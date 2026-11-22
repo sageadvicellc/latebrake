@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { buildFixture, literalsAt, parseArgs, run, USAGE } from '../tools/existing-literals.mjs';
+import { SCANNED_EXTENSIONS, buildFixture, literalsAt, parseArgs, run, USAGE } from '../tools/existing-literals.mjs';
 
 const TOOL = new URL('../tools/existing-literals.mjs', import.meta.url).pathname;
 const roots = [];
@@ -40,6 +40,13 @@ function makeRepo() {
 }
 const capture = () => { const text = { out: '', err: '' }; return { text, io: { out: s => { text.out += s; }, err: s => { text.err += s; } } }; };
 
+// The fixture file lives outside the repository, so that committing the repository never adds it to the scan.
+const writeFixture = (root, first) => {
+  const fixturePath = path.join(tempDir('gauge-errors-fixture-'), 'fixture.json');
+  run(['--write', '--commit', first], { cwd: root, fixturePath, ...capture().io });
+  return { fixturePath, saved: JSON.parse(fs.readFileSync(fixturePath, 'utf8')) };
+};
+
 const ALL = ['ALPHA_CODE', 'BETA_CODE', 'DELTA_CODE', 'EPSILON_CODE', 'ETA_CODE', 'GAMMA_CODE', 'ZETA_CODE'];
 
 test('a scan lists the literals of scanned files only, sorted, and counts the files', () => {
@@ -49,7 +56,8 @@ test('a scan lists the literals of scanned files only, sorted, and counts the fi
   assert.equal(scan.filesScanned, 7);
   assert.equal(scan.commit, first);
   assert.equal(typeof scan.rule, 'string');
-  assert.deepEqual(Object.keys(scan), ['commit', 'rule', 'filesScanned', 'literals']);
+  assert.deepEqual(Object.keys(scan), ['commit', 'rule', 'extensions', 'filesScanned', 'literals']);
+  assert.deepEqual(scan.extensions, [...SCANNED_EXTENSIONS]);
 });
 
 test('the scan does not read lockfiles, markdown, dependency folders, or the registry package, so a re-pin cannot make the registry collide with itself', () => {
@@ -130,7 +138,8 @@ test('write makes the fixture, check exits 0 on a match, and both print the file
   assert.match(wrote.text.err, /\bts\b.*\bpy\b|\bpy\b.*\bts\b/);
   const checked = capture();
   assert.equal(run(['--check'], { cwd: root, fixturePath, ...checked.io }), 0);
-  assert.match(checked.text.err, /matches/);
+  assert.match(checked.text.err, /reproduces/);
+  assert.match(checked.text.err, /pinned commit/);
   assert.match(checked.text.err, /7 files/);
 });
 
@@ -167,14 +176,67 @@ test('the list of differences is capped at 50 each, and the count stays whole', 
 
 test('check on a newer commit with the same literals exits 0 and says the commit moved', () => {
   const { root, first } = makeRepo();
-  const fixturePath = path.join(root, 'fixture.json');
-  run(['--write', '--commit', first], { cwd: root, fixturePath, ...capture().io });
+  const { fixturePath } = writeFixture(root, first);
   put(root, 'docs-only.md', 'more words\n');
   git(root, 'add', '-A');
   git(root, 'commit', '-q', '-m', 'docs');
   const { text, io } = capture();
   assert.equal(run(['--check', '--commit', 'HEAD'], { cwd: root, fixturePath, ...io }), 0);
   assert.match(text.err, /newer|differs from the pinned|pinned commit/i);
+  assert.doesNotMatch(text.err, /re-?pin/i, 'a newer commit never suggests moving the pin');
+});
+
+test('check exits 1 when only the stored count of files differs, and names the field', () => {
+  const { root, first } = makeRepo();
+  const { fixturePath, saved } = writeFixture(root, first);
+  fs.writeFileSync(fixturePath, JSON.stringify({ ...saved, filesScanned: saved.filesScanned + 1 }));
+  const { text, io } = capture();
+  assert.equal(run(['--check'], { cwd: root, fixturePath, ...io }), 1);
+  assert.match(text.err, /filesScanned/);
+  assert.match(text.err, /0 added, 0 removed/);
+});
+
+test('check exits 1 when only the stored rule differs, and names the field', () => {
+  const { root, first } = makeRepo();
+  const { fixturePath, saved } = writeFixture(root, first);
+  fs.writeFileSync(fixturePath, JSON.stringify({ ...saved, rule: 'an older rule' }));
+  const { text, io } = capture();
+  assert.equal(run(['--check'], { cwd: root, fixturePath, ...io }), 1);
+  assert.match(text.err, /\brule\b/);
+});
+
+test('check exits 1 when only the stored list of file kinds differs, and names the field', () => {
+  const { root, first } = makeRepo();
+  const { fixturePath, saved } = writeFixture(root, first);
+  fs.writeFileSync(fixturePath, JSON.stringify({ ...saved, extensions: saved.extensions.filter(ext => ext !== 'py') }));
+  const { text, io } = capture();
+  assert.equal(run(['--check'], { cwd: root, fixturePath, ...io }), 1);
+  assert.match(text.err, /extensions/);
+});
+
+test('a newer commit is compared on the rule, the kinds, and the literals, and the count of files may differ', () => {
+  const { root, first } = makeRepo();
+  const { fixturePath } = writeFixture(root, first);
+  put(root, 'src/more.ts', `const note = 'quiet';\n`);
+  git(root, 'add', '-A');
+  git(root, 'commit', '-q', '-m', 'one more file, no new literal');
+  const { text, io } = capture();
+  assert.equal(run(['--check', '--commit', 'HEAD'], { cwd: root, fixturePath, ...io }), 0);
+  assert.doesNotMatch(text.err, /re-?pin/i);
+});
+
+test('the guard compares against the pinned baseline: a literal added after the pin is not in it', () => {
+  const { root, first } = makeRepo();
+  const { fixturePath, saved } = writeFixture(root, first);
+  put(root, 'src/later.ts', `'LATER_CODE'\n`);
+  git(root, 'add', '-A');
+  git(root, 'commit', '-q', '-m', 'a later literal');
+  assert.equal(saved.literals.includes('LATER_CODE'), false);
+  const { text, io } = capture();
+  assert.equal(run(['--check', '--commit', 'HEAD'], { cwd: root, fixturePath, ...io }), 1);
+  assert.match(text.err, /\+ LATER_CODE/);
+  assert.doesNotMatch(text.err, /re-?pin/i);
+  assert.equal(run(['--check'], { cwd: root, fixturePath, ...capture().io }), 0, 'checked from its own pinned commit, the fixture still reproduces');
 });
 
 test('a failure to read the fixture or the repository exits 3', () => {

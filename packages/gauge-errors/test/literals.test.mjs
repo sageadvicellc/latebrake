@@ -75,3 +75,19 @@ test('markdown, binary files, lockfiles, dependency and build folders, and the r
   ]) assert.equal(isScannedPath(file), false, file);
   assert.equal(isScannedPath('packages/gauge-errors-other/src/a.ts'), true);
 });
+
+test('a token shaped like a cloud access key id is skipped, because the fixture is public and scanners flag such values', () => {
+  assert.deepEqual(found(`'AKIAABCDEFGHIJKLMNOP'; 'ASIA1234567890ABCDEF'; 'REAL_CODE'`), ['REAL_CODE']);
+});
+
+test('a key-like token is kept when its length or prefix is off by one', () => {
+  assert.deepEqual(found(`'AKIAABCDEFGHIJKLMNO'; 'AKIAABCDEFGHIJKLMNOPQ'; 'AKIB1234567890ABCDEF'`), ['AKIAABCDEFGHIJKLMNO', 'AKIAABCDEFGHIJKLMNOPQ', 'AKIB1234567890ABCDEF']);
+});
+
+test('a hex-only token of 16 or more characters is skipped', () => {
+  assert.deepEqual(found(`'C0FFEEC0FFEEC0FFEE'; 'ABCDEF0123456789'; 'DEADBEEF0123456789ABCDEF0123456789'; 'REAL_CODE'`), ['REAL_CODE']);
+});
+
+test('a hex-only token of 15 characters or fewer, and a long token with a non-hex letter or an underscore, are kept', () => {
+  assert.deepEqual(found(`'ABCDEF012345678'; 'C0FFEE'; 'ABCDEF0123456789G'; 'C0FFEEC0_FFEEC0FFEE'`), ['ABCDEF012345678', 'ABCDEF0123456789G', 'C0FFEE', 'C0FFEEC0_FFEEC0FFEE']);
+});

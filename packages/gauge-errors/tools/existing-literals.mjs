@@ -9,12 +9,17 @@
 // with REFUSED_CODE' gives REFUSED_CODE.
 // The scan reads the files of the commit that have one of SCANNED_EXTENSIONS. It reads tests too. It skips: package lockfiles, node_modules, dist, .git, and the
 // package `packages/gauge-errors/` itself (so a re-pin to a newer commit can never make the registry collide with its own codes).
+// It skips a token that looks like a secret or a hash, because the fixture is public: a token of the shape AKIA or ASIA plus 16 capitals and digits, and a token of
+// only 0-9 and A-F that is 16 or more characters long. No code is shaped like that.
 // It errs on the side of too many: it also keeps system error names such as ENOSPC, constants such as PATH_SHOWN_CHARS, and capital words in comments. That is safe,
 // because the fixture only forbids a new code from taking one of these names.
 // It does not read: markdown, binary files, any other extension, or a name that code builds at run time (a template string such as `${PREFIX}_FAILED`).
 //
 //   node packages/gauge-errors/tools/existing-literals.mjs --write --commit <rev>   scan <rev> and write the fixture
 //   node packages/gauge-errors/tools/existing-literals.mjs --check [--commit <rev>] scan again and compare with the fixture (default: the commit in the fixture)
+// The pin never moves forward. It is the baseline of what existed before the Gauge codes, and a newer pin would contain the registry's own codes, because later work
+// uses GAUGE codes in other packages. `--check` with no `--commit` proves that the fixture reproduces exactly from its own pinned commit. With a newer commit it
+// compares the rule, the kinds and the literals, and reports what a newer commit holds that the baseline does not.
 //   node packages/gauge-errors/tools/existing-literals.mjs --print [--commit <rev>] scan and print the fixture to the standard output
 // Run it from any folder inside a clone that holds the commit. Exit codes: 0 done or equal, 1 the literals differ, 2 the call is wrong, 3 the scan failed.
 import fs from 'node:fs';
@@ -27,10 +32,16 @@ const WORD = '[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*';
 export const CODE_SHAPE = new RegExp(`^(?=.{2,}$)${WORD}$`);
 const TOKEN = new RegExp(`(?<![A-Za-z0-9_$])${WORD}(?![A-Za-z0-9_$])`, 'g');
 
+// The fixture is public, and secret scanners flag tokens of these two shapes. A cloud access key id, and a long run of hex digits (a hash, a key, a dump).
+const KEY_ID = /^(?:AKIA|ASIA)[A-Z0-9]{16}$/;
+const LONG_HEX = /^[0-9A-F]{16,}$/;
+/** True for a token that looks like a secret or a hash: an access key id, or 16 or more characters of 0-9 and A-F. The scan skips it. */
+export const isSecretShaped = token => KEY_ID.test(token) || LONG_HEX.test(token);
+
 /** Returns the set of code literals in one text. */
 export function extractCodeLiterals(text) {
   const found = new Set();
-  for (const [token] of text.matchAll(TOKEN)) if (token.length >= 2) found.add(token);
+  for (const [token] of text.matchAll(TOKEN)) if (token.length >= 2 && !isSecretShaped(token)) found.add(token);
   return found;
 }
 
@@ -91,20 +102,20 @@ export function literalsAt(commit, cwd = process.cwd()) {
   return { literals: [...literals].sort(), filesScanned: files.length };
 }
 
-const RULE = 'A code literal is any token in a scanned file that is one word of two or more characters in capitals, digits and single underscores, with a non-word character on both sides. Files with these extensions: ' + SCANNED_EXTENSIONS.join(', ') + '. Lockfiles, node_modules, dist, .git, markdown, and packages/gauge-errors are not scanned. Tests are. See packages/gauge-errors/tools/existing-literals.mjs.';
+const RULE = 'A code literal is any token in a scanned file that is one word of two or more characters in capitals, digits and single underscores, with a non-word character on both sides. Files with these extensions: ' + SCANNED_EXTENSIONS.join(', ') + '. Lockfiles, node_modules, dist, .git, markdown, and packages/gauge-errors are not scanned. Tests are. A token shaped like an AKIA or ASIA access key id (20 characters), or made only of 0-9 and A-F with 16 or more characters, is skipped. See packages/gauge-errors/tools/existing-literals.mjs.';
 
 /** The fixture object for a commit (a revision is resolved to its full hash). */
 export function buildFixture(rev, cwd = process.cwd()) {
   const commit = resolveCommit(rev, cwd);
   const { literals, filesScanned } = literalsAt(commit, cwd);
-  return { commit, rule: RULE, filesScanned, literals };
+  return { commit, rule: RULE, extensions: [...SCANNED_EXTENSIONS], filesScanned, literals };
 }
 
 export const FIXTURE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'test', 'fixtures', 'existing-code-literals.json');
 export const USAGE = [
   'usage: existing-literals.mjs (--write | --check | --print) [--commit <rev>]',
   '  --write   scan <rev> and write the fixture (--commit is required)',
-  '  --check   scan again and compare with the fixture; exit 1 when the literals differ',
+  '  --check   scan again and compare with the fixture (rule, kinds, literals, and the file count at the pinned commit); exit 1 on any difference',
   '  --print   scan and print the fixture to the standard output',
   '  --commit  the revision to scan; --check and --print default to the commit in the fixture',
 ].join('\n');
@@ -146,12 +157,21 @@ export function run(argv, io = {}) {
     if (parsed.mode === 'print') { out(render(scan)); return 0; }
     const before = new Set(pinned.literals), after = new Set(scan.literals);
     const added = scan.literals.filter(literal => !before.has(literal)), removed = pinned.literals.filter(literal => !after.has(literal));
-    if (added.length || removed.length) {
-      err(`the fixture differs from a fresh scan of ${scan.commit}: ${added.length} added, ${removed.length} removed\n`);
-      err(['added (in the scan, not in the fixture):', ...listed('+', added), 'removed (in the fixture, not in the scan):', ...listed('-', removed)].join('\n') + '\n');
+    const same = scan.commit === pinned.commit;
+    // The count of files is compared only at the pinned commit: a newer commit may hold more files.
+    const fields = [
+      ...(pinned.rule !== scan.rule ? ['rule'] : []),
+      ...(JSON.stringify(pinned.extensions) !== JSON.stringify(scan.extensions) ? ['extensions'] : []),
+      ...(same && pinned.filesScanned !== scan.filesScanned ? ['filesScanned'] : []),
+    ];
+    if (added.length || removed.length || fields.length) {
+      err(`the fixture differs from a fresh scan of ${scan.commit}: ${added.length} added, ${removed.length} removed; fields that differ: ${fields.length ? fields.join(', ') : 'none'}\n`);
+      if (added.length || removed.length) err(['added (in the scan, not in the fixture):', ...listed('+', added), 'removed (in the fixture, not in the scan):', ...listed('-', removed)].join('\n') + '\n');
       return 1;
     }
-    err(scan.commit === pinned.commit ? `fixture matches ${scan.commit}\n` : `fixture matches ${scan.commit}: the literals equal those of the pinned commit ${pinned.commit}, so re-pinning is optional\n`);
+    err(same
+      ? `fixture reproduces exactly from its own pinned commit ${pinned.commit}\n`
+      : `fixture holds the same rule, kinds and literals at the newer commit ${scan.commit} as at the pinned commit ${pinned.commit}. The pin stays at ${pinned.commit} on purpose.\n`);
     return 0;
   } catch (error) {
     err(`${error.message}\n`);

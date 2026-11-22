@@ -61,6 +61,17 @@ test('the collision guard reports an old literal that a new code reuses', () => 
   assert.deepEqual(collidingCodes([], existing), []);
 });
 
+test('the fixture stays pinned to the baseline commit, on purpose: a new code is checked against what existed then, and never against a newer commit', () => {
+  assert.equal(fixture.commit, '107445d66c71b09ac7972e44f9d3d67c09ff44a9');
+});
+
+test('the fixture holds no secret-shaped token', () => {
+  for (const literal of fixture.literals) {
+    assert.doesNotMatch(literal, /^(?:AKIA|ASIA)[A-Z0-9]{16}$/, literal);
+    assert.doesNotMatch(literal, /^[0-9A-F]{16,}$/, literal);
+  }
+});
+
 test('the fixture is a real list from a pinned commit', () => {
   assert.match(fixture.commit, /^[0-9a-f]{40}$/);
   assert.ok(fixture.literals.length > 100, `${fixture.literals.length} literals`);
