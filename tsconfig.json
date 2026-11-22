@@ -23,6 +23,7 @@
     "apps/*/src/**/*.ts",
     "tests/**/*.ts",
     "packages/codex-adapter/test/**/*.ts",
-    "packages/roots/test/**/*.ts"
+    "packages/roots/test/**/*.ts",
+    "packages/gauge-errors/test/**/*.ts"
   ]
 }
