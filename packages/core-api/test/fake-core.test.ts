@@ -3,10 +3,14 @@ import assert from 'node:assert/strict';
 import { createFakeCore } from '../src/fake-core.js';
 import { createCoreClient } from '../src/client.js';
 import { FIXTURE_GAUGES } from '../src/fixtures.js';
-import { runClientSuite } from './client-suite.js';
+import { DEFAULT_EXPECTED, runClientSuite } from './client-suite.js';
 
 // The one client suite, run against the fake core.
 runClientSuite('fake core', () => createFakeCore());
+
+test('the fixture Gauges equal the list the suite expects', () => {
+  assert.deepEqual(FIXTURE_GAUGES, DEFAULT_EXPECTED);
+});
 
 test('fixture Gauges are synthetic, so each id starts with "fixture-"', () => {
   assert.ok(FIXTURE_GAUGES.length >= 2);

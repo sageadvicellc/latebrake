@@ -1,6 +1,4 @@
-/** The Core API client and the fake core. See `README.md`. */
+/** The Core API client and its types. The fake core and its fixtures are for tests: import them from `./fake-core.js` and `./fixtures.js`. See `README.md`. */
 export { CoreProtocolError, createCoreClient } from './client.js';
 export type { CoreClient } from './client.js';
-export { createFakeCore } from './fake-core.js';
-export { FIXTURE_GAUGES } from './fixtures.js';
 export type { Core, CoreMethod, CoreReply, CoreResult, GaugeSummary } from './types.js';
