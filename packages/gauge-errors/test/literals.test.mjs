@@ -1,7 +1,7 @@
 // The code literal scanner that builds the old-literal fixture. It is pure text work, so these tests need no git history.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractCodeLiterals, isScannedPath, CODE_SHAPE } from '../tools/existing-literals.mjs';
+import { extractCodeLiterals, isScannedPath, CODE_SHAPE, SCANNED_EXTENSIONS } from '../tools/existing-literals.mjs';
 
 const found = text => [...extractCodeLiterals(text)].sort();
 
@@ -17,20 +17,23 @@ test('a code in a union type or a case label is a literal', () => {
   assert.deepEqual(found(`type C = 'ONE_CODE' | 'TWO_CODE'; switch (x) { case 'THREE_CODE': break; }`), ['ONE_CODE', 'THREE_CODE', 'TWO_CODE']);
 });
 
-test('a string that holds more than a code is not a literal', () => {
-  assert.deepEqual(found(`'Bad CODE here'; 'lowercase'; 'MIXED_case'; 'TRAILING_'; '_LEADING'; 'DOUBLE__GAP'; 'WITH SPACE'; ''`), []);
+test('an enum member, a destructured name, a shorthand member and a class static are literals', () => {
+  assert.deepEqual(found(`enum E { FIRST_CODE, SECOND_CODE = 2 }`), ['FIRST_CODE', 'SECOND_CODE']);
+  assert.deepEqual(found(`const { THIRD_CODE, FOURTH_CODE: renamed } = codes;`), ['FOURTH_CODE', 'THIRD_CODE']);
+  assert.deepEqual(found(`const o = { FIFTH_CODE, SIXTH_CODE };`), ['FIFTH_CODE', 'SIXTH_CODE']);
+  assert.deepEqual(found(`class C { static SEVENTH_CODE = 'x'; }`), ['SEVENTH_CODE']);
+});
+
+test('a code word inside a longer text is a literal, because the scan reads words and not only whole strings', () => {
+  assert.deepEqual(found(`'Bad CODE here'; throw new Error('failed with REFUSED_CODE (see log)')`), ['CODE', 'REFUSED_CODE']);
+});
+
+test('a word that is not wholly capitals, digits and single underscores is not a literal', () => {
+  assert.deepEqual(found(`'lowercase'; 'MIXED_case'; 'TRAILING_'; '_LEADING'; 'DOUBLE__GAP'; camelCASE; 0xABCD; ''`), []);
 });
 
 test('a single letter is not a literal', () => {
   assert.deepEqual(found(`const a = 'X'; const b = { N: 1 };`), []);
-});
-
-test('a constant name used as a value or declared is not a literal', () => {
-  assert.deepEqual(found(`export const PATH_SHOWN_CHARS = 120; const n = PATH_SHOWN_CHARS + OTHER_LIMIT; call(BUNDLE_CODES);`), []);
-});
-
-test('a member access or a type path before a colon is not a key', () => {
-  assert.deepEqual(found(`const a = obj.FIELD_NAME ? x : y; label: Foo::BAR_BAZ;`), []);
 });
 
 test('digits are allowed after the first letter of a word', () => {
@@ -41,12 +44,34 @@ test('the same literal found twice is listed once', () => {
   assert.deepEqual(found(`'DUP_CODE'; { DUP_CODE: 1 }`), ['DUP_CODE']);
 });
 
-test('the code shape matches whole words in capitals and underscores only', () => {
+test('the words of other languages are read the same way', () => {
+  assert.deepEqual(found(`raise Refused("PY_CODE")`), ['PY_CODE']);
+  assert.deepEqual(found(`pub const RS_CODE: &str = "RS_VALUE";`), ['RS_CODE', 'RS_VALUE']);
+  assert.deepEqual(found(`kind = "TOML_CODE"`), ['TOML_CODE']);
+  assert.deepEqual(found(`code: YAML_CODE`), ['YAML_CODE']);
+  assert.deepEqual(found(`exit_with SH_CODE`), ['SH_CODE']);
+});
+
+test('the code shape matches whole words in capitals, digits and underscores only', () => {
   for (const ok of ['AB', 'A_B', 'UNKNOWN_GAUGE', 'V2_X']) assert.match(ok, CODE_SHAPE, ok);
   for (const bad of ['', 'A', 'a_b', 'A_', '_A', 'A__B', 'A-B', 'A B', '2A']) assert.doesNotMatch(bad, CODE_SHAPE, JSON.stringify(bad));
 });
 
-test('only source files outside build and dependency folders are scanned', () => {
-  for (const path of ['packages/a/src/x.ts', 'apps/desktop/renderer/y.tsx', 'tools/z.mjs', 'a/b.js', 'c.cjs', 'd.mts', 'e.cts', 'f.jsx']) assert.equal(isScannedPath(path), true, path);
-  for (const path of ['README.md', 'package-lock.json', 'dist/a.js', 'node_modules/x/y.js', 'apps/desktop/node_modules/x.js', 'a/.git/b.js', 'logo.svg']) assert.equal(isScannedPath(path), false, path);
+test('the scanned file kinds are listed, sorted and without a dot', () => {
+  assert.deepEqual([...SCANNED_EXTENSIONS], [...SCANNED_EXTENSIONS].sort());
+  for (const ext of ['ts', 'tsx', 'mts', 'cts', 'js', 'mjs', 'cjs', 'jsx', 'py', 'rs', 'toml', 'yml', 'yaml', 'sh', 'json']) assert.ok(SCANNED_EXTENSIONS.includes(ext), ext);
+  assert.equal(SCANNED_EXTENSIONS.includes('md'), false);
+});
+
+test('source, script and data files are scanned', () => {
+  for (const file of ['packages/a/src/x.ts', 'apps/desktop/renderer/y.tsx', 'tools/z.mjs', 'a/b.js', 'c.cjs', 'd.mts', 'e.cts', 'f.jsx', 'g.py', 'src-tauri/h.rs', 'Cargo.toml', '.github/ci.yml', 'k.yaml', 'scripts/l.sh', 'data/m.json']) assert.equal(isScannedPath(file), true, file);
+});
+
+test('markdown, binary files, lockfiles, dependency and build folders, and the registry package are not scanned', () => {
+  for (const file of [
+    'README.md', 'logo.svg', 'icon.png', 'package-lock.json', 'apps/desktop/package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock', 'Cargo.lock',
+    'dist/a.js', 'node_modules/x/y.js', 'apps/desktop/node_modules/x.js', 'a/.git/b.js',
+    'packages/gauge-errors/src/registry.ts', 'packages/gauge-errors/test/fixtures/existing-code-literals.json', 'packages/gauge-errors/tools/existing-literals.mjs',
+  ]) assert.equal(isScannedPath(file), false, file);
+  assert.equal(isScannedPath('packages/gauge-errors-other/src/a.ts'), true);
 });

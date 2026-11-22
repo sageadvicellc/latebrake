@@ -12,7 +12,7 @@ const existing = new Set(fixture.literals);
 // The stable codes. A removed or renamed code fails here on purpose: a code is a promise to Gauge authors.
 const STABLE = [
   'GAUGE_MANIFEST_INVALID', 'GAUGE_MANIFEST_TOO_LARGE', 'GAUGE_PATH_UNSAFE', 'GAUGE_SECRET_FOUND', 'GAUGE_API_UNSUPPORTED',
-  'UNKNOWN_GAUGE', 'GAUGE_EXISTS', 'GAUGE_PROTECTED',
+  'UNKNOWN_GAUGE', 'GAUGE_EXISTS', 'GAUGE_PROTECTED', 'GAUGE_REMOVE_INCOMPLETE', 'GAUGE_NAME_RESERVED',
   'GAUGE_GRANT_MISSING', 'GAUGE_GRANT_STALE',
   'GAUGE_LAYOUT_INVALID',
   'GAUGE_PLAN_NOT_APPROVED', 'GAUGE_PLAN_CHANGED',
@@ -27,10 +27,6 @@ test('the registry is frozen, so no caller can add or change a code', () => {
   assert.equal(Object.isFrozen(GAUGE_CODES), true);
   assert.equal(Object.isFrozen(GAUGE_MEANINGS), true);
   for (const entry of GAUGE_ERRORS) assert.equal(Object.isFrozen(entry), true, entry.code);
-});
-
-test('the starter set stays small', () => {
-  assert.ok(GAUGE_CODES.length > 0 && GAUGE_CODES.length < 15, `${GAUGE_CODES.length} codes`);
 });
 
 test('every code has a one-line meaning that ends in a full stop', () => {
@@ -79,13 +75,20 @@ test('every code follows the naming rules', () => {
 
 test('the naming rules refuse a code that breaks them, and say why', () => {
   const bad = {
-    gauge_lower: 'capitals and underscores',
-    'GAUGE-DASH': 'capitals and underscores',
-    '_GAUGE_LEAD': 'capitals and underscores',
-    GAUGE__GAP: 'capitals and underscores',
+    gauge_lower: 'single underscores join the words',
+    'GAUGE-DASH': 'single underscores join the words',
+    '_GAUGE_LEAD': 'single underscores join the words',
+    GAUGE__GAP: 'single underscores join the words',
+    GAUGE_2: 'starts with a capital',
+    '2A_GAUGE': 'starts with a capital',
+    GAUGE_EXTENSIONS: 'EXTENSION',
+    GAUGE_NOEXTENSION: 'EXTENSION',
+    GAUGE_MODULES: 'MODULE',
+    GAUGE_SUBMODULE_X: 'MODULE',
     BAD_MANIFEST: 'the word GAUGE',
-    EXTENSION_EXISTS: 'the word EXTENSION',
-    MODULE_NOT_FOUND: 'the word MODULE',
+    GAUGES_ONLY: 'the word GAUGE',
+    EXTENSION_EXISTS: 'EXTENSION',
+    MODULE_NOT_FOUND: 'MODULE',
     GAUGE_ABSURDLY_LONG_CODE_NAME_THAT_NOBODY_CAN_READ_AT_A_GLANCE: 'at most 40',
   };
   for (const [code, words] of Object.entries(bad)) {
@@ -94,6 +97,15 @@ test('the naming rules refuse a code that breaks them, and say why', () => {
     assert.ok(problems.some(problem => problem.includes(words)), `${code}: ${problems.join(' | ')}`);
   }
   for (const value of [undefined, null, 7, {}, []]) assert.notDeepEqual(codeNameProblems(value), [], String(value));
+});
+
+test('the word GAUGE may lead, follow, or sit in the middle of a code', () => {
+  for (const code of ['GAUGE_EXISTS', 'UNKNOWN_GAUGE', 'BAD_GAUGE_PLAN']) assert.deepEqual(codeNameProblems(code), [], code);
+});
+
+test('each new code has its own meaning, and the two removal and name codes are in the registry', () => {
+  assert.match(GAUGE_MEANINGS.GAUGE_REMOVE_INCOMPLETE, /remov/i);
+  assert.match(GAUGE_MEANINGS.GAUGE_NAME_RESERVED, /reserved/i);
 });
 
 test('isGaugeCode accepts a registry code and refuses everything else', () => {

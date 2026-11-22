@@ -4,15 +4,12 @@
  * A code is a promise to Gauge authors, so it never changes its name. The tests pin the list, refuse two equal codes, refuse a code that equals a code literal
  * which exists in the product at the pinned commit of the fixture, and hold each code to the naming rules of `codeNameProblems`.
  *
- * The codes follow the old module codes with the new name: an old `UNKNOWN_EXTENSION` is `UNKNOWN_GAUGE`, and an old `EXTENSION_EXISTS` is `GAUGE_EXISTS`.
- * Wire identifiers keep the `bowerloom` prefix until the rename, but a code is a bare word, so it carries no prefix.
+ * The naming rules (`codeNameProblems`): capitals, digits and single underscores, every word starting with a capital letter, at most 40 characters, the word
+ * `GAUGE` as one of the words (it may lead, follow or sit between others, as in `UNKNOWN_GAUGE`), and neither `EXTENSION` nor `MODULE` anywhere in the code,
+ * because those two names are retired. Wire identifiers keep the `bowerloom` prefix until the rename, but a code is a bare word, so it carries no prefix.
+ *
+ * A refusal to hide, remove or replace a protected Gauge, such as the Gauge manager, uses `GAUGE_PROTECTED`, in the layout as well as in the lifecycle.
  */
-
-/** One code and what it means, in one line. */
-export interface GaugeErrorEntry {
-  readonly code: string;
-  readonly meaning: string;
-}
 
 /** The starter set. Each later ticket of the Core API work adds its own codes here, in the group of its area. */
 const ENTRIES = [
@@ -26,6 +23,8 @@ const ENTRIES = [
   { code: 'UNKNOWN_GAUGE', meaning: 'No Gauge has that id.' },
   { code: 'GAUGE_EXISTS', meaning: 'A Gauge with that id is already installed.' },
   { code: 'GAUGE_PROTECTED', meaning: 'A protected Gauge cannot be hidden, removed, or replaced.' },
+  { code: 'GAUGE_REMOVE_INCOMPLETE', meaning: 'A removal stopped part way, so some files or grants of the Gauge remain.' },
+  { code: 'GAUGE_NAME_RESERVED', meaning: 'The Gauge id is reserved by the app and no Gauge may use it.' },
   // Grants
   { code: 'GAUGE_GRANT_MISSING', meaning: 'The call needs a permission that the person has not granted to this Gauge.' },
   { code: 'GAUGE_GRANT_STALE', meaning: 'The grant belongs to an earlier manifest or folder, so the person must grant again.' },
@@ -34,13 +33,19 @@ const ENTRIES = [
   // Plans
   { code: 'GAUGE_PLAN_NOT_APPROVED', meaning: 'The write needs a plan that the person has approved, and none was approved.' },
   { code: 'GAUGE_PLAN_CHANGED', meaning: 'The plan to run is not the plan the person approved.' },
-] as const satisfies readonly GaugeErrorEntry[];
+] as const;
 
 /** A Gauge refusal code. */
 export type GaugeCode = (typeof ENTRIES)[number]['code'];
 
+/** One code and what it means, in one line. */
+export interface GaugeErrorEntry {
+  readonly code: GaugeCode;
+  readonly meaning: string;
+}
+
 /** Every code with its meaning, in the order of the list. Frozen. */
-export const GAUGE_ERRORS: readonly GaugeErrorEntry[] = Object.freeze(ENTRIES.map(entry => Object.freeze({ ...entry })));
+export const GAUGE_ERRORS: readonly GaugeErrorEntry[] = Object.freeze(ENTRIES.map((entry): GaugeErrorEntry => Object.freeze({ ...entry })));
 
 /** Every code, in the order of the list. Frozen. */
 export const GAUGE_CODES: readonly GaugeCode[] = Object.freeze(ENTRIES.map(entry => entry.code));
@@ -72,17 +77,16 @@ export function collidingCodes(codes: readonly string[], existing: ReadonlySet<s
 /** The longest a code may be. */
 export const MAX_CODE_LENGTH = 40;
 
-const SHAPE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$/;
+const SHAPE = /^[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)*$/;
 const RETIRED_WORDS = ['EXTENSION', 'MODULE'] as const;
 
 /** Returns what is wrong with a code name, in plain words. An empty list means the name follows the rules. */
 export function codeNameProblems(code: unknown): string[] {
   if (typeof code !== 'string') return ['a code is a string'];
   const problems: string[] = [];
-  if (!SHAPE.test(code)) problems.push('a code uses capitals and underscores only, in words that start with a capital, joined by single underscores');
+  if (!SHAPE.test(code)) problems.push('a code uses capitals, digits, and underscores only, every word starts with a capital letter, and single underscores join the words');
   if (code.length > MAX_CODE_LENGTH) problems.push(`a code has at most ${MAX_CODE_LENGTH} characters`);
-  const words = code.split('_');
-  if (!words.includes('GAUGE')) problems.push('a code holds the word GAUGE');
-  for (const retired of RETIRED_WORDS) if (words.includes(retired)) problems.push(`a code does not use the word ${retired}, which is retired`);
+  if (!code.split('_').includes('GAUGE')) problems.push('a code holds the word GAUGE');
+  for (const retired of RETIRED_WORDS) if (code.includes(retired)) problems.push(`a code does not hold ${retired} anywhere, because that word is retired`);
   return problems;
 }
