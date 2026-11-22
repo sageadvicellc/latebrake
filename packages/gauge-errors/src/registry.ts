@@ -1,8 +1,10 @@
+import { createHash } from 'node:crypto';
+
 /**
  * The Gauge error registry: every refusal the Core API gives a Gauge has one stable code, and every code is in this one list.
  *
- * A code is a promise to Gauge authors, so it never changes its name. The tests pin the list, refuse two equal codes, refuse a code that equals a code literal
- * which exists in the product at the pinned commit of the fixture, and hold each code to the naming rules of `codeNameProblems`.
+ * A code is a promise to Gauge authors, so it never changes its name. The tests pin the list, refuse two equal codes, refuse a code whose digest is among the digests of the code
+ * literals that exist in the product at the pinned commit of the fixture, and hold each code to the naming rules of `codeNameProblems`.
  *
  * The naming rules (`codeNameProblems`): capitals, digits and single underscores, every word starting with a capital letter, at most 40 characters, the word
  * `GAUGE` as one of the words (it may lead, follow or sit between others, as in `UNKNOWN_GAUGE`), and neither `EXTENSION` nor `MODULE` anywhere in the code,
@@ -69,9 +71,12 @@ export function duplicateCodes(codes: readonly string[]): string[] {
   return [...repeated];
 }
 
-/** Returns each code that equals a code literal in `existing`, once each, sorted. */
-export function collidingCodes(codes: readonly string[], existing: ReadonlySet<string>): string[] {
-  return [...new Set(codes.filter(code => existing.has(code)))].sort();
+/** The SHA-256 digest of a code, in lower-case hex. The fixture of existing literals stores these digests and not the literals. */
+export const codeDigest = (code: string): string => createHash('sha256').update(code).digest('hex');
+
+/** Returns each code whose digest is in `existingDigests` (the digests of the code literals that exist in the product), once each, sorted. */
+export function collidingCodes(codes: readonly string[], existingDigests: ReadonlySet<string>): string[] {
+  return [...new Set(codes.filter(code => existingDigests.has(codeDigest(code))))].sort();
 }
 
 /** The longest a code may be. */

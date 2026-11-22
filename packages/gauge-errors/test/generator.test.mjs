@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { SCANNED_EXTENSIONS, buildFixture, literalsAt, parseArgs, run, USAGE } from '../tools/existing-literals.mjs';
+import { SCANNED_EXTENSIONS, buildFixture, digestOf, scanAt, literalsAt, parseArgs, run, USAGE } from '../tools/existing-literals.mjs';
 
 const TOOL = new URL('../tools/existing-literals.mjs', import.meta.url).pathname;
 const roots = [];
@@ -48,21 +48,24 @@ const writeFixture = (root, first) => {
 };
 
 const ALL = ['ALPHA_CODE', 'BETA_CODE', 'DELTA_CODE', 'EPSILON_CODE', 'ETA_CODE', 'GAMMA_CODE', 'ZETA_CODE'];
+const DIGESTS = ALL.map(digestOf).sort();
 
-test('a scan lists the literals of scanned files only, sorted, and counts the files', () => {
+test('a scan stores the digests of the literals of scanned files only, sorted, and counts the files', () => {
   const { root, first } = makeRepo();
   const scan = buildFixture(first, root);
-  assert.deepEqual(scan.literals, [...ALL].sort());
+  assert.deepEqual(scan.digests, DIGESTS);
+  assert.equal('literals' in scan, false);
+  assert.deepEqual(scanAt(first, root).literals, [...ALL].sort());
   assert.equal(scan.filesScanned, 7);
   assert.equal(scan.commit, first);
   assert.equal(typeof scan.rule, 'string');
-  assert.deepEqual(Object.keys(scan), ['commit', 'rule', 'extensions', 'filesScanned', 'literals']);
+  assert.deepEqual(Object.keys(scan), ['commit', 'rule', 'extensions', 'filesScanned', 'digests']);
   assert.deepEqual(scan.extensions, [...SCANNED_EXTENSIONS]);
 });
 
 test('the scan does not read lockfiles, markdown, dependency folders, or the registry package, so a re-pin cannot make the registry collide with itself', () => {
   const { root, first } = makeRepo();
-  const { literals } = buildFixture(first, root);
+  const { literals } = scanAt(first, root);
   for (const hidden of ['LOCK_ONLY', 'DOC_ONLY', 'NM_ONLY', 'SELF_CODE']) assert.equal(literals.includes(hidden), false, hidden);
 });
 
@@ -71,15 +74,15 @@ test('a scan is pinned to its commit, and a later change does not show', () => {
   put(root, 'src/later.ts', `'LATER_CODE'\n`);
   git(root, 'add', '-A');
   git(root, 'commit', '-q', '-m', 'second');
-  assert.equal(buildFixture(first, root).literals.includes('LATER_CODE'), false);
-  assert.equal(buildFixture('HEAD', root).literals.includes('LATER_CODE'), true);
-  assert.deepEqual(literalsAt(first, root).literals, buildFixture(first, root).literals);
+  assert.equal(buildFixture(first, root).digests.includes(digestOf('LATER_CODE')), false);
+  assert.equal(buildFixture('HEAD', root).digests.includes(digestOf('LATER_CODE')), true);
+  assert.deepEqual(literalsAt(first, root).literals, scanAt(first, root).literals);
 });
 
 test('a scan run from a subfolder reads the whole repository', () => {
   const { root, first } = makeRepo();
   const sub = path.join(root, 'cfg');
-  assert.deepEqual(buildFixture(first, sub).literals, [...ALL].sort());
+  assert.deepEqual(buildFixture(first, sub).digests, DIGESTS);
 });
 
 test('a scan refuses a tree entry that is not a plain file, and names it', () => {
@@ -131,7 +134,9 @@ test('write makes the fixture, check exits 0 on a match, and both print the file
   const wrote = capture();
   assert.equal(run(['--write', '--commit', first], { cwd: sub, fixturePath, ...wrote.io }), 0);
   const saved = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
-  assert.deepEqual(saved.literals, [...ALL].sort());
+  assert.deepEqual(saved.digests, DIGESTS);
+  const fileText = fs.readFileSync(fixturePath, 'utf8');
+  for (const literal of ALL) assert.equal(fileText.includes(literal), false, 'the fixture file holds no plain literal');
   assert.equal(saved.filesScanned, 7);
   assert.equal(saved.commit, first);
   assert.match(wrote.text.err, /7 files/);
@@ -143,28 +148,27 @@ test('write makes the fixture, check exits 0 on a match, and both print the file
   assert.match(checked.text.err, /7 files/);
 });
 
-test('check exits 1 when the fixture differs, and lists the added and removed literals with counts', () => {
+test('check exits 1 when the fixture differs, shows added literals in plain form and removed ones as digests, and writes nothing', () => {
   const { root, first } = makeRepo();
-  const fixturePath = path.join(root, 'fixture.json');
-  run(['--write', '--commit', first], { cwd: root, fixturePath, ...capture().io });
-  const saved = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
-  saved.literals = saved.literals.filter(l => l !== 'ALPHA_CODE').concat('STALE_CODE').sort();
+  const { fixturePath, saved } = writeFixture(root, first);
+  saved.digests = saved.digests.filter(d => d !== digestOf('ALPHA_CODE')).concat(digestOf('STALE_CODE')).sort();
   fs.writeFileSync(fixturePath, JSON.stringify(saved));
+  const before = fs.readFileSync(fixturePath, 'utf8');
   const { text, io } = capture();
   assert.equal(run(['--check'], { cwd: root, fixturePath, ...io }), 1);
   assert.match(text.err, /1 added/);
   assert.match(text.err, /1 removed/);
   assert.match(text.err, /\+ ALPHA_CODE/);
-  assert.match(text.err, /- STALE_CODE/);
+  assert.ok(text.err.includes(`- ${digestOf('STALE_CODE')}`));
+  assert.equal(text.err.includes('STALE_CODE'), false, 'a removed literal is known by its digest only');
+  assert.equal(fs.readFileSync(fixturePath, 'utf8'), before, 'a check never writes a file');
 });
 
 test('the list of differences is capped at 50 each, and the count stays whole', () => {
   const { root, first } = makeRepo();
-  const fixturePath = path.join(root, 'fixture.json');
-  run(['--write', '--commit', first], { cwd: root, fixturePath, ...capture().io });
-  const saved = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
-  const extra = Array.from({ length: 60 }, (_, i) => `EXTRA_${String(i).padStart(2, '0')}`);
-  saved.literals = [...saved.literals.filter(l => !l.startsWith('A') && !l.startsWith('B')), ...extra].sort();
+  const { fixturePath, saved } = writeFixture(root, first);
+  const extra = Array.from({ length: 60 }, (_, i) => digestOf(`EXTRA_${String(i).padStart(2, '0')}`));
+  saved.digests = [...saved.digests.filter(d => d !== digestOf('ALPHA_CODE') && d !== digestOf('BETA_CODE')), ...extra].sort();
   fs.writeFileSync(fixturePath, JSON.stringify(saved));
   const { text, io } = capture();
   assert.equal(run(['--check'], { cwd: root, fixturePath, ...io }), 1);
@@ -231,7 +235,7 @@ test('the guard compares against the pinned baseline: a literal added after the 
   put(root, 'src/later.ts', `'LATER_CODE'\n`);
   git(root, 'add', '-A');
   git(root, 'commit', '-q', '-m', 'a later literal');
-  assert.equal(saved.literals.includes('LATER_CODE'), false);
+  assert.equal(saved.digests.includes(digestOf('LATER_CODE')), false);
   const { text, io } = capture();
   assert.equal(run(['--check', '--commit', 'HEAD'], { cwd: root, fixturePath, ...io }), 1);
   assert.match(text.err, /\+ LATER_CODE/);
@@ -251,7 +255,7 @@ test('the command line, started in a subfolder, prints the whole list and never 
   const sub = path.join(root, 'cfg');
   const result = spawnSync(process.execPath, [TOOL, '--print', '--commit', first], { cwd: sub, env: cleanEnv(), encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout).literals, [...ALL].sort());
+  assert.deepEqual(JSON.parse(result.stdout).digests, DIGESTS);
 });
 
 test('the command line exits 2 on an unknown flag', () => {

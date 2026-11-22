@@ -1,16 +1,16 @@
 // The code literal scanner that builds the old-literal fixture. It is pure text work, so these tests need no git history.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractCodeLiterals, isScannedPath, CODE_SHAPE, SCANNED_EXTENSIONS } from '../tools/existing-literals.mjs';
+import { extractCodeLiterals, isScannedPath, CODE_SHAPE, SCANNED_EXTENSIONS, digestOf, displayForm, isSecretShaped } from '../tools/existing-literals.mjs';
 
 const found = text => [...extractCodeLiterals(text)].sort();
 
 test('a quoted string that is wholly a code is a literal, in any quote style', () => {
-  assert.deepEqual(found(`const a = 'BUNDLE_USAGE'; const b = "FAILED"; const c = \`NOT_ALLOWED\`;`), ['BUNDLE_USAGE', 'FAILED', 'NOT_ALLOWED']);
+  assert.deepEqual(found(`const a = 'FIRST_CODE'; const b = "SECOND"; const c = \`THIRD_CODE\`;`), ['FIRST_CODE', 'SECOND', 'THIRD_CODE']);
 });
 
 test('an object key in code shape is a literal, quoted or not', () => {
-  assert.deepEqual(found(`const t = { BUNDLE_FORMAT: 'x', 'ENOSPC': 'y', "TOO_MANY": 'z', OPTIONAL_ONE?: 1 };`), ['BUNDLE_FORMAT', 'ENOSPC', 'OPTIONAL_ONE', 'TOO_MANY']);
+  assert.deepEqual(found(`const t = { KEY_ONE: 'x', 'KEY_TWO': 'y', "KEY_THREE": 'z', OPTIONAL_ONE?: 1 };`), ['KEY_ONE', 'KEY_THREE', 'KEY_TWO', 'OPTIONAL_ONE']);
 });
 
 test('a code in a union type or a case label is a literal', () => {
@@ -90,4 +90,17 @@ test('a hex-only token of 16 or more characters is skipped', () => {
 
 test('a hex-only token of 15 characters or fewer, and a long token with a non-hex letter or an underscore, are kept', () => {
   assert.deepEqual(found(`'ABCDEF012345678'; 'C0FFEE'; 'ABCDEF0123456789G'; 'C0FFEEC0_FFEEC0FFEE'`), ['ABCDEF012345678', 'ABCDEF0123456789G', 'C0FFEE', 'C0FFEEC0_FFEEC0FFEE']);
+});
+
+test('a literal is stored as the SHA-256 digest of its text, in lower-case hex', () => {
+  assert.equal(digestOf('ABC'), 'b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78');
+  assert.match(digestOf('ANY_CODE'), /^[0-9a-f]{64}$/);
+  assert.notEqual(digestOf('ANY_CODE'), digestOf('ANY_CODES'));
+});
+
+test('a secret-shaped text is shown as its digest and any other literal as itself', () => {
+  assert.equal(displayForm('AKIAABCDEFGHIJKLMNOP'), digestOf('AKIAABCDEFGHIJKLMNOP'));
+  assert.equal(displayForm('ABCDEF0123456789'), digestOf('ABCDEF0123456789'));
+  assert.equal(displayForm('PLAIN_CODE'), 'PLAIN_CODE');
+  assert.equal(isSecretShaped('PLAIN_CODE'), false);
 });

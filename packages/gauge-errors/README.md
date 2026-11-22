@@ -18,9 +18,11 @@ The set covers manifest, lifecycle, grant, layout, and plan refusals. A refusal 
 
 ## The old-literal fixture
 
-`test/fixtures/existing-code-literals.json` lists the code literals found in one pinned commit of the product. A test fails when a registry code equals one of them.
+`test/fixtures/existing-code-literals.json` records the code literals found in one pinned commit of the product, as SHA-256 digests. A test hashes each registry code and fails when its digest is in the fixture.
 
-What it holds: the pinned commit, the rule, the file kinds, the number of files scanned, and the sorted literals.
+The fixture holds digests and no plain literal, because it is public and the scanned source may hold names that this repository must not print. Do not add a list of names, or plain literals, to any file of this package.
+
+What it holds: the pinned commit, the rule, the file kinds, the number of files scanned, and the sorted digests of the literals.
 
 What counts as a literal: any token in a scanned file that is one word of two or more characters in capitals, digits, and single underscores, with a non-word character on each side. That reads quoted strings, table and type keys, enum members, destructured and shorthand names, and class statics alike. The full rule is at the top of `tools/existing-literals.mjs`.
 
@@ -38,13 +40,13 @@ The fixture is pinned to `107445d66c71b09ac7972e44f9d3d67c09ff44a9` on purpose. 
 
 Run each from any folder in a clone that holds the pinned commit.
 
-- `npm run check:literals` scans the pinned commit again and compares the result with the fixture. It proves that the fixture reproduces exactly from its own pinned commit, and that the script still makes it. Exit 0 when it does, 1 when anything differs (the added and removed literals are printed, 50 of each at most, with the names of any other field that differs), 2 for a wrong call, 3 when the scan fails.
-- `node packages/gauge-errors/tools/existing-literals.mjs --check --commit <rev>` scans a newer commit. It compares the rule, the file kinds, and the literals. It prints the literals the newer commit holds that the baseline does not. It never suggests moving the pin.
+- `npm run check:literals` scans the pinned commit again and compares the result with the fixture. It proves that the fixture reproduces exactly from its own pinned commit, and that the script still makes it. Exit 0 when it does, 1 when anything differs. A difference prints, to the terminal only, the added literals in plain form and the removed ones as digests, 50 of each at most, with the names of any other field that differs. A check never writes a file, 2 for a wrong call, 3 when the scan fails.
+- `node packages/gauge-errors/tools/existing-literals.mjs --check --commit <rev>` scans a newer commit. It compares the rule, the file kinds, and the digests. It prints the literals the newer commit holds that the baseline does not, on the terminal only. It never suggests moving the pin.
 - `--write --commit <rev>` writes the fixture from `<rev>`. Use it only to fix the script or its rule, and keep `<rev>` at the pinned commit.
 
 ### What the drift check covers
 
-It covers the literals that the scan rule finds in the commit it reads. It compares the stored rule, the list of file kinds, and the literal set. At the pinned commit it also compares the number of files scanned. It prints which field differs. It does not cover a literal outside the rule (see "What is not scanned"), or the meaning of a literal. A newer commit with the same rule, kinds, and literals passes and says so.
+It covers the literals that the scan rule finds in the commit it reads. It compares the stored rule, the list of file kinds, and the set of digests. At the pinned commit it also compares the number of files scanned. It prints which field differs. It does not cover a literal outside the rule (see "What is not scanned"), or the meaning of a literal. A newer commit with the same rule, kinds, and literals passes and says so.
 
 ## Tests
 

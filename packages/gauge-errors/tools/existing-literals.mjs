@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Builds the fixture of code literals that exist in the product at one pinned commit, so a new Gauge code can be checked against it.
 //
-// The rule. The repository writes a refusal code as a bare word in capitals and underscores, such as BUNDLE_USAGE, NOT_ALLOWED or FAILED. It writes the word as a
+// The rule. The repository writes a refusal code as a bare word in capitals and underscores, such as SOME_CODE or FAILED. It writes the word as a
 // quoted string, as a key of a table or a type, as an enum member, as a destructured or shorthand name, as a class static, and in files that are not TypeScript.
 // So the scan does not try to tell these places apart. A code literal is any token in a scanned file that is one code word:
 //   capitals and digits, the words joined by single underscores, at least two characters, with a non-word character (or the edge of the file) on both sides.
@@ -11,9 +11,9 @@
 // package `packages/gauge-errors/` itself (so a re-pin to a newer commit can never make the registry collide with its own codes).
 // It skips a token that looks like a secret or a hash, because the fixture is public: a token of the shape AKIA or ASIA plus 16 capitals and digits, and a token of
 // only 0-9 and A-F that is 16 or more characters long. No code is shaped like that.
-// It errs on the side of too many: it also keeps system error names such as ENOSPC, constants such as PATH_SHOWN_CHARS, and capital words in comments. That is safe,
+// It errs on the side of too many: it also keeps system error names, constants, and capital words in comments. That is safe,
 // because the fixture only forbids a new code from taking one of these names.
-// It does not read: markdown, binary files, any other extension, or a name that code builds at run time (a template string such as `${PREFIX}_FAILED`).
+// It does not read: markdown, binary files, any other extension, or a name that code builds at run time (a template string that joins a prefix and a suffix).
 //
 //   node packages/gauge-errors/tools/existing-literals.mjs --write --commit <rev>   scan <rev> and write the fixture
 //   node packages/gauge-errors/tools/existing-literals.mjs --check [--commit <rev>] scan again and compare with the fixture (default: the commit in the fixture)
@@ -24,6 +24,7 @@
 // Run it from any folder inside a clone that holds the commit. Exit codes: 0 done or equal, 1 the literals differ, 2 the call is wrong, 3 the scan failed.
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -32,11 +33,18 @@ const WORD = '[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*';
 export const CODE_SHAPE = new RegExp(`^(?=.{2,}$)${WORD}$`);
 const TOKEN = new RegExp(`(?<![A-Za-z0-9_$])${WORD}(?![A-Za-z0-9_$])`, 'g');
 
+// The fixture holds the SHA-256 digest of each literal and never the literal itself, because the fixture is public and the scanned source may hold names that the
+// public repository must not print. A check shows a plain literal on the terminal only when the fresh scan found it, and writes no plain literal to any file.
 // The fixture is public, and secret scanners flag tokens of these two shapes. A cloud access key id, and a long run of hex digits (a hash, a key, a dump).
 const KEY_ID = /^(?:AKIA|ASIA)[A-Z0-9]{16}$/;
 const LONG_HEX = /^[0-9A-F]{16,}$/;
 /** True for a token that looks like a secret or a hash: an access key id, or 16 or more characters of 0-9 and A-F. The scan skips it. */
 export const isSecretShaped = token => KEY_ID.test(token) || LONG_HEX.test(token);
+
+/** The SHA-256 digest of a literal, in lower-case hex. The fixture stores this and never the literal. */
+export const digestOf = literal => createHash('sha256').update(literal).digest('hex');
+/** How a literal is shown on the terminal: itself, or its digest when its plain form is secret-shaped. */
+export const displayForm = literal => (isSecretShaped(literal) ? digestOf(literal) : literal);
 
 /** Returns the set of code literals in one text. */
 export function extractCodeLiterals(text) {
@@ -102,20 +110,26 @@ export function literalsAt(commit, cwd = process.cwd()) {
   return { literals: [...literals].sort(), filesScanned: files.length };
 }
 
-const RULE = 'A code literal is any token in a scanned file that is one word of two or more characters in capitals, digits and single underscores, with a non-word character on both sides. Files with these extensions: ' + SCANNED_EXTENSIONS.join(', ') + '. Lockfiles, node_modules, dist, .git, markdown, and packages/gauge-errors are not scanned. Tests are. A token shaped like an AKIA or ASIA access key id (20 characters), or made only of 0-9 and A-F with 16 or more characters, is skipped. See packages/gauge-errors/tools/existing-literals.mjs.';
+const RULE = 'The fixture stores the SHA-256 digest of each literal, sorted, and never the literal. A code literal is any token in a scanned file that is one word of two or more characters in capitals, digits and single underscores, with a non-word character on both sides. Files with these extensions: ' + SCANNED_EXTENSIONS.join(', ') + '. Lockfiles, node_modules, dist, .git, markdown, and packages/gauge-errors are not scanned. Tests are. A token shaped like an AKIA or ASIA access key id (20 characters), or made only of 0-9 and A-F with 16 or more characters, is skipped. See packages/gauge-errors/tools/existing-literals.mjs.';
 
-/** The fixture object for a commit (a revision is resolved to its full hash). */
-export function buildFixture(rev, cwd = process.cwd()) {
+/** A fresh scan of a commit, with the plain literals. It lives in memory only and is never written. A revision is resolved to its full hash. */
+export function scanAt(rev, cwd = process.cwd()) {
   const commit = resolveCommit(rev, cwd);
-  const { literals, filesScanned } = literalsAt(commit, cwd);
-  return { commit, rule: RULE, extensions: [...SCANNED_EXTENSIONS], filesScanned, literals };
+  return { commit, ...literalsAt(commit, cwd) };
 }
+
+/** The fixture object for a commit: the commit, the rule, the file kinds, the number of files, and the sorted digests of the literals. */
+export function buildFixture(rev, cwd = process.cwd()) {
+  return toFixture(scanAt(rev, cwd));
+}
+
+const toFixture = ({ commit, literals, filesScanned }) => ({ commit, rule: RULE, extensions: [...SCANNED_EXTENSIONS], filesScanned, digests: literals.map(digestOf).sort() });
 
 export const FIXTURE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'test', 'fixtures', 'existing-code-literals.json');
 export const USAGE = [
   'usage: existing-literals.mjs (--write | --check | --print) [--commit <rev>]',
   '  --write   scan <rev> and write the fixture (--commit is required)',
-  '  --check   scan again and compare with the fixture (rule, kinds, literals, and the file count at the pinned commit); exit 1 on any difference',
+  '  --check   scan again and compare with the fixture (rule, kinds, digests of the literals, and the file count at the pinned commit); exit 1 on any difference',
   '  --print   scan and print the fixture to the standard output',
   '  --commit  the revision to scan; --check and --print default to the commit in the fixture',
 ].join('\n');
@@ -151,12 +165,14 @@ export function run(argv, io = {}) {
   if (!parsed.ok) { err(`${parsed.error}\n${USAGE}\n`); return 2; }
   try {
     const pinned = parsed.mode === 'write' ? undefined : JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
-    const scan = buildFixture(parsed.commit ?? pinned.commit, cwd);
-    err(`scanned ${scan.filesScanned} files at ${scan.commit}; kinds: ${SCANNED_EXTENSIONS.join(', ')}; ${scan.literals.length} literals\n`);
+    const found = scanAt(parsed.commit ?? pinned.commit, cwd);
+    const scan = toFixture(found);
+    err(`scanned ${scan.filesScanned} files at ${scan.commit}; kinds: ${SCANNED_EXTENSIONS.join(', ')}; ${scan.digests.length} literals\n`);
     if (parsed.mode === 'write') { fs.writeFileSync(fixturePath, render(scan)); err(`wrote the fixture\n`); return 0; }
     if (parsed.mode === 'print') { out(render(scan)); return 0; }
-    const before = new Set(pinned.literals), after = new Set(scan.literals);
-    const added = scan.literals.filter(literal => !before.has(literal)), removed = pinned.literals.filter(literal => !after.has(literal));
+    const before = new Set(pinned.digests), after = new Set(scan.digests);
+    // An added literal is in the fresh scan, so it is shown in plain form on the terminal. A removed one is known by its digest only.
+    const added = found.literals.filter(literal => !before.has(digestOf(literal))).map(displayForm), removed = pinned.digests.filter(digest => !after.has(digest));
     const same = scan.commit === pinned.commit;
     // The count of files is compared only at the pinned commit: a newer commit may hold more files.
     const fields = [
@@ -166,7 +182,7 @@ export function run(argv, io = {}) {
     ];
     if (added.length || removed.length || fields.length) {
       err(`the fixture differs from a fresh scan of ${scan.commit}: ${added.length} added, ${removed.length} removed; fields that differ: ${fields.length ? fields.join(', ') : 'none'}\n`);
-      if (added.length || removed.length) err(['added (in the scan, not in the fixture):', ...listed('+', added), 'removed (in the fixture, not in the scan):', ...listed('-', removed)].join('\n') + '\n');
+      if (added.length || removed.length) err(['added (in the scan, not in the fixture):', ...listed('+', added), 'removed (digests in the fixture, not in the scan):', ...listed('-', removed)].join('\n') + '\n');
       return 1;
     }
     err(same

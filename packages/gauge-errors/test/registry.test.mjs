@@ -2,12 +2,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import {
   GAUGE_CODES, GAUGE_ERRORS, GAUGE_MEANINGS, codeNameProblems, collidingCodes, duplicateCodes, isGaugeCode,
 } from '../../../dist/packages/gauge-errors/src/index.js';
 
 const fixture = JSON.parse(fs.readFileSync(new URL('./fixtures/existing-code-literals.json', import.meta.url), 'utf8'));
-const existing = new Set(fixture.literals);
+const existing = new Set(fixture.digests);
+const digest = text => createHash('sha256').update(text).digest('hex');
 
 // The stable codes. A removed or renamed code fails here on purpose: a code is a promise to Gauge authors.
 const STABLE = [
@@ -55,29 +57,31 @@ test('no code in the registry equals a code literal that exists in the product t
   assert.deepEqual(collidingCodes(GAUGE_CODES, existing), []);
 });
 
-test('the collision guard reports an old literal that a new code reuses', () => {
-  const [first] = fixture.literals;
-  assert.deepEqual(collidingCodes(['GAUGE_NEW_ONE', first, 'BUNDLE_USAGE'], existing), [first, 'BUNDLE_USAGE'].sort());
-  assert.deepEqual(collidingCodes([], existing), []);
+test('the collision guard compares digests, and reports a code whose digest is in the fixture', () => {
+  const old = new Set([digest('SOME_OLD_ONE'), digest('SOME_OLD_TWO')]);
+  assert.deepEqual(collidingCodes(['GAUGE_NEW_ONE', 'SOME_OLD_TWO', 'SOME_OLD_ONE', 'SOME_OLD_ONE'], old), ['SOME_OLD_ONE', 'SOME_OLD_TWO']);
+  assert.deepEqual(collidingCodes(['GAUGE_NEW_ONE'], old), []);
+  assert.deepEqual(collidingCodes([], old), []);
+  assert.deepEqual(collidingCodes(['SOME_OLD_ONE'], new Set(['SOME_OLD_ONE'])), [], 'a plain literal in the set is not a digest, so it does not match');
 });
 
 test('the fixture stays pinned to the baseline commit, on purpose: a new code is checked against what existed then, and never against a newer commit', () => {
   assert.equal(fixture.commit, '107445d66c71b09ac7972e44f9d3d67c09ff44a9');
 });
 
-test('the fixture holds no secret-shaped token', () => {
-  for (const literal of fixture.literals) {
-    assert.doesNotMatch(literal, /^(?:AKIA|ASIA)[A-Z0-9]{16}$/, literal);
-    assert.doesNotMatch(literal, /^[0-9A-F]{16,}$/, literal);
-  }
+test('the fixture holds digests and no plain literal', () => {
+  assert.equal('literals' in fixture, false);
+  assert.ok(fixture.digests.length > 100, `${fixture.digests.length} digests`);
+  for (const entry of fixture.digests) assert.match(entry, /^[0-9a-f]{64}$/);
+  assert.deepEqual(fixture.digests, [...new Set(fixture.digests)].sort());
 });
 
-test('the fixture is a real list from a pinned commit', () => {
+test('the fixture records the pinned commit, the rule, the file kinds, and the count of files', () => {
   assert.match(fixture.commit, /^[0-9a-f]{40}$/);
-  assert.ok(fixture.literals.length > 100, `${fixture.literals.length} literals`);
-  assert.deepEqual(fixture.literals, [...new Set(fixture.literals)].sort());
-  for (const literal of ['BUNDLE_USAGE', 'FAILED', 'NOT_ALLOWED', 'ENOSPC']) assert.ok(existing.has(literal), literal);
   assert.equal(typeof fixture.rule, 'string');
+  assert.ok(Array.isArray(fixture.extensions) && fixture.extensions.length > 0);
+  assert.ok(Number.isInteger(fixture.filesScanned) && fixture.filesScanned > 0);
+  assert.deepEqual(Object.keys(fixture), ['commit', 'rule', 'extensions', 'filesScanned', 'digests']);
 });
 
 test('every code follows the naming rules', () => {
