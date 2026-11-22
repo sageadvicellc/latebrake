@@ -1,6 +1,7 @@
 import { type GaugeCode } from '../../gauge-errors/src/index.js';
 import { CORE_API_VERSION, parseRange, parseVersion, rangeIncludes, rangeIsSatisfiable } from './api-version.js';
 import { unsafeNameReason, unsafePathReason } from './paths.js';
+import { isPermission } from './permissions.js';
 import { looksLikeSecret } from './secrets.js';
 import { parseStrictJson, type JsonProblem, type JsonValue } from './strict-json.js';
 
@@ -50,7 +51,7 @@ export interface GaugeManifest {
 export const MANIFEST_REASONS = [
   'duplicate_key', 'comment', 'trailing_comma', 'syntax',
   'not_utf8', 'too_large', 'secret', 'unknown_field', 'origin_set_by_core', 'missing_field', 'invalid_field',
-  'unsupported_format', 'unsupported_kind', 'api_unsupported',
+  'unsupported_format', 'unsupported_kind', 'api_unsupported', 'unknown_permission',
   'link', 'hidden_name', 'dotdot_name', 'device_name', 'absolute_path', 'unsafe_folder_name',
   'internal',
 ] as const;
@@ -166,7 +167,9 @@ function build(value: JsonValue): GaugeManifest {
 
   const permissions = unique(list(fields['permissions'], 64).map(item => {
     const permission = text(item);
-    return permission.length <= 64 && PERMISSION.test(permission) ? permission : invalid();
+    if (permission.length > 64 || !PERMISSION.test(permission)) return invalid();
+    // The shape is checked first. A well-formed name must also be in the permission list: a Gauge cannot invent a permission.
+    return isPermission(permission) ? permission : invalid('unknown_permission');
   }));
   const dependencies = list(fields['dependencies'], 32).map((item): GaugeDependency => {
     const dependency = shape(item, ['id', 'range']);

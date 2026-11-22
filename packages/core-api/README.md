@@ -11,6 +11,7 @@ A Gauge reaches the core only through the client (`createCoreClient`). The clien
 - `planInstall(folder)`, `planUpdate(folder)`, `planEnable(id)`, `planDisable(id)`, and `planRemove(id)` each give a plan and change nothing.
 - `applyPlan(plan, approval?)` applies a plan that the person approved.
 - `listRoutes()` gives the routes of the enabled Gauges.
+- `planGrant(id, permissions)`, `applyGrant(plan, approval?)`, `revoke(id, permissions)`, `revokeTraces(id)`, `listGrants(id)`, `checkPermission(gauge, permission, engine?)`, and `readAudit()` are the grants calls. See "Permissions and grants".
 
 Each call gives `{ ok: true, value }` or `{ ok: false, code }`. Wire names keep the `bowerloom` prefix, such as `bowerloom.gauges.list`.
 
@@ -51,6 +52,64 @@ Install adds a Gauge disabled. Update is an install plan of the new version, and
 
 A refusal of a manifest may carry a `reason`, a word of the closed set `MANIFEST_REASONS` of `packages/gauge-manifest`. The code says what class of refusal it is. The reason says which rule, so two refusals with the code `GAUGE_MANIFEST_INVALID` (a duplicate key and a comment, for example) can be told apart. The client throws `CoreProtocolError` when a reason is present and is not a word of that set. A reason of `undefined` counts as none.
 
+## Permissions and grants
+
+The permission list is in `packages/gauge-manifest` (`src/permissions.ts`), with a one-line meaning for each. A manifest may declare only names from it. This package holds the grants.
+
+A grant is made by the person, per Gauge version, and a Gauge never makes one. It goes through a plan and an approval, like a lifecycle step:
+
+- `planGrant` gives `{ action: 'grant', id, version, permissions, steps, digest, manifestHash, folderHash, nonce }` and changes nothing. `permissions` are sorted with no repeat. The two hashes are those of the install plan, which the core already holds, so the grant binds to the manifest hash and the whole folder hash. `digest` and `nonce` follow the lifecycle rules: the nonce is exactly 64 lowercase hexadecimal characters, issued by the core for this one plan.
+- Each value in a step goes through the one escape helper, `escapeForPlan`, so no value can add or forge a line. Each permission shows as `permission <name> (<kind>): <meaning>`. A write or act permission says that the Gauge asks for a plan and never skips it. The plan also shows the engines of the Gauge, or `none`.
+- `applyGrant` takes the person's approval of this exact plan. The rules are those of the lifecycle: an approval is a random token, works once, lasts 15 minutes, and ends when any applied step, a lifecycle step or a grant, changes the state. A missing, unknown, old, or used approval is `GAUGE_PLAN_NOT_APPROVED`. A plan that is not the approved one is `GAUGE_PLAN_CHANGED`. The approval of a lifecycle plan cannot apply a grant, and the reverse.
+- A grant plan is allowed for an installed Gauge that is disabled, so a person can review before enabling.
+
+### What a plan refuses
+
+A plan refuses, with nothing changed: a Gauge that is not installed (`UNKNOWN_GAUGE`); a list that is not a non-empty list of text with no repeat (`GAUGE_GRANT_MISSING`, reason `invalid_request`); a name outside the list (`unknown_permission`); a listed name that the manifest does not declare (`not_declared`). A plan that holds a traces permission and any other permission is `GAUGE_TRACES_OWN_STEP`.
+
+### A call without a grant
+
+`checkPermission(gauge, permission, engine?)` is the one enforcement point. Every call that a permission guards goes through the same check in the core. It runs these checks in this order, and the first that fails refuses:
+
+1. The Gauge is installed, else `UNKNOWN_GAUGE`.
+2. The permission is in the list (`GAUGE_GRANT_MISSING`, reason `unknown_permission`), and the manifest declares it (`not_declared`).
+3. The Gauge is enabled (`gauge_disabled`). A disabled Gauge holds no active grant. Its grants stay, and enabling it again brings them back.
+4. For a permission whose scope is `engine`, the engine is a text that the manifest lists (`engine_not_listed`). A Gauge that lists one engine reads that engine only, and a Gauge that lists none reads none. For a permission whose scope is `none`, an engine is refused (`invalid_request`).
+5. The Gauge holds a grant for it, else `GAUGE_GRANT_MISSING` with no reason.
+6. The grant is current: both of its hashes equal those of the installed Gauge. An earlier manifest or folder is `GAUGE_GRANT_STALE`, and the person must grant again.
+
+So a changed manifest asks again: an update installs a new manifest hash and folder hash, and every grant of the old version is stale. A removed Gauge keeps no grant, so the same Gauge installed again starts with none. A grant never outlives a revoke, a removal, or an update.
+
+A reason of the grant set (`GRANT_REASONS`, in `packages/gauge-manifest`) goes only with `GAUGE_GRANT_MISSING`. The client throws `CoreProtocolError` when a grant reason comes with another code, or a manifest reason with `GAUGE_GRANT_MISSING`.
+
+### Revoke
+
+`revoke(id, permissions)` revokes in one action, with no plan, and access ends at once. `revokeTraces(id)` revokes every traces permission the Gauge holds in one action. A revoke only narrows access, so it needs no approval and it does not end other approvals. It works on a stale grant and on a disabled Gauge. A revoke of a permission the Gauge does not hold is `GAUGE_GRANT_MISSING` with the reason `not_held`, and then nothing changes, not even the permissions in the same call that were held. Revoking a traces permission restarts the webview in the app. That is a shell effect, and it is not part of this package.
+
+The fake core trusts the Gauge id in a call. Who may call revoke, and the per-Gauge channel and token that bind an id to its caller, belong to the call identity work and are not built here.
+
+### Traces permissions
+
+`traces.facts` and `traces.text` are denied by default: install, enable, and a grant of every other permission leave them denied. They are granted in a plan of their own, so one approval never covers traces and something else. They are revoked with `revokeTraces`. The facts and the text can be granted apart. The rule that text needs the facts too is for the Traces API.
+
+### The audit file
+
+Every grant and every revoke of a permission appends one record to the audit file. A core writes the record before the change it describes, so a grant never takes effect without its record, and a clock that fails stops the step before anything changes. The file is JSON Lines in UTF-8: one record on each line, ended by one line feed, with these fields in this order: `seq`, `at`, `action`, `via`, `id`, `version`, `permission`, `manifestHash`, `folderHash`.
+
+- `seq` starts at 1 and counts every record ever written. It is never reused, also after old records are dropped.
+- `at` is an ISO 8601 time in UTC with milliseconds, from the wall clock (the option `wall`). It is a time of day, so it is not the monotonic clock of the approvals.
+- `action` is `grant` or `revoke`. `via` is `plan` for a grant, and `revoke` or `remove` for a revoke. A removal of a Gauge writes a `revoke` record, `via` `remove`, for each grant it held. An update that makes grants stale writes none, because no grant was removed.
+- A grant writes one record for each permission, sorted by name. The hashes are those the grant is bound to, so a revoke record of a stale grant shows the old hashes.
+- The file holds no secret and no text a Gauge sent.
+
+The size cap is 64 KiB by default (`DEFAULT_AUDIT_MAX_BYTES`). A core takes a cap of at least 4,096 bytes (`MIN_AUDIT_MAX_BYTES`), as a whole number, and refuses another when it is made. When a new record would push the file over the cap, the core drops the oldest whole records until the new one fits. A file of exactly the cap fits. A revoke is never refused because the file is full. `readAudit()` gives the records the file holds, oldest first, as frozen copies. Dropped records are gone, and the gap shows in `seq`.
+
+`FakeCore.auditFile()` gives the file text for a test. It is not on the `Core` seam.
+
+### What is not covered
+
+Who calls revoke and the Gauge channel token (call identity); the webview restart after a traces revoke; the pairing rule of traces text and facts; calls that read engines, sessions, usage, models, or traces, which belong to the Engine Host and Traces API work and will call the same enforcement; a file on disk for the audit log, and how it survives a crash; two cores writing one file; and a stale grant caused by a change in a folder that keeps the same version (the fake core installs a copy, and an update must raise the version, so only an update makes a grant stale).
+
 ## What the client checks in a reply
 
 The client does not trust the core. It throws `CoreProtocolError` when any of these is false:
@@ -64,6 +123,8 @@ The client does not trust the core. It throws `CoreProtocolError` when any of th
 Only the own properties of an object count. A field that an object inherits, from its prototype, reads as missing.
 
 The client checks the result of an apply against the plan: an install returns `enabled` false and the planned version, an update returns the planned version, an enable returns `enabled` true, a disable returns `enabled` false, and a remove returns `version` null. It checks that each route of `listRoutes` is exactly `/gauges/<id>` for a valid id.
+
+The grants calls are checked as strictly, from own properties, into fresh frozen objects. A grant plan must be for the Gauge and the permissions that were asked, with sorted permissions that are all in the list, and all traces or none. An applied grant must name the plan's Gauge and permissions. A revoke must name the permissions that were asked, and a traces revoke only traces permissions, at least one. A list of grants is sorted by permission with no repeat. A permission check must name the Gauge, the permission, and the engine that were asked, and `engine` is `null` when none was asked. An audit read has records that rise in `seq`, with a valid time, and an action that fits its way (`grant` by `plan`, `revoke` by `revoke` or `remove`).
 
 A Gauge summary has these six fields, all present: `id`, `title`, and `version` are strings, `kind` is `ui` or `data`, `origin` is `stock` or `third-party`, and `protected` is a boolean. The client reads each field once and checks the value it read. It hands back a new frozen object made from those six values. Any other field is dropped. A list is frozen too.
 
@@ -86,6 +147,10 @@ Codes come from the registry in `packages/gauge-errors`, which is the package `@
 ## The lifecycle suite
 
 `test/lifecycle-suite.ts` exports `runLifecycleSuite(name, makeHarness)`. `makeHarness(folders)` gives a core that holds those Gauge folders, a way to approve a plan, a way to replace a folder (as if its files changed on disk), and a way to move the clock. In the app a person approves, so the real core's harness supplies that step. The suite checks the manifest fixtures at load (each with its code), origin, the plan and approval rules for all five steps, and the routes. `test/fake-core.test.ts` runs it on the fake core, which has its own `approve`.
+
+## The grants suite
+
+`test/grants-suite.ts` exports `runGrantsSuite(name, makeHarness)`, the grants suite, built the same way. `makeHarness(folders, options)` gives a core that holds those folders, a way to approve a plan of either kind, and a way to move the clock. `options.auditMaxBytes` sets the audit cap for the cap test. The suite covers the plan, approval, bound hashes, a changed manifest, a missing grant, traces, revoke, engine scope, and the audit file. `test/fake-core-grants.test.ts` runs it on the fake core and adds the fake's own checks. `test/grants.test.ts` tests the pure helpers, and `test/client-grants.test.ts` tests the strict reply checks.
 
 ## The client suite
 

@@ -31,6 +31,7 @@ const ENTRIES = [
   // Grants
   { code: 'GAUGE_GRANT_MISSING', meaning: 'The call needs a permission that the person has not granted to this Gauge.' },
   { code: 'GAUGE_GRANT_STALE', meaning: 'The grant belongs to an earlier manifest or folder, so the person must grant again.' },
+  { code: 'GAUGE_TRACES_OWN_STEP', meaning: 'Traces permissions are granted in their own step, apart from every other permission.' },
   // Layout
   { code: 'GAUGE_LAYOUT_INVALID', meaning: 'The layout file does not match the layout rules.' },
   // Plans

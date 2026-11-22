@@ -1,0 +1,90 @@
+/**
+ * The permission list: the one place that says which permissions exist and what each one means.
+ *
+ * A permission names one thing a Gauge can read or do. The person grants permissions per Gauge version, and a manifest may declare only names from this list.
+ * A `write` or `act` permission lets a Gauge ask for a plan. It never lets the Gauge skip the plan: the person approves every plan.
+ *
+ * `scope` says whether the permission is scoped by the engines a Gauge lists. A permission with scope `engine` works only for an engine in the manifest's `engines` list,
+ * so a Gauge that lists one engine reads that engine only. A permission with scope `none` does not touch an engine.
+ *
+ * `traces` marks a permission that reads traces. Traces permissions are denied by default, granted in their own step, and revoked in one action.
+ * A Gauge that reads the text of a trace needs the facts permission too. The Traces API enforces that pairing, not this list.
+ *
+ * Reactions have no permission: a reaction is recorded only from the person's click on the core's reaction menu, so a Gauge has no call that reacts for the person.
+ */
+
+export const PERMISSION_KINDS = Object.freeze(['read', 'write', 'act'] as const);
+export type PermissionKind = (typeof PERMISSION_KINDS)[number];
+
+export interface PermissionEntry {
+  readonly name: string;
+  readonly kind: PermissionKind;
+  readonly scope: 'engine' | 'none';
+  readonly traces: boolean;
+  /** One line, ending in a full stop. */
+  readonly meaning: string;
+}
+
+const entry = (name: string, kind: PermissionKind, scope: 'engine' | 'none', meaning: string, traces = false): PermissionEntry =>
+  Object.freeze({ name, kind, scope, traces, meaning });
+const NEVER_SKIPS = ' The Gauge never skips the plan.';
+
+/** Every permission, with its one-line meaning, in a fixed order. Frozen. */
+export const PERMISSIONS: readonly PermissionEntry[] = Object.freeze([
+  entry('engines.read', 'read', 'engine', 'Read the state of the engines the Gauge lists.'),
+  entry('usage.read', 'read', 'engine', 'Read the usage figures of the engines the Gauge lists.'),
+  entry('models.read', 'read', 'engine', 'Read the models of the engines the Gauge lists.'),
+  entry('sessions.read', 'read', 'engine', 'Read the sessions of the engines the Gauge lists.'),
+  entry('sessions.stream', 'read', 'engine', 'Read the live message stream of a session on an engine the Gauge lists.'),
+  entry('sessions.start', 'act', 'engine', `Ask for a plan to start a session on an engine the Gauge lists.${NEVER_SKIPS}`),
+  entry('sessions.stop', 'act', 'engine', `Ask for a plan to stop a session on an engine the Gauge lists.${NEVER_SKIPS}`),
+  entry('sessions.attach', 'act', 'engine', `Ask for a plan to attach to a running session on an engine the Gauge lists.${NEVER_SKIPS}`),
+  entry('sessions.send', 'act', 'engine', `Ask for a plan to send text to a session on an engine the Gauge lists.${NEVER_SKIPS}`),
+  entry('layout.propose', 'write', 'none', `Ask for a plan to add the Gauge to the layout.${NEVER_SKIPS}`),
+  entry('jobs.read', 'read', 'none', 'Read the saved jobs and their runs.'),
+  entry('jobs.write', 'write', 'none', `Ask for a plan to create or change a job.${NEVER_SKIPS}`),
+  entry('jobs.run', 'act', 'none', `Ask for a plan to run a job.${NEVER_SKIPS}`),
+  entry('traces.facts', 'read', 'engine', 'Read the recorded facts of traces from the engines the Gauge lists. Denied until the person grants it.', true),
+  entry('traces.text', 'read', 'engine', 'Read the prompt and reply text of traces, together with traces.facts. Denied until the person grants it.', true),
+]);
+
+/** Every permission name, in the order of the list. Frozen. */
+export const PERMISSION_NAMES: readonly string[] = Object.freeze(PERMISSIONS.map(permission => permission.name));
+
+const BY_NAME: ReadonlyMap<string, PermissionEntry> = new Map(PERMISSIONS.map(permission => [permission.name, permission]));
+
+/** The entry of a permission, or `undefined` when the value is not a name in the list. */
+export function permissionOf(value: unknown): PermissionEntry | undefined {
+  return typeof value === 'string' ? BY_NAME.get(value) : undefined;
+}
+
+/** True when the value is a name in the list. */
+export function isPermission(value: unknown): value is string {
+  return permissionOf(value) !== undefined;
+}
+
+/** True when the value is the name of a traces permission. */
+export function isTracesPermission(value: unknown): boolean {
+  return permissionOf(value)?.traces === true;
+}
+
+/**
+ * Why a call about grants was refused, as a closed set. The code `GAUGE_GRANT_MISSING` says what class of refusal it is, and the reason says which rule.
+ * A reason never holds a value that a caller sent.
+ *
+ * - `unknown_permission`: a name that is not in the list.
+ * - `not_declared`: a listed name that the Gauge's manifest does not declare.
+ * - `engine_not_listed`: an engine that the Gauge's manifest does not list, or no engine for a permission that needs one.
+ * - `gauge_disabled`: the Gauge is disabled, so it holds no active grant.
+ * - `not_held`: a revoke of a permission that the Gauge does not hold.
+ * - `invalid_request`: a request of the wrong shape: not a list of names, an empty list, a repeat, or a value that is not text.
+ */
+export const GRANT_REASONS = Object.freeze(['unknown_permission', 'not_declared', 'engine_not_listed', 'gauge_disabled', 'not_held', 'invalid_request'] as const);
+export type GrantReason = (typeof GRANT_REASONS)[number];
+
+const GRANT_REASON_SET: ReadonlySet<string> = new Set(GRANT_REASONS);
+
+/** True when the value is one of the grant reasons. */
+export function isGrantReason(value: unknown): value is GrantReason {
+  return typeof value === 'string' && GRANT_REASON_SET.has(value);
+}

@@ -1,6 +1,10 @@
 import { isGaugeCode, type GaugeCode } from '../../gauge-errors/src/index.js';
-import { isManifestReason } from '../../gauge-manifest/src/index.js';
-import { PLAN_ACTIONS, type Core, type CoreMethod, type CoreResult, type GaugeApplied, type GaugePlan, type GaugeSummary, type PlanAction } from './types.js';
+import { isGrantReason, isManifestReason, isPermission, isTracesPermission } from '../../gauge-manifest/src/index.js';
+import {
+  PLAN_ACTIONS,
+  type AuditEntry, type Core, type CoreMethod, type CoreResult, type GaugeApplied, type GaugePlan, type GaugeSummary, type GrantApplied, type GrantEntry, type GrantPlan, type GrantRevoked,
+  type PermissionCheck, type PlanAction,
+} from './types.js';
 
 /** The core broke the contract: a reply of the wrong shape, or a code outside the registry. This is a bug, not a refusal. It names the method that failed. */
 export class CoreProtocolError extends Error {
@@ -35,6 +39,23 @@ export interface CoreClient {
   applyPlan(plan: GaugePlan, approval?: string): Promise<CoreResult<GaugeApplied>>;
   /** Lists the routes of the enabled Gauges. A disabled or removed Gauge has none. */
   listRoutes(): Promise<CoreResult<readonly string[]>>;
+  /**
+   * Plans a grant of permissions to an installed Gauge. Nothing changes until the plan is applied with the person's approval. The plan binds to the manifest hash and
+   * the folder hash of the Gauge, so a changed manifest asks again. Traces permissions go in a plan of their own: a plan that mixes them is refused with `GAUGE_TRACES_OWN_STEP`.
+   */
+  planGrant(id: string, permissions: readonly string[]): Promise<CoreResult<GrantPlan>>;
+  /** Applies a grant plan. Like a lifecycle plan it needs the person's approval of this exact plan: without one the core refuses with `GAUGE_PLAN_NOT_APPROVED`, with a changed plan `GAUGE_PLAN_CHANGED`. */
+  applyGrant(plan: GrantPlan, approval?: string): Promise<CoreResult<GrantApplied>>;
+  /** Revokes permissions of a Gauge, in one action, with no plan. Access ends at once. Refuses with `GAUGE_GRANT_MISSING` (reason `not_held`) when a permission is not granted, and then changes nothing. */
+  revoke(id: string, permissions: readonly string[]): Promise<CoreResult<GrantRevoked>>;
+  /** Revokes every traces permission that the Gauge holds, in one action. */
+  revokeTraces(id: string): Promise<CoreResult<GrantRevoked>>;
+  /** Lists the grants a Gauge holds, sorted by permission name. A grant of an earlier manifest or folder has `current: false`. */
+  listGrants(id: string): Promise<CoreResult<readonly GrantEntry[]>>;
+  /** Asks whether a Gauge may use a permission now, for an engine. The engine must be one the Gauge lists, and is left out for a permission that touches no engine. */
+  checkPermission(gauge: string, permission: string, engine?: string): Promise<CoreResult<PermissionCheck>>;
+  /** Reads the audit file: every grant and revoke still held, oldest first. The file has a size cap, so the oldest records may be gone. */
+  readAudit(): Promise<CoreResult<readonly AuditEntry[]>>;
 }
 
 const SHOWN_LENGTH = 64;
@@ -108,6 +129,52 @@ function appliedOf(value: unknown): GaugeApplied | undefined {
   return Object.freeze({ action: action as PlanAction, id, version, enabled });
 }
 
+const sameList = (left: readonly string[], right: readonly string[]): boolean => left.length === right.length && left.every((item, index) => item === right[index]);
+const isText = (value: unknown): value is string => typeof value === 'string';
+/** True when the list is in strict order, so sorted with no repeat. Names compare by code unit, and permission names are plain ASCII. */
+const isStrictlyIncreasing = (list: readonly string[]): boolean => list.every((item, index) => index === 0 || (list[index - 1] ?? '') < item);
+const ISO_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
+const isIsoTime = (value: unknown): value is string => typeof value === 'string' && ISO_TIME.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
+
+/** Reads a list of permission names from a value: names of the list, sorted, once each. Anything else reads as `undefined`. */
+function permissionNames(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value) || !value.every((item): item is string => isPermission(item))) return undefined;
+  return isStrictlyIncreasing(value) ? [...value] : undefined;
+}
+
+/** Builds a grant plan from a value, or gives back `undefined` when it is not one. */
+function grantPlanOf(value: unknown): GrantPlan | undefined {
+  if (!isRecord(value)) return undefined;
+  const action = own(value, 'action'), id = own(value, 'id'), version = own(value, 'version'), permissions = permissionNames(own(value, 'permissions')), steps = own(value, 'steps');
+  const digest = own(value, 'digest'), manifestHash = nullableHash(own(value, 'manifestHash')), folderHash = nullableHash(own(value, 'folderHash')), nonce = own(value, 'nonce');
+  if (action !== 'grant' || typeof id !== 'string' || id === '' || typeof version !== 'string' || !permissions || permissions.length === 0) return undefined;
+  const traces = permissions.filter(isTracesPermission).length;
+  if (traces !== 0 && traces !== permissions.length) return undefined;
+  if (!Array.isArray(steps) || !steps.every(isText)) return undefined;
+  if (typeof digest !== 'string' || !HEX_64.test(digest) || manifestHash === undefined || folderHash === undefined || typeof nonce !== 'string' || !HEX_64.test(nonce)) return undefined;
+  return Object.freeze({ action, id, version, permissions: Object.freeze(permissions), steps: Object.freeze([...steps]), digest, manifestHash, folderHash, nonce });
+}
+
+/** Builds one grant of a list from a value, or gives back `undefined` when it is not one. */
+function grantEntryOf(value: unknown): GrantEntry | undefined {
+  if (!isRecord(value)) return undefined;
+  const permission = own(value, 'permission'), manifestHash = nullableHash(own(value, 'manifestHash')), folderHash = nullableHash(own(value, 'folderHash')), isCurrent = own(value, 'current');
+  if (!isPermission(permission) || manifestHash === undefined || folderHash === undefined || typeof isCurrent !== 'boolean') return undefined;
+  return Object.freeze({ permission, manifestHash, folderHash, current: isCurrent });
+}
+
+/** Builds one audit record from a value, or gives back `undefined` when it is not one. The action and the way must fit: a grant is by a plan, and a revoke is by a revoke or a removal. */
+function auditEntryOf(value: unknown): AuditEntry | undefined {
+  if (!isRecord(value)) return undefined;
+  const seq = own(value, 'seq'), at = own(value, 'at'), action = own(value, 'action'), via = own(value, 'via'), id = own(value, 'id'), version = nullableText(own(value, 'version'));
+  const permission = own(value, 'permission'), manifestHash = nullableHash(own(value, 'manifestHash')), folderHash = nullableHash(own(value, 'folderHash'));
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 1 || !isIsoTime(at) || typeof id !== 'string' || id === '' || version === undefined) return undefined;
+  if (!isPermission(permission) || manifestHash === undefined || folderHash === undefined) return undefined;
+  const fits = action === 'grant' ? via === 'plan' : action === 'revoke' && (via === 'revoke' || via === 'remove');
+  if (!fits || (action !== 'grant' && action !== 'revoke') || (via !== 'plan' && via !== 'revoke' && via !== 'remove')) return undefined;
+  return Object.freeze({ seq, at, action, via, id, version, permission, manifestHash, folderHash });
+}
+
 /** Builds the client on a core: the fake core now, the real core later. */
 export function createCoreClient(core: Core): CoreClient {
   /** Calls the core, then reads the reply. A throw from the call itself reaches the caller unchanged. A throw while reading the reply is a protocol error. */
@@ -120,8 +187,13 @@ export function createCoreClient(core: Core): CoreClient {
         const code = refusal(method, own(reply, 'code'));
         const reason = own(reply, 'reason');
         if (reason === undefined) return { ok: false, code };
-        if (!isManifestReason(reason)) throw new CoreProtocolError(method, `refusal reason is not one of the closed set: ${shown(reason)}`);
-        return { ok: false, code, reason };
+        // A grant reason goes with the grant code only, and a manifest reason with any other code. Each reason is from a closed set.
+        if (code === 'GAUGE_GRANT_MISSING') {
+          if (isGrantReason(reason)) return { ok: false, code, reason };
+        } else if (isManifestReason(reason)) {
+          return { ok: false, code, reason };
+        }
+        throw new CoreProtocolError(method, `refusal reason is not one of the closed set: ${shown(reason)}`);
       }
       if (ok !== true) throw new CoreProtocolError(method, 'reply has no boolean ok');
       return { ok: true, value: read(method, own(reply, 'result')) };
@@ -144,6 +216,13 @@ export function createCoreClient(core: Core): CoreClient {
       gauges.push(gauge);
     }
     return Object.freeze(gauges);
+  }
+  function revokedOf(method: CoreMethod, result: unknown, id: string): GrantRevoked {
+    if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not a revoke');
+    const resultId = own(result, 'id'), revoked = permissionNames(own(result, 'revoked'));
+    if (typeof resultId !== 'string' || !revoked) throw new CoreProtocolError(method, 'result is not a revoke');
+    if (resultId !== id) throw new CoreProtocolError(method, `result is for another Gauge: ${shown(resultId)}`);
+    return Object.freeze({ id: resultId, revoked: Object.freeze(revoked) });
   }
   const planning = (action: PlanAction, target: { id: string } | { folder: string }) => ask('bowerloom.gauges.plan', { action, ...target }, (method, result) => {
     const plan = planOf(result);
@@ -178,6 +257,59 @@ export function createCoreClient(core: Core): CoreClient {
         : applied.version === null;
       if (!fits) throw new CoreProtocolError(method, `result does not fit a ${plan.action}`);
       return applied;
+    }),
+    planGrant: (id, permissions) => ask('bowerloom.grants.plan', { id, permissions: [...permissions] }, (method, result) => {
+      const plan = grantPlanOf(result);
+      if (!plan) throw new CoreProtocolError(method, 'result is not a grant plan');
+      if (plan.id !== id) throw new CoreProtocolError(method, `result is a plan for another Gauge: ${shown(plan.id)}`);
+      if (!sameList(plan.permissions, [...permissions].sort())) throw new CoreProtocolError(method, 'result is a plan for other permissions than were asked');
+      return plan;
+    }),
+    applyGrant: (plan, approval) => ask('bowerloom.grants.apply', { plan: { ...plan, permissions: [...plan.permissions], steps: [...plan.steps] }, ...(approval === undefined ? {} : { approval }) }, (method, result) => {
+      if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not an applied grant');
+      const id = own(result, 'id'), permissions = permissionNames(own(result, 'permissions'));
+      if (typeof id !== 'string' || !permissions) throw new CoreProtocolError(method, 'result is not an applied grant');
+      if (id !== plan.id || !sameList(permissions, plan.permissions)) throw new CoreProtocolError(method, 'result is for another grant plan');
+      return Object.freeze({ id, permissions: Object.freeze(permissions) });
+    }),
+    revoke: (id, permissions) => ask('bowerloom.grants.revoke', { id, permissions: [...permissions] }, (method, result) => {
+      const revoked = revokedOf(method, result, id);
+      if (!sameList(revoked.revoked, [...permissions].sort())) throw new CoreProtocolError(method, 'result revokes other permissions than were asked');
+      return revoked;
+    }),
+    revokeTraces: id => ask('bowerloom.grants.revoke', { id, group: 'traces' }, (method, result) => {
+      const revoked = revokedOf(method, result, id);
+      if (revoked.revoked.length === 0 || !revoked.revoked.every(isTracesPermission)) throw new CoreProtocolError(method, 'result revokes more than the traces permissions');
+      return revoked;
+    }),
+    listGrants: id => ask('bowerloom.grants.list', { id }, (method, result) => {
+      if (!Array.isArray(result)) throw new CoreProtocolError(method, 'result is not a list');
+      const entries: GrantEntry[] = [];
+      for (let index = 0; index < result.length; index += 1) {
+        const entry = grantEntryOf(result[index]);
+        if (!entry) throw new CoreProtocolError(method, `result element ${index} is not a grant`);
+        entries.push(entry);
+      }
+      if (!isStrictlyIncreasing(entries.map(entry => entry.permission))) throw new CoreProtocolError(method, 'result is not sorted by permission, or repeats one');
+      return Object.freeze(entries);
+    }),
+    checkPermission: (gauge, permission, engine) => ask('bowerloom.permissions.check', { gauge, permission, ...(engine === undefined ? {} : { engine }) }, (method, result) => {
+      if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not a permission check');
+      const resultGauge = own(result, 'gauge'), resultPermission = own(result, 'permission'), resultEngine = nullableText(own(result, 'engine'));
+      if (typeof resultGauge !== 'string' || typeof resultPermission !== 'string' || resultEngine === undefined) throw new CoreProtocolError(method, 'result is not a permission check');
+      if (resultGauge !== gauge || resultPermission !== permission || resultEngine !== (engine ?? null)) throw new CoreProtocolError(method, 'result is for another call');
+      return Object.freeze({ gauge: resultGauge, permission: resultPermission, engine: resultEngine });
+    }),
+    readAudit: () => ask('bowerloom.audit.read', {}, (method, result) => {
+      if (!Array.isArray(result)) throw new CoreProtocolError(method, 'result is not a list');
+      const entries: AuditEntry[] = [];
+      for (let index = 0; index < result.length; index += 1) {
+        const entry = auditEntryOf(result[index]);
+        if (!entry) throw new CoreProtocolError(method, `result element ${index} is not an audit record`);
+        if (index > 0 && entry.seq <= (entries[index - 1]?.seq ?? 0)) throw new CoreProtocolError(method, 'result records do not rise in number');
+        entries.push(entry);
+      }
+      return Object.freeze(entries);
     }),
     listRoutes: () => ask('bowerloom.gauges.routes', {}, (method, result) => {
       if (!Array.isArray(result) || !result.every((route): route is string => typeof route === 'string' && route.length <= '/gauges/'.length + MAX_ID_LENGTH && ROUTE.test(route))) {

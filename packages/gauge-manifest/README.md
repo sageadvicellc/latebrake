@@ -32,10 +32,25 @@ All fields are required except `tile` and `page`. Any other field is `unknown_fi
 - `engines` is a list of up to 16 engine ids, with no repeat. An empty list means the Gauge serves no engine.
 - `tile` is `{ expandable, resizable, entry }`. A Gauge says whether its tile is expandable, resizable, both, or neither. A tile that is expandable needs a `page` to open.
 - `page` is `{ entry }`.
-- `permissions` is a list of up to 64 dotted names such as `engines.read`, with no repeat. The shape is checked here. Which names exist, and the grants, belong to the grants ticket.
+- `permissions` is a list of up to 64 dotted names, with no repeat. The shape is checked first (`invalid_field`). Then each name must be in the permission list below, so a name that is well formed but not listed is `GAUGE_MANIFEST_INVALID` (`unknown_permission`). A Gauge cannot invent a permission.
 - `dependencies` is a list of up to 32 `{ id, range }`, with no repeat and no Gauge that depends on itself. A range that nothing can satisfy is `invalid_field`.
 
 A `ui` Gauge has a `tile`, a `page`, or both, and each tile has an `entry`. A `data` Gauge holds no code, so it has no `page`, and its tile has no `entry`.
+
+## The permission list
+
+`src/permissions.ts` is the one place that lists the permissions and gives each a one-line meaning. A permission names one thing a Gauge can read or do. The person grants permissions per Gauge version. The grants themselves live in the core (`packages/core-api`), and this package only holds the list.
+
+Each entry has a `name`, a `kind` (`read`, `write`, or `act`), a `scope`, a `traces` flag, and a `meaning` that is one line and ends in a full stop. The list is frozen and keeps a fixed order. `PERMISSIONS` is the list, `PERMISSION_NAMES` the names, `permissionOf` reads one entry, `isPermission` and `isTracesPermission` test a value, and a prototype key such as `constructor` is never a permission.
+
+- `read` permissions read state. `write` and `act` permissions let a Gauge ask for a plan, and never let it skip the plan: the meaning of each says so in the same words, and the person approves every plan.
+- `scope` is `engine` for a permission that works only for an engine in the manifest's `engines` list, so a Gauge that lists one engine reads that engine only. It is `none` for a permission that touches no engine.
+- `traces` is true for `traces.facts` and `traces.text`. Traces permissions are denied by default, granted in their own step, and revoked in one action. A Gauge that reads the text of a trace needs the facts permission too: the meaning says so, and the Traces API enforces it, not this list.
+- There is no permission to react. A reaction is recorded only from the person's click on the core's reaction menu.
+
+The names are `engines.read`, `usage.read`, `models.read`, `sessions.read`, `sessions.stream`, `sessions.start`, `sessions.stop`, `sessions.attach`, `sessions.send`, `layout.propose`, `jobs.read`, `jobs.write`, `jobs.run`, `traces.facts`, and `traces.text`. A test pins this list, so a change to it fails on purpose.
+
+`GRANT_REASONS` is a second closed set of reasons, for a refusal of a call about grants. The core pairs it with the code `GAUGE_GRANT_MISSING` only. See `packages/core-api/README.md`.
 
 ## Origin
 

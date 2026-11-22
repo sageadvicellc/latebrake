@@ -6,3 +6,5 @@ export type { GaugeDependency, GaugeManifest, GaugePage, GaugeTile, ManifestReas
 export { isUnsafeFolderName, unsafeNameReason, unsafePathReason } from './paths.js';
 export { looksLikeSecret } from './secrets.js';
 export { parseStrictJson } from './strict-json.js';
+export { GRANT_REASONS, PERMISSIONS, PERMISSION_KINDS, PERMISSION_NAMES, isGrantReason, isPermission, isTracesPermission, permissionOf } from './permissions.js';
+export type { GrantReason, PermissionEntry, PermissionKind } from './permissions.js';

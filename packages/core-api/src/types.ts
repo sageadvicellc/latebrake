@@ -1,10 +1,12 @@
 import type { GaugeCode } from '../../gauge-errors/src/index.js';
-import type { ManifestReason } from '../../gauge-manifest/src/index.js';
+import type { GrantReason, ManifestReason } from '../../gauge-manifest/src/index.js';
 
 /** The wire names of the calls the core offers. Wire identifiers keep the `bowerloom` prefix until the rename. */
 export type CoreMethod =
   | 'bowerloom.gauges.list' | 'bowerloom.gauges.get'
-  | 'bowerloom.gauges.plan' | 'bowerloom.gauges.apply' | 'bowerloom.gauges.routes';
+  | 'bowerloom.gauges.plan' | 'bowerloom.gauges.apply' | 'bowerloom.gauges.routes'
+  | 'bowerloom.grants.plan' | 'bowerloom.grants.apply' | 'bowerloom.grants.revoke' | 'bowerloom.grants.list'
+  | 'bowerloom.permissions.check' | 'bowerloom.audit.read';
 
 /** The five steps of a Gauge's life, in one list that the client and the fake core both use. Each goes through a plan and an approval. An update is an install plan of the new version. */
 export const PLAN_ACTIONS = Object.freeze(['install', 'enable', 'disable', 'update', 'remove'] as const);
@@ -56,6 +58,68 @@ export interface GaugeSummary {
   readonly protected: boolean;
 }
 
+/**
+ * What a grant would do, shown to the person before anything changes. `permissions` are the names to grant, once each, sorted. `version`, `manifestHash`, and
+ * `folderHash` are those of the installed Gauge (the hashes come from the install plan, and are `null` for a Gauge that the core started with). A grant binds to
+ * both hashes, so it holds no longer when the manifest or any file of the folder changes. `digest` is the SHA-256 of the plan, in lower-case hex, and `nonce` is
+ * issued by the core for this one plan and is not in the digest. A nonce is exactly 64 lowercase hexadecimal characters. A Gauge never makes an approval.
+ */
+export interface GrantPlan {
+  readonly action: 'grant';
+  readonly id: string;
+  readonly version: string;
+  readonly permissions: readonly string[];
+  readonly steps: readonly string[];
+  readonly digest: string;
+  readonly manifestHash: string | null;
+  readonly folderHash: string | null;
+  readonly nonce: string;
+}
+
+/** What an applied grant gives back: the Gauge and the permissions that are now granted, sorted. */
+export interface GrantApplied {
+  readonly id: string;
+  readonly permissions: readonly string[];
+}
+
+/** What a revoke gives back: the Gauge and the permissions that were revoked, sorted. */
+export interface GrantRevoked {
+  readonly id: string;
+  readonly revoked: readonly string[];
+}
+
+/** One grant a Gauge holds. `current` is false when the grant belongs to an earlier manifest or folder, so the person must grant again. */
+export interface GrantEntry {
+  readonly permission: string;
+  readonly manifestHash: string | null;
+  readonly folderHash: string | null;
+  readonly current: boolean;
+}
+
+/** What a permission check gives back when the call is allowed. `engine` is `null` for a permission that touches no engine. */
+export interface PermissionCheck {
+  readonly gauge: string;
+  readonly permission: string;
+  readonly engine: string | null;
+}
+
+/**
+ * One record of the audit file: a grant or a revoke of one permission. `seq` starts at 1 and counts every record ever written, so it is never reused,
+ * also after the oldest records were dropped to keep the file under its cap. `at` is an ISO 8601 time in UTC with milliseconds. `via` says how: `plan` is an
+ * approved grant plan, `revoke` is a revoke call, and `remove` is the removal of the Gauge. The hashes are those the grant is bound to.
+ */
+export interface AuditEntry {
+  readonly seq: number;
+  readonly at: string;
+  readonly action: 'grant' | 'revoke';
+  readonly via: 'plan' | 'revoke' | 'remove';
+  readonly id: string;
+  readonly version: string | null;
+  readonly permission: string;
+  readonly manifestHash: string | null;
+  readonly folderHash: string | null;
+}
+
 /** The raw answer of a core: a result, or a refusal with a code. The client checks the code against the registry. */
 export type CoreReply =
   | { readonly ok: true; readonly result: unknown }
@@ -69,9 +133,10 @@ export interface Core {
 }
 
 /**
- * What a client call gives back: the value, or a stable code of the registry. A refusal of a manifest may also carry a `reason`, a word of the closed set
- * of `packages/gauge-manifest`, which says which rule it broke when several rules share one code. A reason is never a value from the manifest.
+ * What a client call gives back: the value, or a stable code of the registry. A refusal may also carry a `reason`, a word of a closed set of `packages/gauge-manifest`,
+ * which says which rule it broke when several rules share one code. The manifest reasons go with the manifest and path codes. The grant reasons go with
+ * `GAUGE_GRANT_MISSING` only. A reason is never a value that a caller or a manifest sent.
  */
 export type CoreResult<T> =
   | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly code: GaugeCode; readonly reason?: ManifestReason };
+  | { readonly ok: false; readonly code: GaugeCode; readonly reason?: ManifestReason | GrantReason };

@@ -14,7 +14,7 @@ To add a code, write its test in `test/registry.test.mjs` first, then add one li
 
 ## Scope of the starter set
 
-The set covers manifest, lifecycle, grant, layout, and plan refusals. A refusal to hide, remove, or replace a protected Gauge, such as the Gauge manager, reuses `GAUGE_PROTECTED`. In v0.9.1 Gauges have layout slots and no routes, so there are no route codes. Later tickets own any further codes.
+The set covers manifest, lifecycle, grant, layout, and plan refusals. `GAUGE_TRACES_OWN_STEP` is the one code of the grants ticket: the other grant refusals reuse `GAUGE_GRANT_MISSING` and `GAUGE_GRANT_STALE` with a reason. A refusal to hide, remove, or replace a protected Gauge, such as the Gauge manager, reuses `GAUGE_PROTECTED`. In v0.9.1 Gauges have layout slots and no routes, so there are no route codes. Later tickets own any further codes.
 
 ## The old-literal fixture
 
