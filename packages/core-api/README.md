@@ -8,8 +8,25 @@ A Gauge reaches the core only through the client (`createCoreClient`). The clien
 
 - `listGauges()` gives the Gauges the core holds.
 - `getGauge(id)` gives one Gauge, or the refusal `UNKNOWN_GAUGE`.
+- `planInstall(folder)`, `planUpdate(folder)`, `planEnable(id)`, `planDisable(id)`, and `planRemove(id)` each give a plan and change nothing.
+- `applyPlan(plan, approval?)` applies a plan that the person approved.
+- `listRoutes()` gives the routes of the enabled Gauges.
 
 Each call gives `{ ok: true, value }` or `{ ok: false, code }`. Wire names keep the `bowerloom` prefix, such as `bowerloom.gauges.list`.
+
+## Install, enable, disable, update, and remove
+
+Each of the five steps goes through a plan and an approval. A plan says what would change and has a `digest`. A person approves one digest in the app, and the approval works once. A Gauge never makes an approval, so the client has no call for it. The core applies a plan only when it holds an approval of that exact plan and the plan would still be the same plan now:
+
+- No approval, or an approval the core does not know: `GAUGE_PLAN_NOT_APPROVED`.
+- An approval of another plan, a plan that was changed, or a plan the state has moved past: `GAUGE_PLAN_CHANGED`.
+- A plan that no longer applies, such as an install of an id that is now installed: the code of that refusal, such as `GAUGE_EXISTS`.
+
+Install adds a Gauge disabled. Update is an install plan of the new version, and it keeps the Gauge enabled or disabled as it was. Only an enabled Gauge has a route, `/gauges/<id>`, so a disabled or removed Gauge has none. A removed Gauge is gone from the list, from reads, and from the routes.
+
+The core loads a folder through `packages/gauge-manifest`. It sets `origin` from where it found the folder (`bundled` is stock, `user` is third-party), and a manifest cannot set it. A manifest that needs a newer Core API version is refused at the plan, so it never loads. A third-party Gauge can never be protected, and a user folder cannot install over or update a stock Gauge (`GAUGE_EXISTS`, `GAUGE_NAME_RESERVED`). A folder name that is a link, hidden, or has two dots is `GAUGE_PATH_UNSAFE`, and so is a folder that is a link. A folder the core cannot find is `UNKNOWN_GAUGE`.
+
+A plan has eight fields: `action`, `id`, `folder`, `from`, `to`, `origin`, `steps`, and `digest`. An applied plan gives `{ action, id, version, enabled }`.
 
 ## What the client checks in a reply
 
@@ -40,6 +57,10 @@ Codes come from the registry in `packages/gauge-errors`, which is the package `@
 ## The fake core is for tests
 
 `src/index.ts` exports the client, its types, and `CoreProtocolError`. It does not export the fake core or the fixtures, so product code cannot reach them by accident. A test imports them from their own modules: `createFakeCore` from `src/fake-core.js` and `FIXTURE_GAUGES` from `src/fixtures.js`.
+
+## The lifecycle suite
+
+`test/lifecycle-suite.ts` exports `runLifecycleSuite(name, makeHarness)`. `makeHarness(folders)` gives a core that holds those Gauge folders, and a way to approve a plan. In the app a person approves, so the real core's harness supplies that step. The suite checks the manifest fixtures at load (each with its code), origin, the plan and approval rules for all five steps, and the routes. `test/fake-core.test.ts` runs it on the fake core, which has its own `approve`.
 
 ## The client suite
 
