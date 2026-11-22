@@ -26,7 +26,8 @@ const ENTRIES = [
   { code: 'GAUGE_EXISTS', meaning: 'A Gauge with that id is already installed.' },
   { code: 'GAUGE_PROTECTED', meaning: 'A protected Gauge cannot be hidden, removed, or replaced.' },
   { code: 'GAUGE_REMOVE_INCOMPLETE', meaning: 'A removal stopped part way, so some files or grants of the Gauge remain.' },
-  { code: 'GAUGE_NAME_RESERVED', meaning: 'The Gauge id is reserved by the app and no Gauge may use it.' },
+  { code: 'GAUGE_NAME_RESERVED', meaning: 'The Gauge id is reserved by the app, and no user Gauge may use it.' },
+  { code: 'GAUGE_VERSION_NOT_NEWER', meaning: 'An update must be a newer version than the one installed.' },
   // Grants
   { code: 'GAUGE_GRANT_MISSING', meaning: 'The call needs a permission that the person has not granted to this Gauge.' },
   { code: 'GAUGE_GRANT_STALE', meaning: 'The grant belongs to an earlier manifest or folder, so the person must grant again.' },

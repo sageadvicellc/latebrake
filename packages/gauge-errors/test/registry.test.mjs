@@ -14,7 +14,7 @@ const digest = text => createHash('sha256').update(text).digest('hex');
 // The stable codes. A removed or renamed code fails here on purpose: a code is a promise to Gauge authors.
 const STABLE = [
   'GAUGE_MANIFEST_INVALID', 'GAUGE_MANIFEST_TOO_LARGE', 'GAUGE_PATH_UNSAFE', 'GAUGE_SECRET_FOUND', 'GAUGE_API_UNSUPPORTED',
-  'UNKNOWN_GAUGE', 'GAUGE_EXISTS', 'GAUGE_PROTECTED', 'GAUGE_REMOVE_INCOMPLETE', 'GAUGE_NAME_RESERVED',
+  'UNKNOWN_GAUGE', 'GAUGE_EXISTS', 'GAUGE_PROTECTED', 'GAUGE_REMOVE_INCOMPLETE', 'GAUGE_NAME_RESERVED', 'GAUGE_VERSION_NOT_NEWER',
   'GAUGE_GRANT_MISSING', 'GAUGE_GRANT_STALE',
   'GAUGE_LAYOUT_INVALID',
   'GAUGE_PLAN_NOT_APPROVED', 'GAUGE_PLAN_CHANGED',
@@ -121,6 +121,11 @@ test('the word GAUGE may lead, follow, or sit in the middle of a code', () => {
 test('each new code has its own meaning, and the two removal and name codes are in the registry', () => {
   assert.match(GAUGE_MEANINGS.GAUGE_REMOVE_INCOMPLETE, /remov/i);
   assert.match(GAUGE_MEANINGS.GAUGE_NAME_RESERVED, /reserved/i);
+});
+
+test('the two codes of the update rules say what they refuse', () => {
+  assert.equal(GAUGE_MEANINGS.GAUGE_NAME_RESERVED, 'The Gauge id is reserved by the app, and no user Gauge may use it.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_VERSION_NOT_NEWER, 'An update must be a newer version than the one installed.');
 });
 
 test('isGaugeCode accepts a registry code and refuses everything else', () => {
