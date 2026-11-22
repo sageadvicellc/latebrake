@@ -21,11 +21,17 @@ The client does not trust the core. It throws `CoreProtocolError` when any of th
 - On a list, the result is a list, and every element is a Gauge summary.
 - On a read, the result is a Gauge summary, and its `id` is the id that was asked for.
 
-A Gauge summary has these fields, all present: `id`, `title`, and `version` are strings, `kind` is `ui` or `data`, `origin` is `stock` or `third-party`, and `protected` is a boolean. A field beyond these is not checked and passes through.
+Only the own properties of an object count. A field that an object inherits, from its prototype, reads as missing.
 
-`CoreProtocolError` carries the `method` that failed, and its message starts with it. A code that is not valid is printed as a quoted string, cut to 64 characters, on one line.
+A Gauge summary has these six fields, all present: `id`, `title`, and `version` are strings, `kind` is `ui` or `data`, `origin` is `stock` or `third-party`, and `protected` is a boolean. The client reads each field once and checks the value it read. It hands back a new frozen object made from those six values. Any other field is dropped. A list is frozen too.
 
-A core that throws is not wrapped. Its own error reaches the caller unchanged. A later ticket decides how transport failures map to codes.
+`ok` decides. A reply with `ok: true` is a success, and a `code` that it also carries is ignored. A reply with `ok: false` is a refusal, and a `result` that it also carries is ignored.
+
+A throw while the client reads a reply, from a getter or a proxy, becomes a `CoreProtocolError`.
+
+`CoreProtocolError` carries the `method` that failed, and its message starts with it. A value that is shown in a message is printed as JSON on one line. It is cut once to 64 characters, between two pieces of text so an escape is never split, and it ends with `...` when it was cut.
+
+A core that throws from the call itself is not wrapped. Its own error reaches the caller unchanged. A later ticket decides how transport failures map to codes.
 
 ## Where the codes come from
 

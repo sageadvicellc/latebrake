@@ -68,15 +68,26 @@ for (const [name, code] of [['a number', 42], ['null', null], ['missing', undefi
   });
 }
 
-test('the client prints a hostile refusal code as a quoted string cut to 64 characters', async () => {
-  const hostile = 'X'.repeat(500);
-  await assert.rejects(createCoreClient(scripted({ ok: false, code: hostile })).listGauges(), (error: unknown) => {
+test('the client prints a hostile refusal code as a quoted string cut to 64 characters, marked as cut', async () => {
+  await assert.rejects(createCoreClient(scripted({ ok: false, code: 'X'.repeat(500) })).listGauges(), (error: unknown) => {
     assert.ok(error instanceof CoreProtocolError);
-    assert.ok(error.message.includes(JSON.stringify('X'.repeat(64))), error.message);
-    assert.equal(error.message.includes('X'.repeat(65)), false);
+    assert.ok(error.message.includes('"' + 'X'.repeat(63) + '...'), error.message);
+    assert.equal(error.message.includes('X'.repeat(64)), false);
     return true;
   });
 });
+
+for (const [name, tail] of [['a line break', '\n'], ['a unicode escape', '\u0001'], ['a quote', '"'], ['a backslash', '\\']] as const) {
+  test(`the client never cuts ${name} in half when it prints a long code`, async () => {
+    // The quoted text is the opening quote, 62 letters, and then the tail, so the 64-character cut would fall inside the tail.
+    const code = 'a'.repeat(62) + tail + 'b'.repeat(20);
+    await assert.rejects(createCoreClient(scripted({ ok: false, code })).listGauges(), (error: unknown) => {
+      assert.ok(error instanceof CoreProtocolError);
+      assert.ok(error.message.endsWith('"' + 'a'.repeat(62) + '...'), error.message);
+      return true;
+    });
+  });
+}
 
 test('the client prints a code with line breaks escaped, on one line', async () => {
   await assert.rejects(createCoreClient(scripted({ ok: false, code: 'A\nB' })).listGauges(), (error: unknown) => error instanceof CoreProtocolError && !error.message.includes('\n'));
@@ -130,4 +141,96 @@ test('the client does not wrap an error that the core throws', async () => {
   const core: Core = { call: async () => { throw failure; } };
   await assert.rejects(createCoreClient(core).listGauges(), (error: unknown) => error === failure);
   await assert.rejects(createCoreClient(core).getGauge('x'), (error: unknown) => error === failure);
+});
+
+// A refusal of a read.
+test('the client rejects a read refusal whose code is not a string', async () => {
+  await assert.rejects(createCoreClient(scripted({ ok: false, code: 42 })).getGauge('x'), (error: unknown) => error instanceof CoreProtocolError && error.method === 'bowerloom.gauges.get' && /not a string/.test(error.message));
+});
+
+test('the client rejects a read refusal whose code is not in the registry', async () => {
+  await assert.rejects(createCoreClient(scripted({ ok: false, code: 'MADE_UP_CODE' })).getGauge('x'), (error: unknown) => error instanceof CoreProtocolError && error.method === 'bowerloom.gauges.get' && /MADE_UP_CODE/.test(error.message));
+});
+
+// A reply that carries both a result and a code. The word ok decides.
+test('the client treats an ok reply as a success and ignores a code that it also carries', async () => {
+  assert.deepEqual(await createCoreClient(scripted({ ok: true, code: 'NOT_A_CODE', result: [GOOD] })).listGauges(), { ok: true, value: [GOOD] });
+});
+
+test('the client treats a refusal as a refusal and ignores a result that it also carries', async () => {
+  assert.deepEqual(await createCoreClient(scripted({ ok: false, code: 'UNKNOWN_GAUGE', result: 'not read' })).getGauge('x'), { ok: false, code: 'UNKNOWN_GAUGE' });
+});
+
+// What the client hands back is built from the six fields it read, and from nothing else.
+test('the client drops a field that is not one of the six', async () => {
+  const result = await reading({ ...GOOD, extra: 1, note: 'x' });
+  assert.ok(result.ok);
+  assert.deepEqual(result.value, GOOD);
+  assert.equal('extra' in result.value, false);
+});
+
+test('the client drops an own "__proto__" field that came from JSON and does not pollute anything', async () => {
+  const parsed: unknown = JSON.parse(JSON.stringify(GOOD).replace('{', '{"__proto__":{"polluted":true},'));
+  const result = await reading(parsed);
+  assert.ok(result.ok);
+  assert.equal(Object.hasOwn(result.value, '__proto__'), false);
+  assert.equal(Object.getPrototypeOf(result.value), Object.prototype);
+  assert.equal(({} as { polluted?: boolean }).polluted, undefined);
+});
+
+test('the client gives back a fresh frozen Gauge, not the object the core sent', async () => {
+  const sent = { ...GOOD };
+  const result = await reading(sent);
+  assert.ok(result.ok);
+  assert.notEqual(result.value, sent);
+  assert.equal(Object.isFrozen(result.value), true);
+  sent.title = 'changed later';
+  assert.equal(result.value.title, GOOD.title);
+});
+
+test('the client gives back a frozen list of frozen Gauges', async () => {
+  const result = await createCoreClient(listing({ ...GOOD })).listGauges();
+  assert.ok(result.ok);
+  assert.equal(Object.isFrozen(result.value), true);
+  assert.equal(Object.isFrozen(result.value[0]), true);
+});
+
+for (const [name, make] of [
+  ['an object that inherits its fields', () => Object.create(GOOD)],
+  ['an object whose prototype holds its fields', () => ({ __proto__: GOOD })],
+] as const) {
+  test(`the client rejects a Gauge that is ${name}`, async () => {
+    await assert.rejects(reading(make()), CoreProtocolError);
+  });
+  test(`the client rejects a list that holds a Gauge that is ${name}`, async () => {
+    await assert.rejects(createCoreClient(listing(make())).listGauges(), CoreProtocolError);
+  });
+}
+
+test('the client reads each field once, so a getter cannot show one value to the check and another to the caller', async () => {
+  let reads = 0;
+  const shifty = { ...GOOD, get kind() { reads += 1; return reads === 1 ? 'ui' : 'process'; } };
+  const result = await reading(shifty);
+  assert.ok(result.ok);
+  assert.equal(reads, 1);
+  assert.equal(result.value.kind, 'ui');
+});
+
+// A reply that throws when it is read.
+const boom = () => { throw new Error('boom'); };
+for (const [name, reply] of [
+  ['a getter on the reply', { get ok() { return boom(); }, result: [] }],
+  ['a getter on the result', { ok: true, get result() { return boom(); } }],
+  ['a proxy as the reply', new Proxy({}, { getOwnPropertyDescriptor: boom, get: (_target, key) => (key === 'then' ? undefined : boom()), has: boom })],
+  ['a proxy as the list', { ok: true, result: new Proxy([], { get: boom }) }],
+] as const) {
+  test(`the client turns a throw from ${name} into a CoreProtocolError that names the method`, async () => {
+    await assert.rejects(createCoreClient(scripted(reply)).listGauges(), (error: unknown) => error instanceof CoreProtocolError && error.method === 'bowerloom.gauges.list');
+  });
+}
+
+test('the client turns a throw from a getter on a Gauge into a CoreProtocolError that names the method', async () => {
+  const hostile = { ...GOOD, get title() { return boom(); } };
+  await assert.rejects(reading(hostile), (error: unknown) => error instanceof CoreProtocolError && error.method === 'bowerloom.gauges.get');
+  await assert.rejects(createCoreClient(listing(hostile)).listGauges(), CoreProtocolError);
 });

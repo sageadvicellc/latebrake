@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createFakeCore } from '../src/fake-core.js';
-import { createCoreClient } from '../src/client.js';
 import { FIXTURE_GAUGES } from '../src/fixtures.js';
 import { DEFAULT_EXPECTED, runClientSuite } from './client-suite.js';
 
@@ -23,12 +22,13 @@ test('fixture data holds one protected Gauge and one that a person may remove', 
 });
 
 test('a caller that changes a listed Gauge does not change what the core answers next', async () => {
-  const client = createCoreClient(createFakeCore());
-  const first = await client.listGauges();
+  const core = createFakeCore();
+  const first = await core.call('bowerloom.gauges.list', {});
   assert.ok(first.ok);
-  (first.value[0] as { title: string }).title = 'changed';
-  (first.value as unknown as unknown[]).length = 0;
-  assert.deepEqual(await client.listGauges(), { ok: true, value: FIXTURE_GAUGES });
+  const listed = first.result as { title: string }[];
+  listed[0]!.title = 'changed';
+  listed.length = 0;
+  assert.deepEqual(await core.call('bowerloom.gauges.list', {}), { ok: true, result: FIXTURE_GAUGES });
 });
 
 test('two fake cores do not share state', async () => {
