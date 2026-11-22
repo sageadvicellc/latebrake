@@ -2,6 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CORE_API_VERSION, compareVersions, parseRange, parseVersion, rangeIncludes, rangeIsSatisfiable } from '../src/api-version.js';
 
+const rangeOf = (text: string) => {
+  const range = parseRange(text);
+  assert.ok(range, text);
+  return range;
+};
+
 test('the Core API has a semantic version', () => {
   assert.ok(parseVersion(CORE_API_VERSION));
 });
@@ -26,7 +32,7 @@ test('a range includes the versions between its comparators', () => {
 });
 
 test('each comparator operator works at its edge', () => {
-  const has = (text: string, version: [number, number, number]) => rangeIncludes(parseRange(text)!, version);
+  const has = (text: string, version: [number, number, number]) => rangeIncludes(rangeOf(text), version);
   assert.equal(has('>1.0.0', [1, 0, 0]), false);
   assert.equal(has('>1.0.0', [1, 0, 1]), true);
   assert.equal(has('<=1.0.0', [1, 0, 0]), true);
@@ -45,7 +51,7 @@ test('versions compare by major, then minor, then patch', () => {
 });
 
 test('a range that nothing can satisfy is found, and a range that something can satisfy is not', () => {
-  const satisfiable = (text: string) => rangeIsSatisfiable(parseRange(text)!);
+  const satisfiable = (text: string) => rangeIsSatisfiable(rangeOf(text));
   for (const text of ['>=2.0.0 <1.0.0', '>=1.0.0 <1.0.0', '>1.0.0 <=1.0.0', '>1.0.0 <1.0.1', '=1.0.0 >1.0.0', '<0.0.0', '=1.0.0 =1.0.1', '>2.0.0 =2.0.0']) assert.equal(satisfiable(text), false, text);
   for (const text of ['>=1.0.0 <2.0.0', '>=1.0.0', '<0.0.1', '<=0.0.0', '=1.0.0', '>1.0.0 <1.0.2', '>=1.0.0 <=1.0.0', '>999999999.0.0', '<1.0.0']) assert.equal(satisfiable(text), true, text);
 });

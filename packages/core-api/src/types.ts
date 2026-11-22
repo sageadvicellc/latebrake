@@ -15,11 +15,14 @@ export type PlanAction = (typeof PLAN_ACTIONS)[number];
  * `from` is the installed version and `to` the version after the step, each `null` when there is none. `origin` is set by the core. `digest` is the
  * SHA-256 of the plan, in lower-case hex. An approval is for one digest, so a changed plan needs a new approval.
  *
- * `manifestHash` is the SHA-256 of the bytes of `gauge.json`. `folderHash` is the SHA-256 over every file of the Gauge's folder: the files in order
- * of name, and for each file `<byte length of the name>:<name><size in bytes>:` and then its bytes. Both are in the digest, so an approval is for
- * the Gauge the person saw, and it holds no longer when the manifest or any file changes. A step on a Gauge that is already installed carries the
- * hashes from its install, and a Gauge the core started with has none (`null`). The `steps` also show the permissions, the kind, and what the tile can do.
- * `nonce` is issued by the core for this one plan and is not in the digest. An approval is for a nonce.
+ * `manifestHash` is the SHA-256 of the bytes of `gauge.json`. `folderHash` is the SHA-256 over the files of the Gauge's folder: the file names sorted by their UTF-8
+ * bytes, and for each file `<byte length of the name>:<name><size in bytes>:` and then its bytes, with the manifest as `gauge.json`. It covers files only. It does not
+ * model empty folders, file modes, or links inside the folder. Both hashes are in the digest, so an approval is for the Gauge the person saw, and it holds no longer
+ * when the manifest or any file changes. A step on a Gauge that is already installed carries the hashes from its install, and a Gauge the core started with has
+ * none (`null`). The `steps` also show the permissions, the kind, and what the tile can do. A value in a step never holds a line break: the core escapes it.
+ *
+ * `nonce` is issued by the core for this one plan and is not in the digest. It is exactly 64 lowercase hexadecimal characters, and the client refuses any other
+ * form. This is part of the seam contract, so a real core must issue nonces of that form. An approval is for a nonce, and a plan is retired when the state changes.
  */
 export interface GaugePlan {
   readonly action: PlanAction;

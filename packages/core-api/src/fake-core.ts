@@ -1,8 +1,22 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { GaugeCode } from '../../gauge-errors/src/index.js';
-import { compareVersions, parseVersion, unsafeNameReason, validateManifest, type GaugeManifest, type ManifestReason } from '../../gauge-manifest/src/index.js';
+import { compareVersions, isUnsafeFolderName, parseVersion, unsafeNameReason, validateManifest, type GaugeManifest, type ManifestReason } from '../../gauge-manifest/src/index.js';
 import { FIXTURE_GAUGES } from './fixtures.js';
 import { PLAN_ACTIONS, type Core, type CoreReply, type GaugeApplied, type GaugePlan, type GaugeSummary, type PlanAction } from './types.js';
+
+/**
+ * The default clock of the fake core, in milliseconds. It is monotonic: it reads the performance clock, which never steps back, and never the system
+ * clock, which a person or a network time service can move. So a system clock that steps back cannot make an approval last longer.
+ */
+export const monotonicNow = (): number => performance.now();
+
+const UNSAFE_IN_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\\]/gu;
+
+/**
+ * Makes a value safe to put in a line of a plan. A line break, a control, format, or separator character, and a backslash become a visible escape such as
+ * `\u{a}`, so no value can end a line or start a new one, and a person reads what the value really holds.
+ */
+export const escapeForPlan = (value: string): string => value.replace(UNSAFE_IN_TEXT, char => (char === '\\' ? '\\\\' : `\\u{${char.codePointAt(0)?.toString(16) ?? ''}}`));
 
 /** How long an approval lasts, in milliseconds. */
 export const APPROVAL_TTL_MS = 15 * 60 * 1000;
@@ -24,7 +38,7 @@ export interface GaugeFolder {
 export interface FakeCoreOptions {
   /** The folders the core can find. None by default. The core keeps a copy, so a caller that changes its own folders changes nothing here. */
   readonly folders?: readonly GaugeFolder[];
-  /** The clock, in milliseconds. The real clock by default. A test passes its own, to move time. */
+  /** The clock, in milliseconds. A monotonic clock by default (`monotonicNow`). A test passes its own, to move time. */
   readonly now?: () => number;
 }
 
@@ -88,13 +102,14 @@ function copyFolder(folder: GaugeFolder): GaugeFolder {
   return { name: folder.name, location: folder.location, manifest: copyContent(folder.manifest), files, isLink: folder.isLink === true };
 }
 
-/** The hash of the manifest, and the hash of the whole folder: the files in order of name (the manifest is `gauge.json`), each as `<name byte length>:<name><size>:` and its bytes. */
+/** The hash of the manifest, and the hash of the whole folder: the files in order of the UTF-8 bytes of the name (the manifest is `gauge.json`), each as `<name byte length>:<name><size>:` and its bytes. */
 function hashesOf(folder: GaugeFolder): Hashes {
   const all = new Map<string, Content>(Object.entries(folder.files ?? {}));
   all.set('gauge.json', folder.manifest);
   const parts: Content[] = [];
-  for (const name of [...all.keys()].sort()) {
-    const bytes = bytesOf(all.get(name)!);
+  const entries = [...all.entries()].sort(([a], [b]) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')));
+  for (const [name, content] of entries) {
+    const bytes = bytesOf(content);
     parts.push(`${Buffer.byteLength(name)}:${name}${bytes.byteLength}:`, bytes);
   }
   return { manifestHash: sha256(folder.manifest instanceof Uint8Array ? folder.manifest : Buffer.from(folder.manifest, 'utf8')), folderHash: sha256(...parts) };
@@ -126,12 +141,13 @@ const reply = (refusal: Refusal): CoreReply => (refusal.reason === undefined ? {
  * The fake does not check `dependencies` at install, and a removal is not blocked by a Gauge that depends on it. Both belong to a later ticket.
  */
 export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
-  const now = options.now ?? Date.now;
+  const now = options.now ?? monotonicNow;
   const folders = new Map<string, GaugeFolder>((options.folders ?? []).map(folder => [folder.name, copyFolder(folder)]));
   const installed = new Map<string, Installed>(FIXTURE_GAUGES.map(gauge => [gauge.id, { summary: { ...gauge }, enabled: true, manifestHash: null, folderHash: null, details: [`permissions: none`, `kind: ${gauge.kind}`] }]));
   /** Ids that a user Gauge may never use. A stock id stays reserved after its Gauge is removed. */
   const stockIds = new Set<string>(FIXTURE_GAUGES.filter(gauge => gauge.origin === 'stock').map(gauge => gauge.id));
-  const issued = new Map<string, string>();
+  /** The nonce of each plan the core issued, with the digest of the plan and the count of applied steps at that time. A nonce is retired when the state changes. */
+  const issued = new Map<string, { digest: string; epoch: number }>();
   const approvals = new Map<string, Approval>();
   /** Counts the steps applied. An approval from an earlier count is stale. */
   let epoch = 0;
@@ -150,6 +166,8 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (typeof folderName !== 'string') return refuse('UNKNOWN_GAUGE');
     const unsafe = unsafeNameReason(folderName);
     if (unsafe) return refuse('GAUGE_PATH_UNSAFE', unsafe);
+    // The folder name is shown to the person in the plan, so it is one plain name: no line break, no invisible character, no slash.
+    if (isUnsafeFolderName(folderName)) return refuse('GAUGE_PATH_UNSAFE', 'unsafe_folder_name');
     const folder = folders.get(folderName);
     if (!folder) return refuse('UNKNOWN_GAUGE');
     if (folder.isLink === true) return refuse('GAUGE_PATH_UNSAFE', 'link');
@@ -168,7 +186,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
       return {
         ok: true, kind: 'folder', summary, details, hashes,
         plan: sealed({ ...content, action, from: null, to: summary.version, steps: [
-          `check the manifest of ${summary.id}`, ...details, `copy folder ${folder.name} into the Gauge store`, `add ${summary.id} ${summary.version} as ${origin}, disabled`,
+          `check the manifest of ${escapeForPlan(summary.id)}`, ...details, `copy folder ${escapeForPlan(folder.name)} into the Gauge store`, `add ${escapeForPlan(summary.id)} ${escapeForPlan(summary.version)} as ${origin}, disabled`,
         ] }),
       };
     }
@@ -179,7 +197,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     return {
       ok: true, kind: 'folder', summary, details, hashes,
       plan: sealed({ ...content, action, from: current.summary.version, to: summary.version, steps: [
-        `check the manifest of ${summary.id}`, ...details, `replace ${summary.id} ${current.summary.version} with ${summary.version} from folder ${folder.name}`, `keep ${summary.id} ${current.enabled ? 'enabled' : 'disabled'}`,
+        `check the manifest of ${escapeForPlan(summary.id)}`, ...details, `replace ${escapeForPlan(summary.id)} ${escapeForPlan(current.summary.version)} with ${escapeForPlan(summary.version)} from folder ${escapeForPlan(folder.name)}`, `keep ${escapeForPlan(summary.id)} ${current.enabled ? 'enabled' : 'disabled'}`,
       ] }),
     };
   }
@@ -189,10 +207,11 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (!current) return refuse('UNKNOWN_GAUGE');
     if (action !== 'enable' && current.summary.protected) return refuse('GAUGE_PROTECTED');
     const { summary } = current, state = current.enabled ? 'enabled' : 'disabled';
+    const id0 = escapeForPlan(summary.id), version = escapeForPlan(summary.version);
     const steps = {
-      enable: [...current.details, `enable ${summary.id} ${summary.version} (now ${state})`, `add the route of ${summary.id}`],
-      disable: [...current.details, `disable ${summary.id} ${summary.version} (now ${state})`, `remove the route of ${summary.id}`],
-      remove: [...current.details, `remove ${summary.id} ${summary.version} (now ${state})`, `remove the route of ${summary.id}`, `delete the files of ${summary.id}`],
+      enable: [...current.details, `enable ${id0} ${version} (now ${state})`, `add the route of ${id0}`],
+      disable: [...current.details, `disable ${id0} ${version} (now ${state})`, `remove the route of ${id0}`],
+      remove: [...current.details, `remove ${id0} ${version} (now ${state})`, `remove the route of ${id0}`, `delete the files of ${id0}`],
     }[action];
     return {
       ok: true, kind: 'installed',
@@ -258,6 +277,9 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
         result = { action, id, version: current.summary.version, enabled: current.enabled };
       }
     }
+    // The plan is applied: retire its nonce and its approvals, and end every approval and every plan of before. The state has changed.
+    for (const [other, record] of approvals) if (record.nonce === plan.nonce) approvals.delete(other);
+    issued.delete(plan.nonce);
     approvals.delete(token);
     epoch += 1;
     return { ok: true, result };
@@ -265,10 +287,11 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
 
   return {
     approve(nonce) {
-      const digest = typeof nonce === 'string' ? issued.get(nonce) : undefined;
-      if (digest === undefined) throw new TypeError('an approval is for a nonce that the core issued');
+      const plan = typeof nonce === 'string' ? issued.get(nonce) : undefined;
+      // A plan made before the state changed is retired, so a nonce of an old plan is no longer one that the core issued.
+      if (plan === undefined || plan.epoch !== epoch) throw new TypeError('an approval is for a nonce that the core issued, for a plan that is still current');
       const token = randomBytes(32).toString('hex');
-      approvals.set(token, { nonce, digest, at: now(), epoch });
+      approvals.set(token, { nonce, digest: plan.digest, at: now(), epoch });
       return token;
     },
     replaceFolder(folder) {
@@ -289,7 +312,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const planned = planFor(action as PlanAction, params);
           if (!planned.ok) return reply(planned);
           const nonce = randomBytes(32).toString('hex');
-          issued.set(nonce, planned.plan.digest);
+          issued.set(nonce, { digest: planned.plan.digest, epoch });
           return { ok: true, result: { ...planned.plan, steps: [...planned.plan.steps], nonce } };
         }
         case 'bowerloom.gauges.apply':

@@ -275,3 +275,16 @@ test('a manifest one byte under the size cap passes', () => {
   assert.equal(Buffer.byteLength(text), MAX_MANIFEST_BYTES - 1);
   assert.equal(validateManifest(text).ok, true);
 });
+
+test('a title with an invisible filler character is refused, alone or among letters', () => {
+  for (const filler of ['\u3164', '\u2800', '\u115F', '\u1160', '\uFFA0']) {
+    for (const title of [`a${filler}b`, filler, `${filler}${filler}`, `a${filler}`, `${filler}a`]) {
+      assert.deepEqual(refusal(withField('title', title)), { code: INVALID, reason: 'invalid_field' }, JSON.stringify(title));
+    }
+  }
+});
+
+test('a title with no visible character is refused, and a title with one passes', () => {
+  for (const title of ['', ' ', '\u00A0', '\u3000', '\u2003', '\t', ' \u00A0 ']) assert.deepEqual(refusal(withField('title', title)), { code: INVALID, reason: 'invalid_field' }, JSON.stringify(title));
+  for (const title of ['a', '.', '\u2764', 'a b', '\u65e5']) assert.equal(validateManifest(withField('title', title)).ok, true, title);
+});

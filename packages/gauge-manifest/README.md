@@ -24,7 +24,7 @@ All fields are required except `tile` and `page`. Any other field is `unknown_fi
 
 - `format` is `bowerloom/gauge/1`. New formats keep the `bowerloom/` prefix until the rename. Another value is `unsupported_format`.
 - `id` is lower-case words joined by single hyphens, at most 64 characters.
-- `title` is 1 to 80 characters with no space at either end and no control, format, line-separator, or paragraph-separator character (so no invisible or direction-changing characters).
+- `title` is 1 to 80 characters with no space at either end and no control, format, line-separator, or paragraph-separator character (so no invisible or direction-changing characters), none of the invisible fillers U+3164, U+2800, U+115F, U+1160, and U+FFA0, and at least one visible character.
 - `version` is `major.minor.patch`.
 - `coreApi` is a range of Core API versions, such as `>=1.0.0 <2.0.0`. See `api-version.ts`. A range that nothing can satisfy, such as `>=2.0.0 <1.0.0`, is `invalid_field`. A range that something can satisfy but not the version of this app is `api_unsupported`.
 - `kind` is `ui` or `data`. The `process` and `adapter` kinds are specified and not built, so they are `unsupported_kind`.
@@ -43,7 +43,7 @@ A manifest has no `origin`. The core sets it from where it found the folder, so 
 
 ## Names and paths
 
-An `id`, an engine id, a dependency id, and each segment of a `tile` or `page` entry are checked as names: a link (a URL scheme such as `https:`, or a leading `//`) is `link`, a name with two dots in a row is `dotdot_name`, and a name that starts with a dot is `hidden_name`. A Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, in any case, with or without an extension) is `device_name`. An absolute path is `absolute_path`. These five are `GAUGE_PATH_UNSAFE`. An entry path with an empty segment or a character outside letters, digits, dot, underscore, and hyphen is `invalid_field`. An entry names a file, so its last segment must end in a dot and an extension of letters and digits (`ui/tile.js`). A name with no extension is `invalid_field`. The spec does not say whether an entry may be a folder, so this package takes the stricter reading, and a test pins it.
+An `id`, an engine id, a dependency id, and each segment of a `tile` or `page` entry are checked as names: a link (a URL scheme such as `https:`, or a leading `//`) is `link`, a name with two dots in a row is `dotdot_name`, and a name that starts with a dot is `hidden_name`. A Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, in any case, with or without an extension) is `device_name`. An absolute path is `absolute_path`. These five are `GAUGE_PATH_UNSAFE`. A folder name is checked by `isUnsafeFolderName`: a control, format, or separator character, a slash, or a backslash is the reason `unsafe_folder_name`, also `GAUGE_PATH_UNSAFE`. An entry path with an empty segment or a character outside letters, digits, dot, underscore, and hyphen is `invalid_field`. An entry names a file, so its last segment must end in a dot and an extension of letters and digits (`ui/tile.js`). A name with no extension is `invalid_field`. The spec does not say whether an entry may be a folder, so this package takes the stricter reading, and a test pins it.
 
 This package checks the names inside a manifest. It does not read a folder, so a link on disk is for the code that reads the folder. The fake core of `packages/core-api` checks the folder's own name and a link flag.
 

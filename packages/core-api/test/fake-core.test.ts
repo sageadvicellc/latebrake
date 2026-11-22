@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createFakeCore, type GaugeFolder } from '../src/fake-core.js';
+import { createFakeCore, escapeForPlan, monotonicNow, type GaugeFolder } from '../src/fake-core.js';
 import type { GaugePlan } from '../src/types.js';
 import { VALID_MANIFESTS } from '../../gauge-manifest/src/fixtures.js';
 import { FIXTURE_GAUGES } from '../src/fixtures.js';
@@ -29,7 +29,9 @@ test('a caller that changes a listed Gauge does not change what the core answers
   const first = await core.call('bowerloom.gauges.list', {});
   assert.ok(first.ok);
   const listed = first.result as { title: string }[];
-  listed[0]!.title = 'changed';
+  const [firstListed] = listed;
+  assert.ok(firstListed);
+  firstListed.title = 'changed';
   listed.length = 0;
   assert.deepEqual(await core.call('bowerloom.gauges.list', {}), { ok: true, result: FIXTURE_GAUGES });
 });
@@ -133,7 +135,9 @@ test('a folder replaced in the core is copied too', async () => {
 
 test('replacing a folder that the core does not have adds it', async () => {
   const core = createFakeCore();
-  core.replaceFolder(FOLDERS[0]!);
+  const [first] = FOLDERS;
+  assert.ok(first);
+  core.replaceFolder(first);
   assert.equal((await planOf(core)).id, 'fixture-tile');
 });
 
@@ -163,4 +167,49 @@ test('a stock id is reserved even when no bundled folder holds it, also after it
   const applied = await core.call('bowerloom.gauges.apply', { plan: removal.result, approval: core.approve((removal.result as GaugePlan).nonce) });
   assert.equal(applied.ok, true);
   assert.deepEqual(await core.call('bowerloom.gauges.plan', { action: 'install', folder: 'clash' }), { ok: false, code: 'GAUGE_NAME_RESERVED' });
+});
+
+test('the plan text escape leaves a plain name as it is, and turns every line break and invisible character into a visible escape', () => {
+  assert.equal(escapeForPlan('tile-folder 1.0.0 caf\u00e9'), 'tile-folder 1.0.0 caf\u00e9');
+  for (const [value, expected] of [['a\nb', 'a\\u{a}b'], ['a\rb', 'a\\u{d}b'], ['a\u2028b', 'a\\u{2028}b'], ['a\u2029b', 'a\\u{2029}b'], ['a\u200Bb', 'a\\u{200b}b'], ['a\\b', 'a\\\\b'], ['a\u0000b', 'a\\u{0}b'], ['a\u0085b', 'a\\u{85}b']] as const) {
+    assert.equal(escapeForPlan(value), expected, JSON.stringify(value));
+  }
+  for (const value of ['\n', '\r\n', '\u2028\u2029', 'x\ny\nz', 'permissions: none\nkind: ui']) assert.equal(/[\n\r\u2028\u2029\u0085]/.test(escapeForPlan(value)), false, JSON.stringify(value));
+});
+
+test('the steps of a plan never hold a line break that a name put there', async () => {
+  const core = createFakeCore({ folders: FOLDERS });
+  const plan = await planOf(core);
+  for (const step of plan.steps) assert.equal(/[\n\r\u2028\u2029]/.test(step), false, step);
+});
+
+test('a plan that is applied retires its nonce, and every plan issued before the state changed, so none can be approved later', async () => {
+  const core = createFakeCore({ folders: FOLDERS });
+  const issuedEarly = await planOf(core), applied = await planOf(core);
+  const result = await core.call('bowerloom.gauges.apply', { plan: applied, approval: core.approve(applied.nonce) });
+  assert.equal(result.ok, true);
+  assert.throws(() => core.approve(applied.nonce), /nonce/);
+  assert.throws(() => core.approve(issuedEarly.nonce), /nonce/);
+  const later = await core.call('bowerloom.gauges.plan', { action: 'enable', id: 'fixture-tile' });
+  assert.ok(later.ok);
+  const laterPlan = later.result as GaugePlan;
+  assert.notEqual(laterPlan.nonce, applied.nonce);
+  assert.equal(typeof core.approve(laterPlan.nonce), 'string');
+});
+
+test('the default clock is monotonic: a system clock that steps back does not extend an approval', async t => {
+  let performanceNow = 5_000;
+  t.mock.method(performance, 'now', () => performanceNow);
+  t.mock.method(Date, 'now', () => 0);
+  const core = createFakeCore({ folders: FOLDERS });
+  const plan = await planOf(core);
+  const approval = core.approve(plan.nonce);
+  performanceNow += 15 * 60 * 1000;
+  assert.deepEqual(await core.call('bowerloom.gauges.apply', { plan, approval }), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
+});
+
+test('the monotonic clock reads the performance clock and never the system clock', (t) => {
+  t.mock.method(performance, 'now', () => 123.5);
+  t.mock.method(Date, 'now', () => -1);
+  assert.equal(monotonicNow(), 123.5);
 });

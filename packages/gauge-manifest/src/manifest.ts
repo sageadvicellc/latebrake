@@ -51,7 +51,7 @@ export const MANIFEST_REASONS = [
   'duplicate_key', 'comment', 'trailing_comma', 'syntax',
   'not_utf8', 'too_large', 'secret', 'unknown_field', 'origin_set_by_core', 'missing_field', 'invalid_field',
   'unsupported_format', 'unsupported_kind', 'api_unsupported',
-  'link', 'hidden_name', 'dotdot_name', 'device_name', 'absolute_path',
+  'link', 'hidden_name', 'dotdot_name', 'device_name', 'absolute_path', 'unsafe_folder_name',
   'internal',
 ] as const;
 
@@ -92,6 +92,9 @@ function shape(value: JsonValue | undefined, required: readonly string[], option
   return value;
 }
 
+/** Control, format, line-separator, and paragraph-separator characters, and the fillers that draw nothing: Hangul fillers, Braille blank, and the halfwidth Hangul filler. */
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u3164\u2800\u115F\u1160\uFFA0]/u;
+const WHITESPACE_OR_INVISIBLE = /[\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u3164\u2800\u115F\u1160\uFFA0]/gu;
 const NAME = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const PERMISSION = /^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/;
 
@@ -131,7 +134,8 @@ function build(value: JsonValue): GaugeManifest {
   if (fields['format'] !== MANIFEST_FORMAT) invalid('unsupported_format');
   const id = name(fields['id']);
   const title = text(fields['title']);
-  if (title.length < 1 || title.length > 80 || title.trim() !== title || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(title)) invalid();
+  // A title shows a person who made the Gauge, so it has no control, format, or separator character, no invisible filler, and at least one visible character.
+  if (title.length < 1 || title.length > 80 || title.trim() !== title || INVISIBLE.test(title) || title.replace(WHITESPACE_OR_INVISIBLE, '') === '') invalid();
   const version = text(fields['version']);
   if (!parseVersion(version)) invalid();
   const coreApi = text(fields['coreApi']);

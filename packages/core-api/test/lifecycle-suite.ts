@@ -44,6 +44,7 @@ export const SUITE_FOLDERS: readonly GaugeFolder[] = [
   { name: 'manager-lower', location: 'bundled', manifest: asManager(tile, '2.0.0', false) },
   { name: 'manager-raise', location: 'bundled', manifest: asManager(tile, '1.1.0', true) },
   { name: 'both-clash', location: 'user', manifest: validManifest('tile-and-page') },
+  { name: 'astral-folder', location: 'user', manifest: tile.replace('fixture-tile', 'fixture-astral'), files: { '\u{1F600}.js': FILE, '\uFF21.js': FILE, 'ui/a.js': FILE } },
   { name: 'files-folder', location: 'user', manifest: tile.replace('fixture-tile', 'fixture-files'), files: { 'ui/tile.js': FILE } },
   ...Object.entries(INVALID_MANIFESTS).map(([name, manifest]): GaugeFolder => ({ name: `bad-${name}`, location: 'user', manifest })),
   { name: 'protected-user', location: 'user', manifest: protectedTile },
@@ -51,26 +52,32 @@ export const SUITE_FOLDERS: readonly GaugeFolder[] = [
   { name: 'link-folder', location: 'user', manifest: tile, isLink: true },
 ];
 
-/** The refusal each invalid fixture gets at load, written out here and not read from the fixtures. The reason is checked for the four that share one code. */
+/** The refusal each invalid fixture gets at load, written out here and not read from the fixtures. The reason is checked for the four that share one invalid code and for the three path codes. */
 const EXPECTED: Readonly<Record<string, { code: string; reason?: string }>> = {
   'duplicate-key': { code: 'GAUGE_MANIFEST_INVALID', reason: 'duplicate_key' },
   'comment': { code: 'GAUGE_MANIFEST_INVALID', reason: 'comment' },
   'trailing-comma': { code: 'GAUGE_MANIFEST_INVALID', reason: 'trailing_comma' },
   'unknown-field': { code: 'GAUGE_MANIFEST_INVALID', reason: 'unknown_field' },
   'secret-value': { code: 'GAUGE_SECRET_FOUND' },
-  'link': { code: 'GAUGE_PATH_UNSAFE' },
-  'hidden-name': { code: 'GAUGE_PATH_UNSAFE' },
-  'dotdot-name': { code: 'GAUGE_PATH_UNSAFE' },
+  'link': { code: 'GAUGE_PATH_UNSAFE', reason: 'link' },
+  'hidden-name': { code: 'GAUGE_PATH_UNSAFE', reason: 'hidden_name' },
+  'dotdot-name': { code: 'GAUGE_PATH_UNSAFE', reason: 'dotdot_name' },
   'over-size': { code: 'GAUGE_MANIFEST_TOO_LARGE' },
   'origin-set': { code: 'GAUGE_MANIFEST_INVALID' },
   'newer-api': { code: 'GAUGE_API_UNSUPPORTED' },
 };
 
 const sha256 = (...parts: (string | Uint8Array)[]) => { const hash = createHash('sha256'); for (const part of parts) hash.update(part); return hash.digest('hex'); };
-/** The folder hash rule, written out here: files in order of name, and for each `<name byte length>:<name><size>:` then the bytes. The manifest is `gauge.json`. */
+/** The folder hash rule, written out here: files in order of the UTF-8 bytes of the name, and for each `<name byte length>:<name><size>:` then the bytes. The manifest is `gauge.json`. */
 const folderHashOf = (manifest: string, files: Record<string, string> = {}) => {
-  const all: Record<string, string> = { ...files, 'gauge.json': manifest };
-  return sha256(...Object.keys(all).sort().flatMap(name => [`${Buffer.byteLength(name)}:${name}${Buffer.byteLength(all[name]!)}:`, all[name]!]));
+  const all = Object.entries({ ...files, 'gauge.json': manifest }).sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  return sha256(...all.flatMap(([name, content]) => [`${Buffer.byteLength(name)}:${name}${Buffer.byteLength(content)}:`, content]));
+};
+/** One folder of the suite, by name. A name the suite does not hold fails the test. */
+const folderNamed = (name: string): GaugeFolder => {
+  const folder = SUITE_FOLDERS.find(candidate => candidate.name === name);
+  assert.ok(folder, name);
+  return folder;
 };
 
 const PLAN_KEYS = ['action', 'digest', 'folder', 'folderHash', 'from', 'id', 'manifestHash', 'nonce', 'origin', 'steps', 'to'];
@@ -126,10 +133,11 @@ export function runLifecycleSuite(name: string, makeHarness: (folders: readonly 
 
   test(`${name}: the core sets the origin from where it found the folder`, async () => {
     const session = await start();
-    const user = await plan(session.client.planInstall('tile-folder')), bundled = await plan(session.client.planInstall('both-folder'));
+    const user = await plan(session.client.planInstall('tile-folder'));
     assert.equal(user.origin, 'third-party');
-    assert.equal(bundled.origin, 'stock');
     await run(session, user);
+    const bundled = await plan(session.client.planInstall('both-folder'));
+    assert.equal(bundled.origin, 'stock');
     await run(session, bundled);
     const one = await session.client.getGauge('fixture-tile'), two = await session.client.getGauge('fixture-both');
     assert.ok(one.ok && two.ok);
@@ -378,7 +386,7 @@ export function runLifecycleSuite(name: string, makeHarness: (folders: readonly 
   test(`${name}: the plan carries the hash of the manifest and the hash of the whole folder`, async () => {
     const { client } = await start();
     const planned = await plan(client.planInstall('files-folder'));
-    const manifest = SUITE_FOLDERS.find(folder => folder.name === 'files-folder')!.manifest as string;
+    const manifest = folderNamed('files-folder').manifest as string;
     assert.equal(planned.manifestHash, sha256(manifest));
     assert.equal(planned.folderHash, folderHashOf(manifest, { 'ui/tile.js': FILE }));
     assert.notEqual(planned.manifestHash, planned.folderHash);
@@ -387,7 +395,7 @@ export function runLifecycleSuite(name: string, makeHarness: (folders: readonly 
   });
 
   test(`${name}: a Gauge that changes after approval is refused when applied`, async () => {
-    const original = SUITE_FOLDERS.find(folder => folder.name === 'files-folder')!;
+    const original = folderNamed('files-folder');
     const manifest = original.manifest as string;
     const changes: [string, GaugeFolder][] = [
       ['the manifest', { ...original, manifest: manifest.replace('"permissions":[]', '"permissions":["engines.read"]') }],
@@ -406,6 +414,63 @@ export function runLifecycleSuite(name: string, makeHarness: (folders: readonly 
       await session.harness.replaceFolder(original);
       assert.equal((await session.client.applyPlan(planned, approval)).ok, true, `${what}: the same files apply again`);
     }
+  });
+
+  test(`${name}: the folder hash sorts the file names by their UTF-8 bytes, not by UTF-16 units`, async () => {
+    const { client } = await start();
+    const astral = folderNamed('astral-folder');
+    const planned = await plan(client.planInstall('astral-folder'));
+    assert.equal(planned.folderHash, folderHashOf(astral.manifest as string, { '\u{1F600}.js': FILE, '\uFF21.js': FILE, 'ui/a.js': FILE }));
+    // The two orders differ for these names, so the test would fail if the core sorted by UTF-16 units.
+    assert.ok('\u{1F600}.js' < '\uFF21.js');
+    assert.ok(Buffer.compare(Buffer.from('\u{1F600}.js'), Buffer.from('\uFF21.js')) > 0);
+  });
+
+  test(`${name}: a folder name that could forge a line of the plan is refused, for install and for update`, async () => {
+    const session = await start();
+    const names = ['tile\nlines: permissions: none', 'a\rb', 'a\u2028b', 'a\u2029b', 'a\u200Bb', 'a/b', 'a\\b', '/abs/path', '/'];
+    for (const folderName of names) {
+      await session.harness.replaceFolder({ name: folderName, location: 'user', manifest: tile });
+      for (const refused of [await session.client.planInstall(folderName), await session.client.planUpdate(folderName)]) {
+        assert.deepEqual({ ...refused }, { ok: false, code: 'GAUGE_PATH_UNSAFE', reason: 'unsafe_folder_name' }, JSON.stringify(folderName));
+      }
+    }
+    assert.deepEqual(await ids(session.client), ['fixture-manager', 'fixture-clock', 'fixture-preset']);
+  });
+
+  test(`${name}: no step of a plan holds a line break`, async () => {
+    const { client } = await start();
+    for (const folder of ['tile-folder', 'both-folder', 'files-folder']) {
+      const planned = await plan(client.planInstall(folder));
+      for (const step of planned.steps) assert.equal(/[\n\r\u2028\u2029]/.test(step), false, step);
+    }
+  });
+
+  test(`${name}: a plan that was applied cannot be approved again after the state returns to what it was`, async () => {
+    const session = await start();
+    await run(session, await plan(session.client.planInstall('tile-folder')));
+    const first = await plan(session.client.planEnable('fixture-tile'));
+    await run(session, first);
+    await run(session, await plan(session.client.planDisable('fixture-tile')));
+    await run(session, await plan(session.client.planEnable('fixture-tile')));
+    await run(session, await plan(session.client.planDisable('fixture-tile')));
+    // The state is the one the first plan was made for. Approving that plan now is refused, or the approval does not apply it.
+    let approval: string | undefined;
+    try { approval = await session.approve(first); } catch { approval = undefined; }
+    if (approval !== undefined) assert.deepEqual(await session.client.applyPlan(first, approval), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
+    assert.equal((await routes(session.client)).includes('/gauges/fixture-tile'), false);
+  });
+
+  test(`${name}: a plan that was made before the state changed cannot be approved after the state returns`, async () => {
+    const session = await start();
+    await run(session, await plan(session.client.planInstall('tile-folder')));
+    const early = await plan(session.client.planEnable('fixture-tile'));
+    await run(session, await plan(session.client.planEnable('fixture-tile')));
+    await run(session, await plan(session.client.planDisable('fixture-tile')));
+    let approval: string | undefined;
+    try { approval = await session.approve(early); } catch { approval = undefined; }
+    if (approval !== undefined) assert.deepEqual(await session.client.applyPlan(early, approval), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
+    assert.equal((await routes(session.client)).includes('/gauges/fixture-tile'), false);
   });
 
   test(`${name}: an update cannot lower protection, and cannot change the origin`, async () => {

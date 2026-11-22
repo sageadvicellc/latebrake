@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { unsafeNameReason, unsafePathReason } from '../src/paths.js';
+import { isUnsafeFolderName, unsafeNameReason, unsafePathReason } from '../src/paths.js';
 
 test('a plain name is safe', () => {
   for (const name of ['fixture-clock', 'tile', 'main.js', 'a.b.c', 'x']) assert.equal(unsafeNameReason(name), undefined, name);
@@ -37,4 +37,9 @@ test('a Windows device name is refused, with or without an extension and in any 
   for (const name of ['com0', 'com10', 'lpt0', 'console', 'icon', 'auxiliary', 'nullable', 'a.con', 'com']) assert.equal(unsafeNameReason(name), undefined, name);
   assert.equal(unsafePathReason('ui/CON/main.js'), 'device_name');
   assert.equal(unsafePathReason('ui/nul.js'), 'device_name');
+});
+
+test('a folder name with a control, format, or separator character, a slash, or a backslash is unsafe', () => {
+  for (const name of ['a\nb', 'a\rb', 'a\u2028b', 'a\u2029b', 'a\u200Bb', 'a\u202Eb', 'a\u0000b', 'a\u007Fb', 'a/b', '/abs/path', '/', 'a\\b', 'C:\\x', '\n']) assert.equal(isUnsafeFolderName(name), true, JSON.stringify(name));
+  for (const name of ['tile-folder', 'a b', 'caf\u00e9', 'a.b', '\u65e5\u672c', '\u{1F600}', 'x_y']) assert.equal(isUnsafeFolderName(name), false, name);
 });

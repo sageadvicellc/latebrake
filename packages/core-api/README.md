@@ -21,12 +21,12 @@ Each of the five steps goes through a plan and an approval. A plan says what wou
 A plan has these fields: `action`, `id`, `folder`, `from`, `to`, `origin`, `steps`, `digest`, `manifestHash`, `folderHash`, and `nonce`. An applied plan gives `{ action, id, version, enabled }`.
 
 - The `steps` show the person what the Gauge may do: its permissions, its kind, what its tile can do, and whether it has a page.
-- `manifestHash` is the SHA-256 of the bytes of `gauge.json`. `folderHash` is the SHA-256 over every file of the folder, in order of name, each as `<byte length of the name>:<name><size>:` and then its bytes, with the manifest as `gauge.json`. A step on a Gauge that is installed carries the hashes from its install. A Gauge the core starts with has none.
-- `digest` is the SHA-256 of the plan, hashes included. `nonce` is issued by the core for this one plan and is not in the digest.
+- `manifestHash` is the SHA-256 of the bytes of `gauge.json`. `folderHash` is the SHA-256 over the files of the folder: the file names sorted by their UTF-8 bytes (not by UTF-16 units), each as `<byte length of the name>:<name><size>:` and then its bytes, with the manifest as `gauge.json`. It covers files only. It does not model empty folders, file modes, or links inside the folder. A step on a Gauge that is installed carries the hashes from its install. A Gauge the core starts with has none.
+- `digest` is the SHA-256 of the plan, hashes included. `nonce` is issued by the core for this one plan and is not in the digest. A nonce is exactly 64 lowercase hexadecimal characters, as part of the seam contract. The client refuses any other form, so a real core must issue that form.
 
 The core applies a plan only when all of these hold:
 
-1. It holds an approval for the plan: no approval, an unknown one, an old one, or one the state has moved past is `GAUGE_PLAN_NOT_APPROVED`. An approval works once and lasts 15 minutes. Any applied step ends every approval given before it, so an old approval cannot apply again after the state returns to what it was.
+1. It holds an approval for the plan: no approval, an unknown one, an old one, or one the state has moved past is `GAUGE_PLAN_NOT_APPROVED`. An approval works once and lasts 15 minutes. Any applied step ends every approval given before it, and retires every plan issued before it, so an old approval cannot apply again, and an old plan cannot be approved, after the state returns to what it was. The fake core's own clock is monotonic (`monotonicNow`, from the performance clock), so a system clock that steps back cannot extend an approval.
 2. The plan is the one that was approved: another plan, a changed plan, or a plan with another nonce is `GAUGE_PLAN_CHANGED`.
 3. The folder still has the approved hashes. A changed manifest, title, or other file is `GAUGE_PLAN_CHANGED`.
 4. The plan would still be the same plan now. A plan that no longer applies gives the code of that refusal, such as `GAUGE_EXISTS`.
@@ -42,7 +42,7 @@ Install adds a Gauge disabled. Update is an install plan of the new version, and
 - A third-party Gauge is never protected.
 - Stock ids are reserved for ever: a user folder whose id is a stock Gauge id is `GAUGE_NAME_RESERVED`, on install and on update, also after the stock Gauge is removed.
 - An update cannot lower `protected` (`GAUGE_PROTECTED`), cannot change the origin (`GAUGE_NAME_RESERVED`), and must be a newer version (`GAUGE_VERSION_NOT_NEWER`).
-- A folder name that is a link, hidden, a Windows device name, or has two dots is `GAUGE_PATH_UNSAFE`, and so is a folder that is a link. A folder the core cannot find is `UNKNOWN_GAUGE`.
+- A folder name that is a link, hidden, a Windows device name, or has two dots is `GAUGE_PATH_UNSAFE`, and so is a folder that is a link. So is a folder name with a control, format, or line or paragraph separator character, a slash, or a backslash (reason `unsafe_folder_name`), because the name is shown in the plan the person approves and must not forge a line of it. The core also escapes each value it puts in a step. A folder the core cannot find is `UNKNOWN_GAUGE`.
 - Every id and folder param must be a string. Any other value is `UNKNOWN_GAUGE`.
 - `dependencies` of a manifest are not checked at install, and a removal is not blocked by a Gauge that depends on the one removed. A later ticket owns both.
 - The fake core keeps a copy of the folders it is given, so a caller that changes its own folders afterwards changes nothing.

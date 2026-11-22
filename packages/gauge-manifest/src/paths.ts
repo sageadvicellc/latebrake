@@ -34,3 +34,13 @@ export function unsafePathReason(path: string): PathReason | undefined {
   }
   return segments.every(segment => SEGMENT.test(segment)) ? undefined : 'invalid_path';
 }
+
+const FORBIDDEN_IN_FOLDER_NAME = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}/\\]/u;
+
+/**
+ * True when the name of a Gauge folder holds a control, format, line-separator, or paragraph-separator character, a slash, or a backslash. That also covers an
+ * absolute path. A folder name is one plain name. It is shown to the person in a plan, so it must never carry a line break or an invisible character.
+ */
+export function isUnsafeFolderName(name: string): boolean {
+  return FORBIDDEN_IN_FOLDER_NAME.test(name);
+}
