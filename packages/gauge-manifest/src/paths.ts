@@ -1,7 +1,9 @@
 /** Why a name or a path is unsafe. Each reason belongs to the code `GAUGE_PATH_UNSAFE`, except `invalid_path`, which is a plain invalid field. */
-export type PathReason = 'link' | 'hidden_name' | 'dotdot_name' | 'absolute_path' | 'invalid_path';
+export type PathReason = 'link' | 'hidden_name' | 'dotdot_name' | 'device_name' | 'absolute_path' | 'invalid_path';
 
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+/** A Windows device name, in any case, with or without an extension: `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, and `LPT1` to `LPT9`. */
+const DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 const SEGMENT = /^[A-Za-z0-9._-]+$/;
 
 /**
@@ -12,6 +14,7 @@ export function unsafeNameReason(name: string): Exclude<PathReason, 'absolute_pa
   if (SCHEME.test(name) || name.startsWith('//')) return 'link';
   if (name.includes('..')) return 'dotdot_name';
   if (name.startsWith('.')) return 'hidden_name';
+  if (DEVICE.test(name)) return 'device_name';
   return undefined;
 }
 

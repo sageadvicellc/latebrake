@@ -6,13 +6,15 @@ The strict validator for `gauge.json`, the manifest of a Gauge (Core API, v0.9.1
 
 `validateManifest(input)` takes the text or the UTF-8 bytes of one manifest. It gives `{ ok: true, manifest }` or `{ ok: false, code, reason }`. It never throws and never repeats the manifest, so a refusal never repeats a secret.
 
-The `code` is one code of the registry in `packages/gauge-errors`. The `reason` is a stable lower-case word for the exact rule, so a test and a person can tell two refusals with the same code apart. This package adds no code.
+The `code` is one code of the registry in `packages/gauge-errors`. The `reason` is a stable lower-case word of the closed set `MANIFEST_REASONS`, which says the exact rule, so a test and a person can tell two refusals with the same code apart. `isManifestReason` tells whether a value is one. This package adds no code.
+
+A check that breaks inside the validator, or an input that is not text or bytes, is the reason `internal` (still `GAUGE_MANIFEST_INVALID`). It is told apart from `syntax` on purpose, so a bug here is never reported as bad JSON.
 
 ## The order of the checks
 
 1. Size. More than 16,384 bytes of UTF-8 is `GAUGE_MANIFEST_TOO_LARGE` (`too_large`). Exactly 16,384 passes.
 2. UTF-8. Bytes that are not valid UTF-8 are `GAUGE_MANIFEST_INVALID` (`not_utf8`). A byte order mark is `syntax`.
-3. Strict JSON, read by `strict-json.ts`, not by `JSON.parse`. A duplicate key (`duplicate_key`), a comment (`comment`), and a trailing comma (`trailing_comma`) are `GAUGE_MANIFEST_INVALID`. So is any other break of the format (`syntax`), and a nesting deeper than 16.
+3. Strict JSON, read by `strict-json.ts`, not by `JSON.parse`. A duplicate key (`duplicate_key`), a comment (`comment`, only a `//` or a `/*`), and a trailing comma (`trailing_comma`) are `GAUGE_MANIFEST_INVALID`. So is any other break of the format (`syntax`): any other slash, a number that is not finite (`1e999`) or longer than 400 characters, a lone surrogate written as an escape, and a nesting deeper than 16 (16 passes, 17 is refused).
 4. The secret scan, over every key and every value with escapes decoded. A hit is `GAUGE_SECRET_FOUND` (`secret`). The rules are at the top of `secrets.ts`.
 5. The fields, below. A Gauge that needs a Core API version this app does not offer is refused last, with `GAUGE_API_UNSUPPORTED` (`api_unsupported`).
 
@@ -22,16 +24,16 @@ All fields are required except `tile` and `page`. Any other field is `unknown_fi
 
 - `format` is `bowerloom/gauge/1`. New formats keep the `bowerloom/` prefix until the rename. Another value is `unsupported_format`.
 - `id` is lower-case words joined by single hyphens, at most 64 characters.
-- `title` is 1 to 80 characters with no control character and no space at either end.
+- `title` is 1 to 80 characters with no space at either end and no control, format, line-separator, or paragraph-separator character (so no invisible or direction-changing characters).
 - `version` is `major.minor.patch`.
-- `coreApi` is a range of Core API versions, such as `>=1.0.0 <2.0.0`. See `api-version.ts`.
+- `coreApi` is a range of Core API versions, such as `>=1.0.0 <2.0.0`. See `api-version.ts`. A range that nothing can satisfy, such as `>=2.0.0 <1.0.0`, is `invalid_field`. A range that something can satisfy but not the version of this app is `api_unsupported`.
 - `kind` is `ui` or `data`. The `process` and `adapter` kinds are specified and not built, so they are `unsupported_kind`.
 - `protected` is a boolean.
 - `engines` is a list of up to 16 engine ids, with no repeat. An empty list means the Gauge serves no engine.
 - `tile` is `{ expandable, resizable, entry }`. A Gauge says whether its tile is expandable, resizable, both, or neither. A tile that is expandable needs a `page` to open.
 - `page` is `{ entry }`.
 - `permissions` is a list of up to 64 dotted names such as `engines.read`, with no repeat. The shape is checked here. Which names exist, and the grants, belong to the grants ticket.
-- `dependencies` is a list of up to 32 `{ id, range }`, with no repeat and no Gauge that depends on itself.
+- `dependencies` is a list of up to 32 `{ id, range }`, with no repeat and no Gauge that depends on itself. A range that nothing can satisfy is `invalid_field`.
 
 A `ui` Gauge has a `tile`, a `page`, or both, and each tile has an `entry`. A `data` Gauge holds no code, so it has no `page`, and its tile has no `entry`.
 
@@ -41,7 +43,7 @@ A manifest has no `origin`. The core sets it from where it found the folder, so 
 
 ## Names and paths
 
-An `id`, an engine id, a dependency id, and each segment of a `tile` or `page` entry are checked as names: a link (a URL scheme such as `https:`, or a leading `//`) is `link`, a name with two dots in a row is `dotdot_name`, and a name that starts with a dot is `hidden_name`. An absolute path is `absolute_path`. These four are `GAUGE_PATH_UNSAFE`. An entry path with an empty segment or a character outside letters, digits, dot, underscore, and hyphen is `invalid_field`.
+An `id`, an engine id, a dependency id, and each segment of a `tile` or `page` entry are checked as names: a link (a URL scheme such as `https:`, or a leading `//`) is `link`, a name with two dots in a row is `dotdot_name`, and a name that starts with a dot is `hidden_name`. A Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, in any case, with or without an extension) is `device_name`. An absolute path is `absolute_path`. These five are `GAUGE_PATH_UNSAFE`. An entry path with an empty segment or a character outside letters, digits, dot, underscore, and hyphen is `invalid_field`. An entry names a file, so its last segment must end in a dot and an extension of letters and digits (`ui/tile.js`). A name with no extension is `invalid_field`. The spec does not say whether an entry may be a folder, so this package takes the stricter reading, and a test pins it.
 
 This package checks the names inside a manifest. It does not read a folder, so a link on disk is for the code that reads the folder. The fake core of `packages/core-api` checks the folder's own name and a link flag.
 

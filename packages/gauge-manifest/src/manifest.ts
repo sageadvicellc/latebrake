@@ -1,5 +1,5 @@
 import { type GaugeCode } from '../../gauge-errors/src/index.js';
-import { CORE_API_VERSION, parseRange, parseVersion, rangeIncludes } from './api-version.js';
+import { CORE_API_VERSION, parseRange, parseVersion, rangeIncludes, rangeIsSatisfiable } from './api-version.js';
 import { unsafeNameReason, unsafePathReason } from './paths.js';
 import { looksLikeSecret } from './secrets.js';
 import { parseStrictJson, type JsonProblem, type JsonValue } from './strict-json.js';
@@ -43,12 +43,30 @@ export interface GaugeManifest {
   readonly dependencies: readonly GaugeDependency[];
 }
 
-/** The narrow reason for a refusal. The code says what class of refusal it is, and the reason says which rule. */
-export type ManifestReason =
-  | JsonProblem
-  | 'not_utf8' | 'too_large' | 'secret' | 'unknown_field' | 'origin_set_by_core' | 'missing_field' | 'invalid_field'
-  | 'unsupported_format' | 'unsupported_kind' | 'api_unsupported'
-  | 'link' | 'hidden_name' | 'dotdot_name' | 'absolute_path';
+/**
+ * Every reason a refusal can have, as a closed set. The code says what class of refusal it is, and the reason says which rule. A reason that holds
+ * a value of a manifest never appears: the set is fixed, so a reason can never repeat a secret.
+ */
+export const MANIFEST_REASONS = [
+  'duplicate_key', 'comment', 'trailing_comma', 'syntax',
+  'not_utf8', 'too_large', 'secret', 'unknown_field', 'origin_set_by_core', 'missing_field', 'invalid_field',
+  'unsupported_format', 'unsupported_kind', 'api_unsupported',
+  'link', 'hidden_name', 'dotdot_name', 'device_name', 'absolute_path',
+  'internal',
+] as const;
+
+export type ManifestReason = (typeof MANIFEST_REASONS)[number];
+
+const REASONS: ReadonlySet<string> = new Set(MANIFEST_REASONS);
+
+/** True when the value is one of the reasons of the closed set. */
+export function isManifestReason(value: unknown): value is ManifestReason {
+  return typeof value === 'string' && REASONS.has(value);
+}
+
+// A compile-time check: a problem of the JSON reader is always a reason of this set.
+const jsonProblemsAreReasons: JsonProblem extends ManifestReason ? true : never = true;
+void jsonProblemsAreReasons;
 
 export type ManifestResult =
   | { readonly ok: true; readonly manifest: GaugeManifest }
@@ -96,6 +114,8 @@ function entry(value: JsonValue | undefined): string {
   const reason = unsafePathReason(path);
   if (reason === 'invalid_path') return invalid();
   if (reason) throw new Refused('GAUGE_PATH_UNSAFE', reason);
+  // An entry names a file, so its last segment ends in a dot and an extension of letters and digits.
+  if (!/[^.]\.[A-Za-z0-9]+$/.test(path.slice(path.lastIndexOf('/') + 1))) return invalid();
   return path;
 }
 function list(value: JsonValue | undefined, most: number): readonly JsonValue[] {
@@ -111,11 +131,12 @@ function build(value: JsonValue): GaugeManifest {
   if (fields['format'] !== MANIFEST_FORMAT) invalid('unsupported_format');
   const id = name(fields['id']);
   const title = text(fields['title']);
-  if (title.length < 1 || title.length > 80 || title.trim() !== title || /\p{Cc}/u.test(title)) invalid();
+  if (title.length < 1 || title.length > 80 || title.trim() !== title || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(title)) invalid();
   const version = text(fields['version']);
   if (!parseVersion(version)) invalid();
   const coreApi = text(fields['coreApi']);
   const range = parseRange(coreApi) ?? invalid();
+  if (!rangeIsSatisfiable(range)) invalid();
   const kindText = text(fields['kind']);
   if (kindText === 'process' || kindText === 'adapter') invalid('unsupported_kind');
   if (kindText !== 'ui' && kindText !== 'data') invalid();
@@ -147,7 +168,8 @@ function build(value: JsonValue): GaugeManifest {
     const dependency = shape(item, ['id', 'range']);
     const dependencyId = name(dependency['id']);
     const dependencyRange = text(dependency['range']);
-    if (dependencyId === id || !parseRange(dependencyRange)) invalid();
+    const parsedRange = parseRange(dependencyRange);
+    if (dependencyId === id || !parsedRange || !rangeIsSatisfiable(parsedRange)) invalid();
     return Object.freeze({ id: dependencyId, range: dependencyRange });
   });
   unique(dependencies.map(dependency => dependency.id));
@@ -165,10 +187,12 @@ function build(value: JsonValue): GaugeManifest {
  * Checks one `gauge.json`, given as text or as UTF-8 bytes. It gives the manifest, or a stable code and the reason. The order of the checks is fixed:
  * the size cap in bytes, UTF-8, strict JSON (no duplicate key, comment, or trailing comma), the secret scan over every key and value, then the fields.
  * A manifest that sets `origin` is refused: the core sets it. A Gauge that needs a Core API version this app does not offer is refused at the end.
- * The refusal never repeats the text of the manifest, so it never repeats a secret. This function never throws.
+ * The refusal never repeats the text of the manifest, so it never repeats a secret. This function never throws. A bug of its own is `internal`.
  */
 export function validateManifest(input: string | Uint8Array): ManifestResult {
   try {
+    // Only text and bytes are inputs. Anything else is a bug in the caller, so it is `internal` and not bad JSON.
+    if (typeof input !== 'string' && !(input instanceof Uint8Array)) throw new Error('input is not text or bytes');
     const bytes = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
     if (bytes.byteLength > MAX_MANIFEST_BYTES) throw new Refused('GAUGE_MANIFEST_TOO_LARGE', 'too_large');
     let source: string;
@@ -183,6 +207,7 @@ export function validateManifest(input: string | Uint8Array): ManifestResult {
     return { ok: true, manifest: build(parsed.value) };
   } catch (error) {
     if (error instanceof Refused) return { ok: false, code: error.code, reason: error.reason };
-    return { ok: false, code: 'GAUGE_MANIFEST_INVALID', reason: 'syntax' };
+    // A check that broke is a bug here and not a fault of the manifest. It is told apart from a real syntax problem, so a test can see it.
+    return { ok: false, code: 'GAUGE_MANIFEST_INVALID', reason: 'internal' };
   }
 }

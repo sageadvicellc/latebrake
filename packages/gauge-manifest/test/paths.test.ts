@@ -31,3 +31,10 @@ test('a path is checked one segment at a time', () => {
   assert.equal(unsafePathReason('ui/main.js/'), 'invalid_path');
   assert.equal(unsafePathReason('ui/ma in.js'), 'invalid_path');
 });
+
+test('a Windows device name is refused, with or without an extension and in any case', () => {
+  for (const name of ['CON', 'con', 'Prn', 'AUX', 'nul', 'COM1', 'com9', 'LPT1', 'lpt9', 'con.js', 'NUL.tar.gz', 'aux.txt']) assert.equal(unsafeNameReason(name), 'device_name', name);
+  for (const name of ['com0', 'com10', 'lpt0', 'console', 'icon', 'auxiliary', 'nullable', 'a.con', 'com']) assert.equal(unsafeNameReason(name), undefined, name);
+  assert.equal(unsafePathReason('ui/CON/main.js'), 'device_name');
+  assert.equal(unsafePathReason('ui/nul.js'), 'device_name');
+});

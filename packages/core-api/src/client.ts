@@ -1,5 +1,6 @@
 import { isGaugeCode, type GaugeCode } from '../../gauge-errors/src/index.js';
-import type { Core, CoreMethod, CoreResult, GaugeApplied, GaugePlan, GaugeSummary, PlanAction } from './types.js';
+import { isManifestReason } from '../../gauge-manifest/src/index.js';
+import { PLAN_ACTIONS, type Core, type CoreMethod, type CoreResult, type GaugeApplied, type GaugePlan, type GaugeSummary, type PlanAction } from './types.js';
 
 /** The core broke the contract: a reply of the wrong shape, or a code outside the registry. This is a bug, not a refusal. It names the method that failed. */
 export class CoreProtocolError extends Error {
@@ -77,21 +78,26 @@ function summaryOf(value: unknown): GaugeSummary | undefined {
   return Object.freeze({ id, title, version, kind, origin, protected: isProtected });
 }
 
-const ACTIONS: readonly string[] = ['install', 'enable', 'disable', 'update', 'remove'];
-const DIGEST = /^[0-9a-f]{64}$/;
+const ACTIONS: readonly string[] = PLAN_ACTIONS;
+const HEX_64 = /^[0-9a-f]{64}$/;
+const ROUTE = /^\/gauges\/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+const MAX_ID_LENGTH = 64;
+const nullableHash = (value: unknown): string | null | undefined => (value === null || (typeof value === 'string' && HEX_64.test(value)) ? value : undefined);
 const nullableText = (value: unknown): string | null | undefined => (value === null || typeof value === 'string' ? value : undefined);
 
-/** Builds a plan from a value, or gives back `undefined` when it is not one. Each of the eight fields is read once, from own properties. */
+/** Builds a plan from a value, or gives back `undefined` when it is not one. Each of the eleven fields is read once, from own properties. */
 function planOf(value: unknown): GaugePlan | undefined {
   if (!isRecord(value)) return undefined;
   const action = own(value, 'action'), id = own(value, 'id'), folder = nullableText(own(value, 'folder')), from = nullableText(own(value, 'from')), to = nullableText(own(value, 'to'));
   const origin = own(value, 'origin'), steps = own(value, 'steps'), digest = own(value, 'digest');
+  const manifestHash = nullableHash(own(value, 'manifestHash')), folderHash = nullableHash(own(value, 'folderHash')), nonce = own(value, 'nonce');
   if (typeof action !== 'string' || !ACTIONS.includes(action) || typeof id !== 'string' || id === '') return undefined;
   if (folder === undefined || from === undefined || to === undefined) return undefined;
   if (origin !== 'stock' && origin !== 'third-party') return undefined;
   if (!Array.isArray(steps) || !steps.every((step): step is string => typeof step === 'string')) return undefined;
-  if (typeof digest !== 'string' || !DIGEST.test(digest)) return undefined;
-  return Object.freeze({ action: action as PlanAction, id, folder, from, to, origin, steps: Object.freeze([...steps]), digest });
+  if (typeof digest !== 'string' || !HEX_64.test(digest)) return undefined;
+  if (manifestHash === undefined || folderHash === undefined || typeof nonce !== 'string' || !HEX_64.test(nonce)) return undefined;
+  return Object.freeze({ action: action as PlanAction, id, folder, from, to, origin, steps: Object.freeze([...steps]), digest, manifestHash, folderHash, nonce });
 }
 
 /** Builds the result of an applied plan from a value, or gives back `undefined` when it is not one. */
@@ -110,7 +116,13 @@ export function createCoreClient(core: Core): CoreClient {
     try {
       if (!isRecord(reply)) throw new CoreProtocolError(method, `reply is not an object: ${shown(reply)}`);
       const ok = own(reply, 'ok');
-      if (ok === false) return { ok: false, code: refusal(method, own(reply, 'code')) };
+      if (ok === false) {
+        const code = refusal(method, own(reply, 'code'));
+        const reason = own(reply, 'reason');
+        if (reason === undefined) return { ok: false, code };
+        if (!isManifestReason(reason)) throw new CoreProtocolError(method, `refusal reason is not one of the closed set: ${shown(reason)}`);
+        return { ok: false, code, reason };
+      }
       if (ok !== true) throw new CoreProtocolError(method, 'reply has no boolean ok');
       return { ok: true, value: read(method, own(reply, 'result')) };
     } catch (error) {
@@ -157,10 +169,20 @@ export function createCoreClient(core: Core): CoreClient {
       const applied = appliedOf(result);
       if (!applied) throw new CoreProtocolError(method, 'result is not an applied plan');
       if (applied.action !== plan.action || applied.id !== plan.id) throw new CoreProtocolError(method, 'result is for another plan');
+      // The result must fit the step: an install adds the Gauge disabled, and each step ends in the state it names.
+      const fits =
+        applied.action === 'install' ? !applied.enabled && applied.version === plan.to
+        : applied.action === 'update' ? applied.version === plan.to
+        : applied.action === 'enable' ? applied.enabled
+        : applied.action === 'disable' ? !applied.enabled
+        : applied.version === null;
+      if (!fits) throw new CoreProtocolError(method, `result does not fit a ${plan.action}`);
       return applied;
     }),
     listRoutes: () => ask('bowerloom.gauges.routes', {}, (method, result) => {
-      if (!Array.isArray(result) || !result.every((route): route is string => typeof route === 'string')) throw new CoreProtocolError(method, 'result is not a list of routes');
+      if (!Array.isArray(result) || !result.every((route): route is string => typeof route === 'string' && route.length <= '/gauges/'.length + MAX_ID_LENGTH && ROUTE.test(route))) {
+        throw new CoreProtocolError(method, 'result is not a list of routes of the form /gauges/<id>');
+      }
       return Object.freeze([...result]);
     }),
   };

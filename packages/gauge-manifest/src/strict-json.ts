@@ -8,6 +8,9 @@ export type JsonResult =
   | { readonly ok: false; readonly reason: JsonProblem };
 
 const MAX_DEPTH = 16;
+/** The most characters that one number may have. A longer number is refused as a syntax problem. */
+export const MAX_NUMBER_TEXT = 400;
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 const NUMBER = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/;
 
 class Refusal extends Error {
@@ -33,7 +36,13 @@ export function parseStrictJson(text: string): JsonResult {
     for (;;) {
       if (at >= text.length) return fail();
       const char = text[at]!;
-      if (char === '"') { at += 1; strings.push(out); return out; }
+      if (char === '"') {
+        at += 1;
+        // A lone surrogate, written as an escape, is not text, so it is refused in a key and in a value.
+        if (LONE_SURROGATE.test(out)) return fail();
+        strings.push(out);
+        return out;
+      }
       if (char < ' ') return fail();
       if (char !== '\\') { out += char; at += 1; continue; }
       const escape = text[at + 1];
@@ -103,10 +112,11 @@ export function parseStrictJson(text: string): JsonResult {
     for (const [word, value] of [['true', true], ['false', false], ['null', null]] as const) {
       if (text.startsWith(word, at)) { at += word.length; return value; }
     }
-    const number = NUMBER.exec(text.slice(at, at + 400));
+    const number = NUMBER.exec(text.slice(at, at + MAX_NUMBER_TEXT));
     if (!number) return fail();
     at += number[0].length;
-    return Number(number[0]);
+    const value = Number(number[0]);
+    return Number.isFinite(value) ? value : fail();
   };
   try {
     const value = readValue(0);

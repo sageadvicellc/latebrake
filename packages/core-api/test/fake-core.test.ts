@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createFakeCore } from '../src/fake-core.js';
+import { createFakeCore, type GaugeFolder } from '../src/fake-core.js';
+import type { GaugePlan } from '../src/types.js';
+import { VALID_MANIFESTS } from '../../gauge-manifest/src/fixtures.js';
 import { FIXTURE_GAUGES } from '../src/fixtures.js';
 import { DEFAULT_EXPECTED, runClientSuite } from './client-suite.js';
 import { runLifecycleSuite } from './lifecycle-suite.js';
@@ -51,16 +53,96 @@ test('reading a Gauge without an id is refused with UNKNOWN_GAUGE', async () => 
 });
 
 // The lifecycle suite, run against the fake core. The fake core gives the person's approval through its own `approve`, which no Gauge can reach.
+// A real core must not copy how the fake mints an approval: the fake is a test double, and its tokens are not a security design.
 runLifecycleSuite('fake core lifecycle', folders => {
-  const core = createFakeCore({ folders });
-  return { core, approve: digest => core.approve(digest) };
+  let now = 1_000_000;
+  const core = createFakeCore({ folders, now: () => now });
+  return { core, approve: plan => core.approve(plan.nonce), replaceFolder: folder => core.replaceFolder(folder), advance: milliseconds => { now += milliseconds; } };
 });
 
+const FOLDERS: readonly GaugeFolder[] = [{ name: 'tile-folder', location: 'user', manifest: VALID_MANIFESTS['tile-only'] }];
+const planOf = async (core: ReturnType<typeof createFakeCore>): Promise<GaugePlan> => {
+  const reply = await core.call('bowerloom.gauges.plan', { action: 'install', folder: 'tile-folder' });
+  assert.ok(reply.ok);
+  return reply.result as GaugePlan;
+};
+
 test('a lifecycle call with a malformed plan is refused with GAUGE_PLAN_CHANGED', async () => {
-  const core = createFakeCore();
+  const core = createFakeCore({ folders: FOLDERS });
+  const approval = core.approve((await planOf(core)).nonce);
   for (const plan of [undefined, null, 'x', [], {}, { action: 'explode' }]) {
-    assert.deepEqual(await core.call('bowerloom.gauges.apply', { plan, approval: core.approve('x') }), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+    assert.deepEqual(await core.call('bowerloom.gauges.apply', { plan, approval }), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
   }
+});
+
+test('an approval is an unguessable random token, and each one differs', async () => {
+  const core = createFakeCore({ folders: FOLDERS });
+  const nonce = (await planOf(core)).nonce;
+  const tokens = new Set(Array.from({ length: 50 }, () => core.approve(nonce)));
+  assert.equal(tokens.size, 50);
+  for (const token of tokens) assert.match(token, /^[0-9a-f]{64}$/);
+});
+
+test('an approval is for a nonce that the core issued, and no other', async () => {
+  const core = createFakeCore({ folders: FOLDERS });
+  assert.throws(() => core.approve('f'.repeat(64)), /nonce/);
+  assert.throws(() => core.approve(5 as never), /nonce/);
+});
+
+test('a token that was guessed or made up applies nothing', async () => {
+  const core = createFakeCore({ folders: FOLDERS });
+  const plan = await planOf(core);
+  for (const approval of ['approval-1', '0'.repeat(64), plan.nonce, plan.digest, 5, null, undefined]) {
+    assert.deepEqual(await core.call('bowerloom.gauges.apply', { plan, approval }), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' }, String(approval));
+  }
+});
+
+test('the core reads an id param only when it is a string', async () => {
+  const core = createFakeCore({ folders: FOLDERS });
+  for (const id of [5, null, undefined, ['fixture-clock'], { toString: () => 'fixture-clock' }, true]) {
+    assert.deepEqual(await core.call('bowerloom.gauges.get', { id }), { ok: false, code: 'UNKNOWN_GAUGE' }, String(id));
+    for (const action of ['enable', 'disable', 'remove']) assert.deepEqual(await core.call('bowerloom.gauges.plan', { action, id }), { ok: false, code: 'UNKNOWN_GAUGE' }, `${action} ${String(id)}`);
+  }
+  for (const folder of [5, null, ['tile-folder'], undefined]) assert.deepEqual(await core.call('bowerloom.gauges.plan', { action: 'install', folder }), { ok: false, code: 'UNKNOWN_GAUGE' }, String(folder));
+});
+
+test('a caller that keeps a folder it gave to the core cannot change the core by it', async () => {
+  const bytes = new TextEncoder().encode('export default 1;');
+  const folder = { name: 'tile-folder', location: 'user' as const, manifest: VALID_MANIFESTS['tile-only'], files: { 'ui/tile.js': bytes } };
+  const folders = [folder];
+  const core = createFakeCore({ folders });
+  const before = await planOf(core);
+  bytes[0] = 0;
+  (folder as { manifest: string }).manifest = '{}';
+  (folder as { location: string }).location = 'bundled';
+  folders.length = 0;
+  const after = await planOf(core);
+  assert.deepEqual({ ...after, nonce: '' }, { ...before, nonce: '' });
+  assert.equal(after.origin, 'third-party');
+});
+
+test('a folder replaced in the core is copied too', async () => {
+  const core = createFakeCore({ folders: FOLDERS });
+  const bytes = new TextEncoder().encode('a');
+  const replacement = { name: 'tile-folder', location: 'user' as const, manifest: VALID_MANIFESTS['tile-only'], files: { 'ui/tile.js': bytes } };
+  core.replaceFolder(replacement);
+  const before = await planOf(core);
+  bytes[0] = 98;
+  assert.equal((await planOf(core)).folderHash, before.folderHash);
+});
+
+test('replacing a folder that the core does not have adds it', async () => {
+  const core = createFakeCore();
+  core.replaceFolder(FOLDERS[0]!);
+  assert.equal((await planOf(core)).id, 'fixture-tile');
+});
+
+test('the default clock is the real clock, so an approval made now is still good a moment later', async () => {
+  const core = createFakeCore({ folders: FOLDERS });
+  const plan = await planOf(core);
+  const approval = core.approve(plan.nonce);
+  const applied = await core.call('bowerloom.gauges.apply', { plan, approval });
+  assert.equal(applied.ok, true);
 });
 
 test('a plan call with an unknown action is a programming error, not a refusal code', async () => {
@@ -70,4 +152,15 @@ test('a plan call with an unknown action is a programming error, not a refusal c
 test('a fake core made with no folders finds no folder to install', async () => {
   const reply = await createFakeCore().call('bowerloom.gauges.plan', { action: 'install', folder: 'nothing' });
   assert.deepEqual(reply, { ok: false, code: 'UNKNOWN_GAUGE' });
+});
+
+test('a stock id is reserved even when no bundled folder holds it, also after its Gauge is removed', async () => {
+  const clash: GaugeFolder = { name: 'clash', location: 'user', manifest: VALID_MANIFESTS['tile-only'].replace('fixture-tile', 'fixture-clock') };
+  const core = createFakeCore({ folders: [clash] });
+  assert.deepEqual(await core.call('bowerloom.gauges.plan', { action: 'install', folder: 'clash' }), { ok: false, code: 'GAUGE_NAME_RESERVED' });
+  const removal = await core.call('bowerloom.gauges.plan', { action: 'remove', id: 'fixture-clock' });
+  assert.ok(removal.ok);
+  const applied = await core.call('bowerloom.gauges.apply', { plan: removal.result, approval: core.approve((removal.result as GaugePlan).nonce) });
+  assert.equal(applied.ok, true);
+  assert.deepEqual(await core.call('bowerloom.gauges.plan', { action: 'install', folder: 'clash' }), { ok: false, code: 'GAUGE_NAME_RESERVED' });
 });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CORE_API_VERSION, MAX_MANIFEST_BYTES, validateManifest } from '../src/index.js';
+import { CORE_API_VERSION, MANIFEST_REASONS, MAX_MANIFEST_BYTES, isManifestReason, validateManifest } from '../src/index.js';
 import { INVALID_MANIFESTS, VALID_MANIFESTS, validManifest } from '../src/fixtures.js';
 
 const refusal = (input: string | Uint8Array) => {
@@ -191,7 +191,7 @@ test('a Gauge id is checked as a name: hidden, dots, and link', () => {
 
 test('a Gauge that needs a newer Core API version is refused at load', () => {
   assert.deepEqual(refusal(withField('coreApi', '>=99.0.0')), { code: 'GAUGE_API_UNSUPPORTED', reason: 'api_unsupported' });
-  assert.deepEqual(refusal(withField('coreApi', '>=1.0.0 <1.0.0')), { code: 'GAUGE_API_UNSUPPORTED', reason: 'api_unsupported' });
+  assert.deepEqual(refusal(withField('coreApi', '>=1.0.1 <1.0.2')), { code: 'GAUGE_API_UNSUPPORTED', reason: 'api_unsupported' });
   assert.deepEqual(refusal(withField('coreApi', '<1.0.0')), { code: 'GAUGE_API_UNSUPPORTED', reason: 'api_unsupported' });
 });
 
@@ -200,6 +200,78 @@ test('a Gauge that accepts the current Core API version is not refused', () => {
   for (const range of ['=1.0.0', '>=0.1.0', '>=1.0.0 <2.0.0', '<=1.0.0']) assert.equal(validateManifest(withField('coreApi', range)).ok, true, range);
 });
 
-test('hostile text never throws', () => {
-  for (const text of ['', '\u0000', '{"__proto__":{"x":1}}', '{"id":"\ud800"}', '\u{1F4A5}', '{'.repeat(50_000)]) assert.doesNotThrow(() => validateManifest(text));
+const INVALID = 'GAUGE_MANIFEST_INVALID';
+test('hostile text gets its exact code and reason', () => {
+  const cases: [string, { code: string; reason: string }][] = [
+    ['', { code: INVALID, reason: 'syntax' }],
+    ['\u0000', { code: INVALID, reason: 'syntax' }],
+    ['{"__proto__":{"x":1}}', { code: INVALID, reason: 'unknown_field' }],
+    ['{"constructor":1}', { code: INVALID, reason: 'unknown_field' }],
+    ['{"id":"\\ud800"}', { code: INVALID, reason: 'syntax' }],
+    ['\u{1F4A5}', { code: INVALID, reason: 'syntax' }],
+    ['{'.repeat(50_000), { code: 'GAUGE_MANIFEST_TOO_LARGE', reason: 'too_large' }],
+    ['{'.repeat(MAX_MANIFEST_BYTES), { code: INVALID, reason: 'syntax' }],
+    ['['.repeat(MAX_MANIFEST_BYTES), { code: INVALID, reason: 'syntax' }],
+    ['{"id":1e999}', { code: INVALID, reason: 'syntax' }],
+    ['{}', { code: INVALID, reason: 'missing_field' }],
+  ];
+  for (const [text, expected] of cases) assert.deepEqual(refusal(text), expected, text.slice(0, 30));
+});
+
+test('an input that is not text or bytes, or that throws when read, is an internal problem and not bad JSON', () => {
+  const internal = { code: INVALID, reason: 'internal' };
+  assert.deepEqual(refusal(5 as never), internal);
+  assert.deepEqual(refusal(null as never), internal);
+  assert.deepEqual(refusal({} as never), internal);
+  const hostile = new Proxy(new Uint8Array(4), { get() { throw new Error('boom'); } });
+  assert.deepEqual(refusal(hostile), internal);
+});
+
+test('the reasons are a closed set, and every reason this suite saw is in it', () => {
+  assert.equal(new Set(MANIFEST_REASONS).size, MANIFEST_REASONS.length);
+  for (const reason of ['duplicate_key', 'comment', 'trailing_comma', 'syntax', 'not_utf8', 'too_large', 'secret', 'unknown_field', 'origin_set_by_core', 'missing_field', 'invalid_field', 'unsupported_format', 'unsupported_kind', 'api_unsupported', 'link', 'hidden_name', 'dotdot_name', 'absolute_path', 'device_name', 'internal']) {
+    assert.equal(isManifestReason(reason), true, reason);
+  }
+  for (const value of ['', 'toString', '__proto__', 'SYNTAX', 5, null, undefined, {}]) assert.equal(isManifestReason(value), false, String(value));
+  for (const name of Object.keys(INVALID_MANIFESTS)) {
+    const result = validateManifest(INVALID_MANIFESTS[name as keyof typeof INVALID_MANIFESTS]);
+    assert.ok(!result.ok && isManifestReason(result.reason), name);
+  }
+});
+
+test('a title with an invisible format character or a line or paragraph separator is refused', () => {
+  for (const title of ['a\u200Bb', 'a\u202Eb', 'a\uFEFFb', 'a\u2028b', 'a\u2029b', '\u00ADx', 'a\u0007b']) assert.deepEqual(refusal(withField('title', title)), { code: INVALID, reason: 'invalid_field' }, JSON.stringify(title));
+  for (const title of ['Caf\u00e9', '\u65e5\u672c\u8a9e', 'A B', '\u{1F600}']) assert.equal(validateManifest(withField('title', title)).ok, true, title);
+});
+
+test('a lone surrogate escape in a title is refused', () => {
+  const text = validManifest('tile-only').replace('"Fixture Tile"', '"\\ud800"');
+  assert.notEqual(text, validManifest('tile-only'));
+  assert.deepEqual(refusal(text), { code: INVALID, reason: 'syntax' });
+});
+
+test('a dependency range that nothing can satisfy is refused, and so is a core API range', () => {
+  const dependency = (range: string) => withField('dependencies', [{ id: 'fixture-clock', range }]);
+  for (const range of ['>=2.0.0 <1.0.0', '>=1.0.0 <1.0.0', '>1.0.0 <=1.0.0', '=1.0.0 =1.0.1']) assert.deepEqual(refusal(dependency(range)), { code: INVALID, reason: 'invalid_field' }, range);
+  assert.equal(validateManifest(dependency('>=1.0.0 <2.0.0')).ok, true);
+  assert.deepEqual(refusal(withField('coreApi', '>=2.0.0 <1.0.0')), { code: INVALID, reason: 'invalid_field' });
+});
+
+test('an entry that is a Windows device name is refused', () => {
+  const entry = (value: string) => refusal(withField('tile', { expandable: false, resizable: true, entry: value }));
+  for (const value of ['ui/CON.js', 'nul.js', 'ui/aux/main.js', 'COM1.js', 'lpt9.js']) assert.deepEqual(entry(value), { code: 'GAUGE_PATH_UNSAFE', reason: 'device_name' }, value);
+  assert.deepEqual(refusal(withField('id', 'con')), { code: 'GAUGE_PATH_UNSAFE', reason: 'device_name' });
+});
+
+test('an entry names a file with an extension, so a name with none is refused', () => {
+  const entry = (value: string) => refusal(withField('tile', { expandable: false, resizable: true, entry: value }));
+  for (const value of ['ui/tile', 'tile', 'ui/tile.', 'ui.v1/tile']) assert.deepEqual(entry(value), { code: INVALID, reason: 'invalid_field' }, value);
+  for (const value of ['tile.js', 'ui/tile.min.js', 'ui.v1/tile.html']) assert.equal(validateManifest(withField('tile', { expandable: false, resizable: true, entry: value })).ok, true, value);
+});
+
+test('a manifest one byte under the size cap passes', () => {
+  const base = validManifest('tile-only');
+  const text = base + ' '.repeat(MAX_MANIFEST_BYTES - 1 - base.length);
+  assert.equal(Buffer.byteLength(text), MAX_MANIFEST_BYTES - 1);
+  assert.equal(validateManifest(text).ok, true);
 });

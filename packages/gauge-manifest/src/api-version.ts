@@ -35,15 +35,10 @@ export function parseRange(text: string): Range | undefined {
   return comparators;
 }
 
-function compare(a: Version, b: Version): number {
-  for (let index = 0; index < 3; index += 1) if (a[index]! !== b[index]!) return a[index]! < b[index]! ? -1 : 1;
-  return 0;
-}
-
 /** True when the version passes every comparator of the range. */
 export function rangeIncludes(range: Range, version: Version): boolean {
   return range.every(({ operator, version: bound }) => {
-    const order = compare(version, bound);
+    const order = compareVersions(version, bound);
     switch (operator) {
       case '>=': return order >= 0;
       case '<=': return order <= 0;
@@ -52,4 +47,20 @@ export function rangeIncludes(range: Range, version: Version): boolean {
       case '=': return order === 0;
     }
   });
+}
+
+/** Gives -1, 0, or 1 as the first version is lower than, equal to, or higher than the second. */
+export function compareVersions(a: Version, b: Version): -1 | 0 | 1 {
+  for (let index = 0; index < 3; index += 1) if (a[index]! !== b[index]!) return a[index]! < b[index]! ? -1 : 1;
+  return 0;
+}
+
+/**
+ * True when at least one version passes every comparator. The versions that pass form one interval, and an interval of versions has a lowest
+ * version, which is `0.0.0`, a bound of a comparator, or the version just above a bound. So it is enough to try those.
+ */
+export function rangeIsSatisfiable(range: Range): boolean {
+  const candidates: Version[] = [[0, 0, 0]];
+  for (const { version } of range) candidates.push(version, [version[0], version[1], version[2] + 1]);
+  return candidates.some(candidate => rangeIncludes(range, candidate));
 }
