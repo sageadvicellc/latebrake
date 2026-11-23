@@ -291,7 +291,7 @@ test('a relay is not made from options that are wrong: each is a bug of the call
   assert.throws(make({ run: 'Run 1' }), TypeError);
   assert.throws(make({ members: [] }), TypeError);
   assert.throws(make({ members: Array.from({ length: 9 }, (_v, i) => ({ session: `sess-${i}`, port: a })) }), TypeError);
-  assert.throws(make({ members: [members[0], members[0]] }), TypeError);
+  assert.throws(make({ members: [members[0], members[1], members[0]] }), TypeError);
   assert.throws(make({ members: [{ session: 'sess-a', port: {} }, members[1]] }), TypeError);
   assert.throws(make({ members: [{ session: 'Sess A', port: a }, members[1]] }), TypeError);
   assert.throws(make({ routes: [route('route-1', 'sess-a', 'sess-zzz')] }), TypeError);

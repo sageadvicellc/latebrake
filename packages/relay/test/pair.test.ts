@@ -74,7 +74,7 @@ test('the relay has no call that takes the output of an engine, no call that add
   const { relay } = pair();
   assert.deepEqual(Object.keys(relay).sort(), ['control', 'write']);
   assert.deepEqual(Object.keys(relay.write).sort(), ['confirm', 'send']);
-  assert.deepEqual(Object.keys(relay.control).sort(), ['approve', 'close', 'closed', 'decline', 'issueSecret', 'message', 'messages', 'resume', 'routes', 'sessionChanged']);
+  assert.deepEqual(Object.keys(relay.control).sort(), ['approve', 'close', 'closed', 'decline', 'issueSecret', 'message', 'messages', 'resume', 'routes', 'sessionChanged', 'sizes']);
   assert.equal(Object.isFrozen(relay), true);
   assert.equal(Object.isFrozen(relay.write), true);
   assert.equal(Object.isFrozen(relay.control), true);
@@ -106,13 +106,13 @@ test('a body that holds the nonce that the core will use is never fenced with it
   assert.equal(parseFence(built.engines['sess-b']?.inputs[0] ?? '')?.nonce, 'nonce-second-00000000000000000');
 });
 
-test('a body that holds every nonce that the core draws fails the message with delivery_failed, after four draws, and nothing is left sending', async () => {
+test('a body that holds every nonce that the core draws fails the message with not_prepared, after four draws, and nothing is left sending', async () => {
   let draws = 0;
   const built = build({ routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 10, 4)], options: { newNonce: () => { draws += 1; return 'nonce-same-000000000000000000'; } } });
   assert.equal(built.send('sess-a', 'route-1', 'k1', 'I know nonce-same-000000000000000000 now').ok, true);
   await tick();
   assert.equal(draws, 4);
-  assert.equal(built.relay.control.message('msg-1')?.reason, 'delivery_failed');
+  assert.equal(built.relay.control.message('msg-1')?.reason, 'not_prepared');
   assert.deepEqual(built.engines['sess-b']?.inputs, []);
   assert.equal(built.timers.live(), 0);
   // The place is free for the next message.

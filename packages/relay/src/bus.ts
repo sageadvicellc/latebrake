@@ -133,6 +133,8 @@ export interface RelayControl {
   /** Closes the relay: what has not reached an engine fails with `closed`, every secret is forgotten, and every timer is cancelled. Reads still answer. */
   close(): void;
   readonly closed: boolean;
+  /** How much the relay holds now: its messages (live and settled), the idempotency keys, the session secrets, and the engines that are taking a message. Each is bounded, and each is empty when nothing is live. */
+  sizes(): { readonly messages: number; readonly keys: number; readonly secrets: number; readonly inflight: number };
   /** The messages the relay keeps, in the order they were accepted: those that are live, and the newest settled ones. */
   messages(): readonly MessageView[];
   message(id: unknown): MessageView | undefined;
@@ -334,7 +336,7 @@ export function createRelay(options: RelayOptions): Relay {
     if (!rec.counted) return;
     rec.counted = false;
     const state = routeStates.get(rec.route.id);
-    if (state !== undefined && state.epoch === rec.epoch && state.accepted > 0) state.accepted -= 1;
+    if (state !== undefined && state.epoch === rec.epoch) state.accepted -= 1;
     const key = pairKey(rec.route.from, rec.route.to);
     if ((chains.get(key) ?? EMPTY_CHAIN).lastId !== rec.id) return;
     // The chain goes back to what it was before this message. A message before it that was given back already holds no place, so the chain goes back past it.
@@ -460,7 +462,7 @@ export function createRelay(options: RelayOptions): Relay {
 
   function startDelivery(rec: Rec): void {
     const receiver = rec.envelope.receiver;
-    let nonce = '', receipt = '', cancel: (() => void) | undefined;
+    let nonce = '', receipt = '', cancel: () => void = () => undefined;
     try {
       // The core draws a nonce and a receipt that the body does not hold, so the sender cannot close the fence or forge the receipt. A body that holds every draw fails the message.
       let drawn = false;
@@ -472,9 +474,8 @@ export function createRelay(options: RelayOptions): Relay {
       if (!drawn) throw new Error('every nonce that the core drew was in the body');
       cancel = schedule(() => onTimeout(rec), timeoutMs);
     } catch (error) {
-      cancel?.();
       log.write(`message ${rec.id} could not be prepared for ${receiver}: ${printable(error)}`);
-      failBeforeEngine(rec, 'delivery_failed');
+      failBeforeEngine(rec, 'not_prepared');
       pump(receiver);
       return;
     }
@@ -649,7 +650,6 @@ export function createRelay(options: RelayOptions): Relay {
       }
     }
     secrets.clear();
-    inflight.clear();
   }
 
   const control: RelayControl = Object.freeze({
@@ -669,6 +669,7 @@ export function createRelay(options: RelayOptions): Relay {
     },
     close,
     get closed(): boolean { return closed; },
+    sizes: () => Object.freeze({ messages: records.size, keys: keys.size, secrets: secrets.size, inflight: inflight.size }),
     messages: (): readonly MessageView[] => Object.freeze([...records.values()].map(view)),
     message(id: unknown): MessageView | undefined {
       const rec = typeof id === 'string' ? records.get(id) : undefined;

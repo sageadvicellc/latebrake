@@ -62,11 +62,12 @@ const STATE_SET: ReadonlySet<string> = new Set(MESSAGE_STATES);
 export const isMessageState = (value: unknown): value is MessageState => typeof value === 'string' && STATE_SET.has(value);
 
 /**
- * Why a message failed. `receiver_gone`: the session of the receiver ended. `route_stopped`: a cap stopped the route before the message moved. `closed`: the relay of the run closed before the message moved, or while the engine took it
+ * Why a message failed. `receiver_gone`: the session of the receiver ended. `closed`: the relay of the run closed before the message moved, or while the engine took it
  * (the text may have reached the engine). `delivery_failed`: the engine of the receiver said it could not take the message, or answered with something that is no answer. `delivery_timeout`: the engine did not answer in time (the text may
- * still reach it). `no_delivery_path`: the adapter has no way to give the engine a message while it runs, so nothing was given.
+ * still reach it). `no_delivery_path`: the adapter has no way to give the engine a message while it runs, so nothing was given. `not_prepared`: the core could not make the text for the engine (the body held every nonce or receipt that it drew, or a maker
+ * or the schedule failed), so nothing was given to the engine.
  */
-export const FAILURE_REASONS = Object.freeze(['receiver_gone', 'route_stopped', 'closed', 'delivery_failed', 'delivery_timeout', 'no_delivery_path'] as const);
+export const FAILURE_REASONS = Object.freeze(['receiver_gone', 'closed', 'delivery_failed', 'delivery_timeout', 'no_delivery_path', 'not_prepared'] as const);
 export type FailureReason = (typeof FAILURE_REASONS)[number];
 const FAILURE_SET: ReadonlySet<string> = new Set(FAILURE_REASONS);
 export const isFailureReason = (value: unknown): value is FailureReason => typeof value === 'string' && FAILURE_SET.has(value);

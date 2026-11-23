@@ -93,3 +93,10 @@ test('the keys of once are bounded: after 64 kinds a new kind is dropped and not
   for (let i = 0; i < 100; i += 1) log.once(`kind-${i}`, `line ${i}`);
   assert.equal(lines.length, 64);
 });
+
+test('two hidden values where one sits inside the other leave no tail of the longer one', () => {
+  assert.equal(redactText(['abcdefghijkl', 'cdefghi'], 'x abcdefghijkl y'), 'x [redacted] y');
+  assert.equal(redactText(['cdefghi', 'abcdefghijkl'], 'x abcdefghijkl y'), 'x [redacted] y');
+  assert.equal(redactText(['abcdefg', 'abcdefghij'], 'x abcdefghij y'), 'x [redacted] y');
+  assert.equal(redactText(['abcdefghij', 'abcdefg'], 'x abcdefghij y'), 'x [redacted] y');
+});

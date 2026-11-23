@@ -23,7 +23,7 @@ export function redactText(hidden: readonly string[], text: string): string {
     if (value.length < MIN_HIDDEN_LENGTH) continue;
     for (let at = text.indexOf(value); at !== -1; at = text.indexOf(value, at + 1)) found.push([at, at + value.length]);
   }
-  found.sort((left, right) => left[0] - right[0] || right[1] - left[1]);
+  found.sort((left, right) => left[0] - right[0]);
   const ranges: [number, number][] = [];
   for (const range of found) {
     const last = ranges[ranges.length - 1];
