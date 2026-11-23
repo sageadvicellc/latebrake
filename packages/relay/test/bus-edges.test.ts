@@ -300,3 +300,13 @@ test('the history keeps 256 settled messages by default, and a relay takes 8 ses
   const engines = names.map(name => createFakeEngine(name));
   assert.doesNotThrow(() => createRelay({ run: 'run-1', routes, members: engines.map(engine => ({ session: engine.session, port: engine })) }));
 });
+
+test('every read gives new frozen values: the list of messages, a message, the routes, a route, and the sizes', async () => {
+  const { relay, send } = build({ routes: auto });
+  send('sess-a', 'route-1', 'k1', 'first');
+  await tick();
+  const messages = relay.control.messages(), routes = relay.control.routes(), sizes = relay.control.sizes();
+  for (const value of [messages, messages[0], routes, routes[0], sizes, relay.control.message('msg-1')]) assert.equal(Object.isFrozen(value), true);
+  assert.notEqual(relay.control.messages(), messages);
+  assert.notEqual(relay.control.routes(), routes);
+});
