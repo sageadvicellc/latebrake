@@ -736,6 +736,8 @@ test('a revoke ends the approval of a grant plan that the cap dropped: the grant
 
 test('plans fill a bucket for who may fill it: a Gauge fills only its own, and the layout, the grants, and the lifecycle fill one each', async () => {
   const w = await world();
+  // A job is a step that is applied, and it drops every plan of before, so it is made first.
+  const job = await makeJob(w, [entry('writer', 'fixture-engine', '/work/free')]);
   const grant = must(await w.client.planGrant('fixture-viewer', ['sessions.start']));
   const lifecycle = must(await w.client.planDisable('fixture-viewer'));
   const layout = must(await w.client.planLayoutSet(must(await w.client.exportLayout())));
@@ -747,6 +749,10 @@ test('plans fill a bucket for who may fill it: a Gauge fills only its own, and t
   // A Gauge that plans for itself, again and again, drops only its own plans.
   for (let count = 0; count < 200; count += 1) must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/flood' }));
   for (const kept of [grant, lifecycle, session]) assert.ok(w.fake.approve(kept.nonce).length > 0, 'the plans of another Gauge, and the plans of the person, are kept');
+  // So do the jobs and the runs of a Gauge.
+  for (let count = 0; count < MAX_LIVE_PLANS_PER_GAUGE; count += 1) must(await w.client.planJobCreate('fixture-blind', { title: 'Other', sessions: [entry('writer', 'fixture-engine', '/work/free')] }));
+  for (let count = 0; count < MAX_LIVE_PLANS_PER_GAUGE; count += 1) must(await w.client.planRun('fixture-blind', job));
+  for (const kept of [grant, lifecycle, session]) assert.ok(w.fake.approve(kept.nonce).length > 0, 'the jobs and runs of a Gauge drop only its own');
   // Plans for the grants drop only plans for the grants.
   for (let count = 0; count < MAX_LIVE_PLANS_PER_GAUGE; count += 1) must(await w.client.planGrant('fixture-starter', ['sessions.start']));
   assert.throws(() => w.fake.approve(grant.nonce), TypeError);
@@ -812,6 +818,15 @@ test('a plan that changed for a cause that a Gauge cannot see tells the person, 
   assert.deepEqual(await applyRunNow(w.client, run, approved), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
   assert.deepEqual(w.fake.personNotices().at(-1), { action: 'run', gauge: 'fixture-blind', nonce: run.nonce, shown: 'GAUGE_PLAN_CHANGED', cause: 'plan_changed_hidden', engines: ['fixture-third'], member: null });
   assert.equal(JSON.stringify(run).includes('plan_changed'), false);
+});
+
+test('a plan that changed in what a Gauge can read does not tell the person that the cause was hidden', async () => {
+  const w = await world();
+  const plan = must(await w.client.planSessionStart('fixture-viewer', { engine: 'fixture-engine', folder: LINK }));
+  const approval = w.fake.approve(plan.nonce);
+  w.occupy('fixture-other', REAL);
+  assert.deepEqual(await applyNow(w.client, plan, approval), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+  assert.deepEqual(w.fake.personNotices(), [], 'the viewer may read fixture-other, so the change was in its own plan');
 });
 
 // The entropy of a test
