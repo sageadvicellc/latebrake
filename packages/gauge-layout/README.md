@@ -113,14 +113,16 @@ Each is a pure function that builds a new layout and never edits the one it was 
 
 A step that changes the Gauges (disable, remove, update, enable) reconciles the layout inside the same approved plan, and saves the result as a normal revision, so the saved layout never goes stale and every later change still works. `reconcileLayout(layout, table)` does this, and never edits the layout it was given:
 
-- A Gauge that is disabled, removed, or has lost its tile leaves its tile. The place goes back to its default Gauge when that Gauge is enabled, has a tile, and is not on another tile. Otherwise the tile is dropped, since the format has no empty place. A Gauge that is enabled and only lost its tile goes to the shelf.
-- A tile whose Gauge no longer allows its size takes the first allowed size that is no bigger than the tile and that fits, in the same cell. A step never makes a tile grow. When none fits, the Gauge goes to the shelf.
+- A Gauge that is disabled, removed, or has lost its tile leaves its tile. The place goes back to its default Gauge when that Gauge is enabled, has a tile, is not hidden, is not on another tile, and has a size that fits: the size of the place first, then the order of its manifest. Otherwise the tile is dropped, since the format has no empty place. A dropped tile stays gone. A restore of an earlier revision brings it back, and a swap puts the Gauge on another place. A Gauge that is enabled and only lost its tile goes to the shelf.
+- A tile whose Gauge no longer allows its size takes the first allowed size that is no bigger than the tile and that fits, in the same cell. A step never makes a tile grow in that case. When none fits, the Gauge goes to the shelf.
+- A place that is for a protected Gauge (its default became protected, or it is a place of the default home for one) and that another Gauge fills gives the place back. A protected Gauge on the shelf takes the place, with itself as the default, and the Gauge that was there goes to the shelf. A protected Gauge on another tile exchanges places with it. When neither fits, the tile is dropped and the Gauge that was there goes to the shelf.
 - A default Gauge that is gone becomes the Gauge in the place, and two places never share a default.
 - A Gauge that is disabled or removed leaves the shelf and the hidden list. `settings` stays.
 - A protected Gauge that is enabled and on no tile goes to the shelf, also from the hidden list, so a newly enabled protected Gauge appears there. A protected Gauge is never dropped.
-- An enabled Gauge that is not protected and that the layout does not hold is left alone. The person adds it.
+- A Gauge that a step just enabled (`options.enabled`) and that is on no tile, shelf, or hidden entry goes to the shelf. So a Gauge that is disabled and enabled again, or installed and enabled for the first time, is not lost. An enabled Gauge that the layout does not hold, in any other step, is left alone.
+- A hidden Gauge stays hidden. It does not come back on a tile when a place has it as its default.
 
-The result is valid for the Gauges. If a case that the rules do not foresee ever gave an invalid layout, the default layout is given instead, and a test holds every single-Gauge change to this. The plan of the step says what changes, in lines that start with `layout: `, and none when the layout does not change.
+The result is valid for the Gauges. A case that these rules do not foresee throws a plain `Error`: there is no fallback to the default layout, so a bug fails loudly, and the step throws before it changes anything. A fuzz test of 3,000 random layouts and Gauge changes, including protect flips, holds this (a run of 60,000 found no case). The plan of the step says what changes, in lines that start with `layout: `, one for every difference, and none when the layout does not change.
 
 ## Reasons
 
