@@ -26,6 +26,7 @@
     "packages/roots/test/**/*.ts",
     "packages/gauge-errors/test/**/*.ts",
     "packages/core-api/test/**/*.ts",
-    "packages/gauge-manifest/test/**/*.ts"
+    "packages/gauge-manifest/test/**/*.ts",
+    "packages/gauge-layout/test/**/*.ts"
   ]
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CORE_API_VERSION, MANIFEST_REASONS, MAX_MANIFEST_BYTES, isManifestReason, validateManifest } from '../src/index.js';
+import { CORE_API_VERSION, MANIFEST_REASONS, MAX_MANIFEST_BYTES, TILE_SIZES, isManifestReason, validateManifest } from '../src/index.js';
 import { INVALID_MANIFESTS, VALID_MANIFESTS, validManifest } from '../src/fixtures.js';
 
 const refusal = (input: string | Uint8Array) => {
@@ -287,4 +287,35 @@ test('a title with an invisible filler character is refused, alone or among lett
 test('a title with no visible character is refused, and a title with one passes', () => {
   for (const title of ['', ' ', '\u00A0', '\u3000', '\u2003', '\t', ' \u00A0 ']) assert.deepEqual(refusal(withField('title', title)), { code: INVALID, reason: 'invalid_field' }, JSON.stringify(title));
   for (const title of ['a', '.', '\u2764', 'a b', '\u65e5']) assert.equal(validateManifest(withField('title', title)).ok, true, title);
+});
+
+// Size hints: a tile may list the sizes it allows. The grid is in `packages/gauge-layout`.
+const tileWith = (extra: Record<string, unknown>, flags: { expandable?: boolean; resizable?: boolean } = {}) =>
+  withField('tile', { expandable: false, resizable: true, entry: 'ui/tile.js', ...flags, ...extra });
+
+test('the four tile sizes are small, medium, large, and full, in that order', () => {
+  assert.deepEqual([...TILE_SIZES], ['small', 'medium', 'large', 'full']);
+});
+
+test('a tile may declare size hints, and the manifest keeps them in the order given', () => {
+  const result = validateManifest(tileWith({ sizes: ['large', 'small'] }));
+  assert.ok(result.ok);
+  assert.deepEqual(result.manifest.tile?.sizes, ['large', 'small']);
+  assert.equal(Object.isFrozen(result.manifest.tile?.sizes), true);
+});
+
+test('a tile with no size hints has no sizes field', () => {
+  const result = validateManifest(validManifest('tile-only'));
+  assert.ok(result.ok);
+  assert.equal(Object.hasOwn(result.manifest.tile ?? {}, 'sizes'), false);
+});
+
+test('a tile that cannot be resized may name one size, and no more', () => {
+  assert.equal(validateManifest(tileWith({ sizes: ['medium'] }, { resizable: false })).ok, true);
+  assert.deepEqual(refusal(tileWith({ sizes: ['medium', 'large'] }, { resizable: false })), { code: 'GAUGE_MANIFEST_INVALID', reason: 'invalid_field' });
+});
+
+test('hostile size hints are refused with GAUGE_MANIFEST_INVALID and invalid_field', () => {
+  const bad: unknown[] = [[], ['huge'], ['small', 'small'], ['Small'], 'small', null, 5, {}, [1], [null], ['small', 'medium', 'large', 'full', 'small'], ['__proto__'], ['constructor'], [{ w: 7, h: 1 }]];
+  for (const sizes of bad) assert.deepEqual(refusal(tileWith({ sizes })), { code: 'GAUGE_MANIFEST_INVALID', reason: 'invalid_field' }, JSON.stringify(sizes));
 });

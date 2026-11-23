@@ -137,6 +137,6 @@ test('the code for a mixed traces grant says that traces permissions have their 
   assert.equal(GAUGE_MEANINGS.GAUGE_TRACES_OWN_STEP, 'Traces permissions are granted in their own step, apart from every other permission.');
 });
 
-test('the code for a grant that could not be recorded says that the audit file could not be written', () => {
-  assert.equal(GAUGE_MEANINGS.GAUGE_AUDIT_FAILED, 'The audit file could not be written, so the grant was refused.');
+test('the code for a grant that could not be recorded names both causes: the file failed, or the clock gave no usable time', () => {
+  assert.equal(GAUGE_MEANINGS.GAUGE_AUDIT_FAILED, 'A grant was refused because its audit record could not be made: the file failed, or the clock gave no usable time.');
 });

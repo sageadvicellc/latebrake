@@ -1,9 +1,10 @@
 import { isGaugeCode, type GaugeCode } from '../../gauge-errors/src/index.js';
 import { isAuditReason, isGrantReason, isManifestReason, isPermission, isTracesPermission, type PermissionName } from '../../gauge-manifest/src/index.js';
+import { MAX_LAYOUT_BYTES, MAX_REVISIONS, canonicalText, isLayoutReason, isProtectedReason, layoutOf, parseLayoutText, sha256Hex, type Layout } from '../../gauge-layout/src/index.js';
 import {
-  PLAN_ACTIONS,
+  LAYOUT_KINDS, PLAN_ACTIONS,
   type AuditEntry, type AuditRead, type Core, type CoreMethod, type CoreResult, type GaugeApplied, type GaugePlan, type GaugeSummary, type GrantApplied, type GrantEntry, type GrantPlan, type GrantRevoked,
-  type PermissionCheck, type PlanAction,
+  type LayoutApplied, type LayoutKind, type LayoutPlan, type LayoutRevisionEntry, type LayoutSafe, type LayoutState, type PermissionCheck, type PlanAction,
 } from './types.js';
 
 /** The core broke the contract: a reply of the wrong shape, or a code outside the registry. This is a bug, not a refusal. It names the method that failed. */
@@ -62,6 +63,35 @@ export interface CoreClient {
    * true once a record could not be written. The file is not a complete history.
    */
   readAudit(): Promise<CoreResult<AuditRead>>;
+  /**
+   * Reads the layout in use: the 6-column bento home, with its tiles, the shelf of what is one step away, and the hidden list. `revision` is its number, and `safe` is `null`. When the saved
+   * layout file was broken or invalid, the core started in safe mode: `revision` is 0, `safe` holds the code and reason of the refusal, and `layout` is the default layout, which is not saved
+   * until the person makes a change.
+   */
+  readLayout(): Promise<CoreResult<LayoutState>>;
+  /** Lists the earlier layouts that the file keeps, newest first, at most 10. The layout in use is not in the list. The list is empty in safe mode. */
+  listLayoutRevisions(): Promise<CoreResult<readonly LayoutRevisionEntry[]>>;
+  /** Gives the canonical text of the layout in use: one line of compact JSON and one line feed. Importing it gives the same layout. */
+  exportLayout(): Promise<CoreResult<string>>;
+  /**
+   * Plans to use the layout in a text, which is how a person saves a layout and how a person imports one. The text is validated like a manifest: strict JSON, a size cap, no unknown field, every
+   * Gauge must exist and be enabled, and no tile may overlap or leave the grid. A layout that hides, removes, or replaces a protected Gauge or Settings is refused with `GAUGE_PROTECTED`.
+   * Nothing changes until the plan is applied with the person's approval.
+   */
+  planLayoutSet(text: string): Promise<CoreResult<LayoutPlan>>;
+  /** Plans to swap which Gauge fills a place. The default Gauge of the place stays one action away (`planLayoutDefault`). */
+  planLayoutSwap(place: string, gauge: string): Promise<CoreResult<LayoutPlan>>;
+  /** Plans to put the default Gauge of a place back in it. */
+  planLayoutDefault(place: string): Promise<CoreResult<LayoutPlan>>;
+  /** Plans to restore an earlier layout of the file. It becomes the new layout in use, and the one it replaces becomes a revision. */
+  planLayoutRestore(revision: number): Promise<CoreResult<LayoutPlan>>;
+  /**
+   * A Gauge asks to add itself to the layout. It needs the `layout.propose` grant, and the change is a plan that only the person approves: a Gauge never changes the layout. The core
+   * puts the tile where it finds room, in the first size the Gauge allows.
+   */
+  planLayoutPropose(gauge: string): Promise<CoreResult<LayoutPlan>>;
+  /** Applies a layout plan. Like every plan, it needs the person's approval of this exact plan. Without one the core refuses with `GAUGE_PLAN_NOT_APPROVED`, and with a changed plan with `GAUGE_PLAN_CHANGED`. */
+  applyLayout(plan: LayoutPlan, approval?: string): Promise<CoreResult<LayoutApplied>>;
 }
 
 const SHOWN_LENGTH = 64;
@@ -189,6 +219,56 @@ function auditEntryOf(value: unknown): AuditEntry | undefined {
   return Object.freeze({ seq, at, action, via, id, version, permission, manifestHash, folderHash });
 }
 
+const NONNEGATIVE = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0);
+const POSITIVE = (value: unknown): value is number => NONNEGATIVE(value) && value >= 1;
+const KINDS: readonly string[] = LAYOUT_KINDS;
+
+/** Reads a layout from a reply: own properties only, in canonical order, with the grid and the tiles checked, and no Gauge. Gives a new frozen layout, or throws a protocol error. */
+function layoutIn(method: CoreMethod, value: unknown, what: string): Layout {
+  const result = layoutOf(value, { requireCanonical: true });
+  if (!result.ok) throw new CoreProtocolError(method, `${what} is not a layout: ${result.reason}`);
+  return result.layout;
+}
+
+/** Builds the state of the layout from a value, or gives back `undefined` when it is not one. In safe mode the revision is 0, and the cause is a code of the layout with its reason. */
+function safeOf(value: unknown): LayoutSafe | null | undefined {
+  if (value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const code = own(value, 'code'), reason = own(value, 'reason');
+  if (code === 'GAUGE_LAYOUT_INVALID' && isLayoutReason(reason)) return Object.freeze({ code, reason });
+  if (code === 'GAUGE_PROTECTED' && isProtectedReason(reason)) return Object.freeze({ code, reason });
+  return undefined;
+}
+
+/** Builds a layout plan from a value, or gives back `undefined` when it is not one. Each of the eleven fields is read once, from own properties. */
+function layoutPlanOf(value: unknown): LayoutPlan | undefined {
+  if (!isRecord(value)) return undefined;
+  const action = own(value, 'action'), kind = own(value, 'kind'), place = nullableText(own(value, 'place')), gauge = nullableText(own(value, 'gauge')), revision = own(value, 'revision'), text = nullableText(own(value, 'text'));
+  const steps = denseTexts(own(value, 'steps')), digest = own(value, 'digest'), baseHash = own(value, 'baseHash'), nextHash = own(value, 'nextHash'), nonce = own(value, 'nonce');
+  if (action !== 'layout' || typeof kind !== 'string' || !KINDS.includes(kind) || place === undefined || gauge === undefined || text === undefined || !steps) return undefined;
+  if (revision !== null && !POSITIVE(revision)) return undefined;
+  for (const hash of [digest, baseHash, nextHash, nonce]) if (typeof hash !== 'string' || !HEX_64.test(hash)) return undefined;
+  if (typeof digest !== 'string' || typeof baseHash !== 'string' || typeof nextHash !== 'string' || typeof nonce !== 'string') return undefined;
+  return Object.freeze({ action, kind: kind as LayoutKind, place, gauge, revision: revision, text, steps: Object.freeze(steps), digest, baseHash, nextHash, nonce });
+}
+
+/**
+ * A copy of a plan to send: each own enumerable data property of the plan (`Object.keys`), read once through its descriptor, with each named list copied. A property that is an accessor, or that is not enumerable,
+ * or that the plan only inherits, is not sent and is not read, so the core refuses the plan as incomplete. A plan that is `null` or `undefined` throws, as it always did.
+ */
+function ownLists(plan: object, keys: readonly string[]): Record<string, unknown> {
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(plan)) {
+    const descriptor = Object.getOwnPropertyDescriptor(plan, key);
+    // `Object.keys` lists the enumerable own string keys only, so a hidden property is never seen. An accessor has no `value`, and is skipped without being read.
+    if (!descriptor || !('value' in descriptor)) continue;
+    const value: unknown = descriptor.value;
+    // A key such as `__proto__` stays an own data property of the copy: it is defined, and not assigned, so it never changes the prototype of the copy.
+    Object.defineProperty(copy, key, { value: keys.includes(key) && Array.isArray(value) ? [...(value as unknown[])] : value, enumerable: true, writable: true, configurable: true });
+  }
+  return copy;
+}
+
 /** Builds the client on a core: the fake core now, the real core later. */
 export function createCoreClient(core: Core): CoreClient {
   /** Calls the core, then reads the reply. A throw from the call itself reaches the caller unchanged. A throw while reading the reply is a protocol error. */
@@ -206,6 +286,11 @@ export function createCoreClient(core: Core): CoreClient {
           if (isGrantReason(reason)) return { ok: false, code, reason };
         } else if (code === 'GAUGE_AUDIT_FAILED') {
           if (isAuditReason(reason)) return { ok: false, code, reason };
+        } else if (code === 'GAUGE_LAYOUT_INVALID') {
+          if (isLayoutReason(reason)) return { ok: false, code, reason };
+        } else if (code === 'GAUGE_PROTECTED') {
+          if (reason === undefined) return { ok: false, code };
+          if (isProtectedReason(reason)) return { ok: false, code, reason };
         } else {
           if (reason === undefined) return { ok: false, code };
           if (isManifestReason(reason)) return { ok: false, code, reason };
@@ -248,7 +333,69 @@ export function createCoreClient(core: Core): CoreClient {
     if ('folder' in target ? plan.folder !== target.folder : plan.folder !== null || plan.id !== target.id) throw new CoreProtocolError(method, 'result is a plan for another target');
     return plan;
   });
+  /** A plan for a change to the layout. It must answer the request: the same kind and the same targets, and nothing else. */
+  const layoutPlanning = (request: { readonly kind: LayoutKind; readonly place?: string; readonly gauge?: string; readonly revision?: number; readonly text?: string }) =>
+    ask('bowerloom.layout.plan', { ...request }, (method, result) => {
+      const plan = layoutPlanOf(result);
+      if (!plan) throw new CoreProtocolError(method, 'result is not a layout plan');
+      if (plan.kind !== request.kind) throw new CoreProtocolError(method, `result is a plan for another change: ${shown(plan.kind)}`);
+      if (plan.place !== (request.place ?? null) || plan.gauge !== (request.gauge ?? null) || plan.revision !== (request.revision ?? null) || plan.text !== (request.text ?? null)) {
+        throw new CoreProtocolError(method, 'result is a plan for another target');
+      }
+      // The last line is the one that binds the change to the two hashes, so the person reads the hashes that the plan holds.
+      if (plan.steps[plan.steps.length - 1] !== `bind the change to layout ${plan.baseHash} and result ${plan.nextHash}`) throw new CoreProtocolError(method, 'result plan does not end with the line that binds it to its hashes');
+      if (request.kind === 'set') {
+        // The result of a layout that is set is known from the text alone, so the hash can be checked here.
+        const parsed = parseLayoutText(request.text ?? '');
+        if (!parsed.ok) throw new CoreProtocolError(method, `result is a plan for a text that is not a layout: ${parsed.reason}`);
+        if (plan.nextHash !== sha256Hex(canonicalText(parsed.layout))) throw new CoreProtocolError(method, 'result plan holds a hash that is not the hash of the text that was sent');
+      }
+      return plan;
+    });
   return {
+    readLayout: () => ask('bowerloom.layout.read', {}, (method, result) => {
+      if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not a layout state');
+      const layout = layoutIn(method, own(result, 'layout'), 'result layout'), revision = own(result, 'revision'), safe = safeOf(own(result, 'safe'));
+      if (!NONNEGATIVE(revision) || safe === undefined) throw new CoreProtocolError(method, 'result is not a layout state');
+      // A layout in safe mode was not saved, so it has no number. A saved layout has one.
+      if ((safe === null) !== (revision >= 1)) throw new CoreProtocolError(method, 'result revision does not fit the safe mode');
+      return Object.freeze<LayoutState>({ layout, revision, safe });
+    }),
+    listLayoutRevisions: () => ask('bowerloom.layout.revisions', {}, (method, result) => {
+      if (!Array.isArray(result)) throw new CoreProtocolError(method, 'result is not a list');
+      if (result.length > MAX_REVISIONS) throw new CoreProtocolError(method, 'result holds more revisions than the file keeps');
+      const entries: LayoutRevisionEntry[] = [];
+      for (const item of Array.from(result as unknown[])) {
+        if (!isRecord(item)) throw new CoreProtocolError(method, `result element ${entries.length} is not a revision`);
+        const revision = own(item, 'revision');
+        if (!POSITIVE(revision)) throw new CoreProtocolError(method, `result element ${entries.length} is not a revision`);
+        // Newest first: each number is lower than the one before.
+        if (entries.length > 0 && revision >= (entries[entries.length - 1]?.revision ?? 0)) throw new CoreProtocolError(method, 'result revisions are not newest first');
+        entries.push(Object.freeze({ revision, layout: layoutIn(method, own(item, 'layout'), `result element ${entries.length}`) }));
+      }
+      return Object.freeze(entries);
+    }),
+    exportLayout: () => ask('bowerloom.layout.export', {}, (method, result) => {
+      if (typeof result !== 'string' || result.length > MAX_LAYOUT_BYTES || new TextEncoder().encode(result).byteLength > MAX_LAYOUT_BYTES) throw new CoreProtocolError(method, 'result is not a layout text');
+      const parsed = parseLayoutText(result);
+      if (!parsed.ok) throw new CoreProtocolError(method, `result is not a layout text: ${parsed.reason}`);
+      if (canonicalText(parsed.layout) !== result) throw new CoreProtocolError(method, 'result is not in the canonical form');
+      return result;
+    }),
+    planLayoutSet: text => layoutPlanning({ kind: 'set', text }),
+    planLayoutSwap: (place, gauge) => layoutPlanning({ kind: 'swap', place, gauge }),
+    planLayoutDefault: place => layoutPlanning({ kind: 'default', place }),
+    planLayoutRestore: revision => layoutPlanning({ kind: 'restore', revision }),
+    planLayoutPropose: gauge => layoutPlanning({ kind: 'propose', gauge }),
+    applyLayout: (plan, approval) => ask('bowerloom.layout.apply', { plan: ownLists(plan, ['steps']), ...(approval === undefined ? {} : { approval }) }, (method, result) => {
+      if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not an applied layout change');
+      const kind = own(result, 'kind'), revision = own(result, 'revision'), changed = own(result, 'changed');
+      if (typeof kind !== 'string' || !KINDS.includes(kind) || !POSITIVE(revision) || typeof changed !== 'boolean') throw new CoreProtocolError(method, 'result is not an applied layout change');
+      if (kind !== plan.kind) throw new CoreProtocolError(method, 'result is for another plan');
+      // A plan whose result differs from the layout in use is a change, so a revision was written.
+      if (plan.baseHash !== plan.nextHash && !changed) throw new CoreProtocolError(method, 'result says nothing changed for a plan that changes the layout');
+      return Object.freeze({ kind: kind as LayoutKind, revision, changed });
+    }),
     listGauges: () => ask('bowerloom.gauges.list', {}, gaugeList),
     getGauge: id => ask('bowerloom.gauges.get', { id }, (method, result) => {
       const gauge = summaryOf(result);
@@ -261,7 +408,7 @@ export function createCoreClient(core: Core): CoreClient {
     planEnable: id => planning('enable', { id }),
     planDisable: id => planning('disable', { id }),
     planRemove: id => planning('remove', { id }),
-    applyPlan: (plan, approval) => ask('bowerloom.gauges.apply', { plan: { ...plan, steps: [...plan.steps] }, ...(approval === undefined ? {} : { approval }) }, (method, result) => {
+    applyPlan: (plan, approval) => ask('bowerloom.gauges.apply', { plan: ownLists(plan, ['steps']), ...(approval === undefined ? {} : { approval }) }, (method, result) => {
       const applied = appliedOf(result);
       if (!applied) throw new CoreProtocolError(method, 'result is not an applied plan');
       if (applied.action !== plan.action || applied.id !== plan.id) throw new CoreProtocolError(method, 'result is for another plan');
@@ -282,7 +429,7 @@ export function createCoreClient(core: Core): CoreClient {
       if (!sameList(plan.permissions, [...permissions].sort())) throw new CoreProtocolError(method, 'result is a plan for other permissions than were asked');
       return plan;
     }),
-    applyGrant: (plan, approval) => ask('bowerloom.grants.apply', { plan: { ...plan, permissions: [...plan.permissions], steps: [...plan.steps] }, ...(approval === undefined ? {} : { approval }) }, (method, result) => {
+    applyGrant: (plan, approval) => ask('bowerloom.grants.apply', { plan: ownLists(plan, ['permissions', 'steps']), ...(approval === undefined ? {} : { approval }) }, (method, result) => {
       if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not an applied grant');
       const id = own(result, 'id'), permissions = permissionNames(own(result, 'permissions'));
       if (typeof id !== 'string' || !permissions) throw new CoreProtocolError(method, 'result is not an applied grant');

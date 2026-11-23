@@ -1,12 +1,14 @@
 import type { GaugeCode } from '../../gauge-errors/src/index.js';
 import type { AuditReason, GrantReason, ManifestReason, PermissionName } from '../../gauge-manifest/src/index.js';
+import type { Layout, LayoutReason, LayoutRevision, ProtectedReason } from '../../gauge-layout/src/index.js';
 
 /** The wire names of the calls the core offers. Wire identifiers keep the `bowerloom` prefix until the rename. */
 export type CoreMethod =
   | 'bowerloom.gauges.list' | 'bowerloom.gauges.get'
   | 'bowerloom.gauges.plan' | 'bowerloom.gauges.apply' | 'bowerloom.gauges.routes'
   | 'bowerloom.grants.plan' | 'bowerloom.grants.apply' | 'bowerloom.grants.revoke' | 'bowerloom.grants.list'
-  | 'bowerloom.permissions.check' | 'bowerloom.audit.read';
+  | 'bowerloom.permissions.check' | 'bowerloom.audit.read'
+  | 'bowerloom.layout.read' | 'bowerloom.layout.revisions' | 'bowerloom.layout.export' | 'bowerloom.layout.plan' | 'bowerloom.layout.apply';
 
 /** The five steps of a Gauge's life, in one list that the client and the fake core both use. Each goes through a plan and an approval. An update is an install plan of the new version. */
 export const PLAN_ACTIONS = Object.freeze(['install', 'enable', 'disable', 'update', 'remove'] as const);
@@ -134,6 +136,56 @@ export interface AuditRead {
   readonly auditFailed: boolean;
 }
 
+/** The kinds of change to the layout, in one list that the client and the fake core both use. Each goes through a plan and an approval. */
+export const LAYOUT_KINDS = Object.freeze(['set', 'swap', 'default', 'restore', 'propose'] as const);
+export type LayoutKind = (typeof LAYOUT_KINDS)[number];
+
+/** Why the core is in safe mode: the code and the reason of the refusal that the saved layout file got when the core started. */
+export type LayoutSafe =
+  | { readonly code: 'GAUGE_LAYOUT_INVALID'; readonly reason: LayoutReason }
+  | { readonly code: 'GAUGE_PROTECTED'; readonly reason: ProtectedReason };
+
+/**
+ * What a read of the layout gives. `revision` is the number of the layout in use, from 1. In safe mode it is 0, `safe` says why, and `layout` is the default layout, which is not saved
+ * until the person makes a change. When `safe` is `null`, the layout is the saved one.
+ */
+export interface LayoutState {
+  readonly layout: Layout;
+  readonly revision: number;
+  readonly safe: LayoutSafe | null;
+}
+
+/** One earlier layout of the file, with the number it had. */
+export type LayoutRevisionEntry = LayoutRevision;
+
+/**
+ * What a change to the layout would do, shown to the person before anything changes. The change is named by `kind` and the fields it needs, and the others are `null`:
+ * `set` has `text` (the layout to use: a save and an import are both this), `swap` has `place` and `gauge`, `default` has `place`, `restore` has `revision`, and `propose` has `gauge`,
+ * the Gauge that asks to add itself. `baseHash` is the SHA-256 of the canonical text of the layout the plan was made for, and `nextHash` is that of the layout it would give. Both are in the
+ * `digest`, so an approval is for the change the person saw. `nonce` is issued by the core and is exactly 64 lowercase hexadecimal characters. Only the person approves a plan, so a Gauge never
+ * changes the layout: it can only ask, and only to add itself.
+ */
+export interface LayoutPlan {
+  readonly action: 'layout';
+  readonly kind: LayoutKind;
+  readonly place: string | null;
+  readonly gauge: string | null;
+  readonly revision: number | null;
+  readonly text: string | null;
+  readonly steps: readonly string[];
+  readonly digest: string;
+  readonly baseHash: string;
+  readonly nextHash: string;
+  readonly nonce: string;
+}
+
+/** What an applied layout plan gives back: the kind, the number of the layout now in use, and whether a revision was written. A change that gives the layout already in use writes none. */
+export interface LayoutApplied {
+  readonly kind: LayoutKind;
+  readonly revision: number;
+  readonly changed: boolean;
+}
+
 /** The raw answer of a core: a result, or a refusal with a code. The client checks the code against the registry. */
 export type CoreReply =
   | { readonly ok: true; readonly result: unknown }
@@ -153,8 +205,13 @@ export interface Core {
  */
 export type CoreResult<T> = { readonly ok: true; readonly value: T } | CoreRefusal;
 
-/** A refusal, with its reason typed by its code. `GAUGE_GRANT_MISSING` has a grant reason or none. `GAUGE_AUDIT_FAILED` always has an audit reason. Every other code has a manifest reason or none. */
+/**
+ * A refusal, with its reason typed by its code. `GAUGE_GRANT_MISSING` has a grant reason or none. `GAUGE_AUDIT_FAILED` always has an audit reason. `GAUGE_LAYOUT_INVALID` always has a layout reason.
+ * `GAUGE_PROTECTED` has a protected reason (`hidden`, `removed`, `replaced`) when the layout refused it, and none when the lifecycle did. Every other code has a manifest reason or none.
+ */
 export type CoreRefusal =
   | { readonly ok: false; readonly code: 'GAUGE_GRANT_MISSING'; readonly reason?: GrantReason }
   | { readonly ok: false; readonly code: 'GAUGE_AUDIT_FAILED'; readonly reason: AuditReason }
-  | { readonly ok: false; readonly code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED'>; readonly reason?: ManifestReason };
+  | { readonly ok: false; readonly code: 'GAUGE_LAYOUT_INVALID'; readonly reason: LayoutReason }
+  | { readonly ok: false; readonly code: 'GAUGE_PROTECTED'; readonly reason?: ProtectedReason }
+  | { readonly ok: false; readonly code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED'>; readonly reason?: ManifestReason };

@@ -30,7 +30,7 @@ All fields are required except `tile` and `page`. Any other field is `unknown_fi
 - `kind` is `ui` or `data`. The `process` and `adapter` kinds are specified and not built, so they are `unsupported_kind`.
 - `protected` is a boolean.
 - `engines` is a list of up to 16 engine ids, with no repeat. An empty list means the Gauge serves no engine.
-- `tile` is `{ expandable, resizable, entry }`. A Gauge says whether its tile is expandable, resizable, both, or neither. A tile that is expandable needs a `page` to open.
+- `tile` is `{ expandable, resizable, entry }`, and may also have `sizes`. A Gauge says whether its tile is expandable, resizable, both, or neither. A tile that is expandable needs a `page` to open. `sizes` are size hints: one to four names of `TILE_SIZES` (`small`, `medium`, `large`, `full`), once each, and the first is preferred. A tile that cannot be resized names at most one size. A hostile hint is `invalid_field`. The grid, and what a layout may do with the hints, are in `packages/gauge-layout`.
 - `page` is `{ entry }`.
 - `permissions` is a list of up to 64 dotted names, with no repeat. The shape is checked first (`invalid_field`). Then each name must be in the permission list below, so a name that is well formed but not listed is `GAUGE_MANIFEST_INVALID` (`unknown_permission`). A Gauge cannot invent a permission.
 - `dependencies` is a list of up to 32 `{ id, range }`, with no repeat and no Gauge that depends on itself. A range that nothing can satisfy is `invalid_field`.
