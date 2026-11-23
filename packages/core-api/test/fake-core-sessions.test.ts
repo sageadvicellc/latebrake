@@ -220,6 +220,13 @@ test('a plan for a shared folder is a changed plan once the other engine has gon
   assert.equal(rig.host.launched, 1);
 });
 
+test('a host that is shutting down refuses a plan with ENGINE_START_FAILED and the reason shutting_down', async t => {
+  const { rig, client } = await ready(t);
+  await rig.host.killAll();
+  assert.deepEqual(await client.planSessionStart(GAUGE, { engine: ENGINE, folder: rig.folder('alpha') }), { ok: false, code: 'ENGINE_START_FAILED', reason: 'shutting_down' });
+  assert.equal(rig.host.launched, 0);
+});
+
 test('a plan made before a Gauge update, disable, or removal cannot start a session after it', async t => {
   const { rig, client, fake } = await ready(t);
   const planned = must(await client.planSessionStart(GAUGE, { engine: ENGINE, folder: rig.folder('alpha') }));
