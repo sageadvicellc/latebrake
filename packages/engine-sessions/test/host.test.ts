@@ -1,7 +1,7 @@
 // The host, with a launcher that starts no process: each event of a program is made by the test, so every state change is exact. The tests with real processes are in `host-process.test.ts`.
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_SESSION_CAP, DEFAULT_STOP_TIMEOUT_MS, StalePlanError, createEngineHost, type EngineHost, type EngineSpec, type HostOptions } from '../src/host.js';
+import { DEFAULT_SESSION_CAP, DEFAULT_STOP_TIMEOUT_MS, StalePlanError, createEngineHost, isStalePlanError, type EngineHost, type EngineSpec, type HostOptions } from '../src/host.js';
 import { KEEP_ENDED_SESSIONS, MAX_SESSIONS_LISTED } from '../src/vocab.js';
 import { fakeSignal } from '../src/fixtures.js';
 import type { FaultEntry } from '../src/session.js';
@@ -133,6 +133,41 @@ test('a folder that changes between the plan and the begin is a stale plan, with
   assert.equal(r.host.launched, 0);
   // A plan that is a bug of the caller (a malformed plan) is not a stale plan: it is the plain error that it was.
   assert.throws(() => r.host.beginStartGroup([{ nothing: true } as never], { sharedApproved: false }), error => error instanceof TypeError && !(error instanceof StalePlanError));
+});
+
+test('a stale plan is known by its class and also by its name and mark, so a second copy of the host module is known too', () => {
+  const copy = Object.assign(new Error('from another copy'), { name: 'StalePlanError' });
+  Object.defineProperty(copy, 'stalePlan', { value: true, enumerable: false });
+  assert.equal(copy instanceof StalePlanError, false);
+  assert.equal(isStalePlanError(copy), true, 'the name and the mark of another copy');
+  assert.equal(Object.keys(copy).includes('stalePlan'), false, 'the mark is not enumerable');
+  assert.equal(isStalePlanError(new StalePlanError('here')), true);
+  assert.equal(isStalePlanError(Object.assign(new Error('x'), { name: 'StalePlanError' })), false, 'a name alone is not enough');
+  assert.equal(isStalePlanError(Object.assign(new Error('x'), { stalePlan: true })), false, 'a mark alone is not enough');
+  for (const other of [null, undefined, 'StalePlanError', { name: 'StalePlanError', stalePlan: true }, new TypeError('x')]) assert.equal(isStalePlanError(other), false, String(other));
+});
+
+test('a configured program with a hidden character is logged before the program is looked for, also when it is not there, and a flood of folders cannot make the host log it again', (t: TestContext) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'host-config-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  // A folder that loops back on itself: reading it fails with a code other than "not there", which the host logs once for each folder.
+  fs.symlinkSync('loop', path.join(root, 'loop'));
+  const faults: FaultEntry[] = [];
+  const host = createEngineHost({ engines: [spec('alpha', { program: '/nowhere/sh\nx' }), spec('beta')], launcher: manualLauncher(), locate: program => (program === '/bin/beta' ? program : undefined), log: entry => faults.push(entry), schedule: () => () => undefined });
+  const configured = (): string[] => faults.map(entry => entry.message).filter(message => message.includes('is configured with'));
+  assert.deepEqual(host.planStart(request('alpha', root)), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
+  assert.deepEqual(configured(), ['engine host: the program of the engine alpha is configured with a control, format, or separator character: /nowhere/sh\\u{a}x']);
+  for (let index = 0; index < 1100; index += 1) host.planStart(request('beta', `${root}/loop/${index}`));
+  assert.ok(faults.length > 1024, 'the log of folders filled the once-guard of the folders and cleared it');
+  assert.equal(host.planStart(request('alpha', root)).ok, false);
+  assert.equal(configured().length, 1, 'the engine is logged once');
+});
+
+test('a real path of a program with a hidden character is logged too, once for each engine', () => {
+  const r = rig({ locate: () => '/bin/al\npha' }, [spec('alpha')]);
+  assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
+  assert.deepEqual(r.host.planStart(request('alpha', '/work/two')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
+  assert.deepEqual(r.faults.map(entry => entry.message), ['engine host: the real path of the program of the engine alpha holds a control, format, or separator character: /bin/al\\u{a}pha']);
 });
 
 test('a program that is configured with a hidden or separator character is logged once for the person, with the engine, and never in a refusal', () => {

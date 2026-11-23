@@ -18,8 +18,14 @@ export class StalePlanError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'StalePlanError';
+    // The mark does not show when the error is listed or copied. With the name, it tells a stale plan of another copy of this module, which `instanceof` does not.
+    Object.defineProperty(this, 'stalePlan', { value: true, enumerable: false });
   }
 }
+
+/** True for a `StalePlanError` of this module or of another copy of it: by its class, or by its name and its mark together. A name alone, or a mark alone, is not enough. */
+export const isStalePlanError = (error: unknown): error is StalePlanError => error instanceof StalePlanError
+  || (error instanceof Error && error.name === 'StalePlanError' && Object.getOwnPropertyDescriptor(error, 'stalePlan')?.value === true);
 
 export { BILLING_SOURCES };
 export type { Billing };
@@ -402,6 +408,13 @@ export function createEngineHost(options: HostOptions): EngineHost {
     logged.add(key);
     report(log, { session: '', from: 'detected', to: 'detected', message: `engine host: ${message}` });
   };
+  /** The engines whose program was logged as a mistake of the configuration. One flag for each engine and kind, so at most twice the engines (16 at most), and no request can clear it. */
+  const warned = new Set<string>();
+  const warn = (key: string, message: string): void => {
+    if (warned.has(key)) return;
+    warned.add(key);
+    report(log, { session: '', from: 'detected', to: 'detected', message: `engine host: ${message}` });
+  };
   const locate = options.locate ?? ((program: string) => locateProgram(program, (folder, code) => logOnce(`program\u0000${folder}\u0000${code}`, `could not search the folder ${escapeText(folder)} for the program: ${escapeText(code)}`)));
   const canonical = options.canonical ?? ((folder: string) => canonicalFolder(folder, code => logOnce(`folder\u0000${folder}\u0000${code}`, `could not read the folder ${escapeText(folder)}: ${escapeText(code)}`)));
   const log = options.log;
@@ -554,6 +567,12 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!spec) return notFound('engine');
     // The denylist is for the names that a caller asks for. A name that the engine declares itself passes, since the plan lists it and a plan that is planned again must be accepted.
     if (allowed.value.some(name => isRefusedVariable(name) && !spec.env.includes(name))) return invalid('variables');
+    // The program as the engine is configured is shown to a Gauge, so it is held to the same rule as the real path, and before the program is looked for: a program that is not there is still a mistake of the configuration.
+    // It is a mistake that the person must find, so it is logged once for each engine, in a record of its own that no request can clear.
+    if (hasUnsafeChar(spec.program)) {
+      warn(`configured:${spec.id}`, `the program of the engine ${spec.id} is configured with a control, format, or separator character: ${escapeText(spec.program)}`);
+      return notFound('program_missing');
+    }
     const located = locate(spec.program);
     if (located === undefined) return notFound('program_missing');
     if (typeof located !== 'string') {
@@ -563,10 +582,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
     }
     const program = located;
     // A program whose path holds a control or separator character is not offered to the person: the plan shows the real path as it is.
-    if (hasUnsafeChar(program)) return notFound('program_missing');
-    // The program as the engine is configured is shown to a Gauge, so it is held to the same rule. It is a mistake of the configuration, so the person finds it in the log, once for each engine.
-    if (hasUnsafeChar(spec.program)) {
-      logOnce(`configured\u0000${spec.id}`, `the program of the engine ${spec.id} is configured with a control, format, or separator character: ${escapeText(spec.program)}`);
+    if (hasUnsafeChar(program)) {
+      warn(`real:${spec.id}`, `the real path of the program of the engine ${spec.id} holds a control, format, or separator character: ${escapeText(program)}`);
       return notFound('program_missing');
     }
     const real = canonical(folder.value);
