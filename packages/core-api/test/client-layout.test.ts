@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCoreClient, CoreProtocolError } from '../src/client.js';
+import { createHash } from 'node:crypto';
 import type { Core, CoreReply, LayoutPlan } from '../src/types.js';
 import { LAYOUT_REASONS, PROTECTED_REASONS } from '../../gauge-layout/src/index.js';
 import { HOME_DOC } from './layout-suite.js';
@@ -12,7 +13,11 @@ function scripted(reply: unknown): Core & { readonly calls: { method: string; pa
 const ok = (result: unknown) => scripted({ ok: true, result });
 const A = 'a'.repeat(64), B = 'b'.repeat(64), C = 'c'.repeat(64), D = 'd'.repeat(64);
 const TEXT = '{"x":1}';
-const PLAN: LayoutPlan = { action: 'layout', kind: 'swap', place: 'models', gauge: 'tracing', revision: null, text: null, steps: ['one', 'two'], digest: A, baseHash: B, nextHash: C, nonce: D };
+const bind = (base: string, next: string) => `bind the change to layout ${base} and result ${next}`;
+const PLAN: LayoutPlan = { action: 'layout', kind: 'swap', place: 'models', gauge: 'tracing', revision: null, text: null, steps: ['one', bind(B, C)], digest: A, baseHash: B, nextHash: C, nonce: D };
+const SET_TEXT = `${JSON.stringify(HOME_DOC)}\n`;
+const SET_HASH = createHash('sha256').update(SET_TEXT).digest('hex');
+const SET_PLAN: LayoutPlan = { ...PLAN, kind: 'set', place: null, gauge: null, text: SET_TEXT, nextHash: SET_HASH, steps: ['one', bind(B, SET_HASH)] };
 const swapping = (result: unknown) => createCoreClient(ok(result)).planLayoutSwap('models', 'tracing');
 const STATE = { layout: HOME_DOC, revision: 2, safe: null };
 const reading = (result: unknown) => createCoreClient(ok(result)).readLayout();
@@ -45,10 +50,10 @@ test('each layout call sends its params under a bowerloom wire name', async () =
 });
 
 test('the client sends a copy of the plan, so a core that changes it changes nothing for the caller', async () => {
-  const plan: LayoutPlan = { ...PLAN, steps: ['one'] };
+  const plan: LayoutPlan = { ...PLAN, steps: ['one', bind(B, C)] };
   const core: Core = { call: async (_method, params) => { (params['plan'] as { steps: string[] } | undefined)?.steps.push('x'); return { ok: false, code: 'UNKNOWN_GAUGE' }; } };
   await createCoreClient(core).applyLayout(plan);
-  assert.deepEqual(plan.steps, ['one']);
+  assert.deepEqual(plan.steps, ['one', bind(B, C)]);
 });
 
 // The state
@@ -152,8 +157,8 @@ test('a well-formed layout plan comes back as a frozen copy that drops other fie
 test('a layout plan must answer the request: the kind, the place, the Gauge, the revision, and the text', async () => {
   const wrong: unknown[] = [{ ...PLAN, kind: 'default' }, { ...PLAN, place: 'other' }, { ...PLAN, gauge: 'other' }, { ...PLAN, place: null }, { ...PLAN, revision: 1 }, { ...PLAN, text: 'x' }];
   for (const plan of wrong) await assert.rejects(swapping(plan), (error: unknown) => error instanceof CoreProtocolError && error.method === 'bowerloom.layout.plan', JSON.stringify(plan));
-  assert.deepEqual(await createCoreClient(ok({ ...PLAN, kind: 'set', place: null, gauge: null, text: TEXT })).planLayoutSet(TEXT), { ok: true, value: { ...PLAN, kind: 'set', place: null, gauge: null, text: TEXT } });
-  await assert.rejects(createCoreClient(ok({ ...PLAN, kind: 'set', place: null, gauge: null, text: `${TEXT} ` })).planLayoutSet(TEXT), CoreProtocolError);
+  assert.deepEqual(await createCoreClient(ok(SET_PLAN)).planLayoutSet(SET_TEXT), { ok: true, value: SET_PLAN });
+  await assert.rejects(createCoreClient(ok({ ...SET_PLAN, text: `${SET_TEXT} ` })).planLayoutSet(SET_TEXT), CoreProtocolError);
   assert.deepEqual(await createCoreClient(ok({ ...PLAN, kind: 'default', gauge: null })).planLayoutDefault('models'), { ok: true, value: { ...PLAN, kind: 'default', gauge: null } });
   assert.deepEqual(await createCoreClient(ok({ ...PLAN, kind: 'restore', place: null, gauge: null, revision: 3 })).planLayoutRestore(3), { ok: true, value: { ...PLAN, kind: 'restore', place: null, gauge: null, revision: 3 } });
   await assert.rejects(createCoreClient(ok({ ...PLAN, kind: 'restore', place: null, gauge: null, revision: 4 })).planLayoutRestore(3), CoreProtocolError);
@@ -219,4 +224,25 @@ test('a core that throws from the call itself is not wrapped for a layout call e
   const failure = new Error('transport');
   const core: Core = { call: async () => { throw failure; } };
   await assert.rejects(createCoreClient(core).readLayout(), (error: unknown) => error === failure);
+});
+
+test('a layout plan must end with the line that binds it to its two hashes, and the line must name those hashes', async () => {
+  const bad: unknown[] = [
+    { ...PLAN, steps: ['one'] }, { ...PLAN, steps: [] }, { ...PLAN, steps: [bind(B, C), 'one'] }, { ...PLAN, steps: ['one', bind(C, B)] }, { ...PLAN, steps: ['one', bind(B, B)] },
+    { ...PLAN, steps: ['one', `${bind(B, C)} `] }, { ...PLAN, steps: ['one', bind(B, C).toUpperCase()] }, { ...PLAN, steps: ['one', 'bind the change'] },
+  ];
+  for (const plan of bad) await assert.rejects(swapping(plan), (error: unknown) => error instanceof CoreProtocolError && /bind/.test(error.message), JSON.stringify(plan));
+});
+
+test('the next hash of a plan to set a layout is the SHA-256 of the canonical text of the text that was sent', async () => {
+  const bad: unknown[] = [
+    { ...SET_PLAN, nextHash: C, steps: ['one', bind(B, C)] }, { ...SET_PLAN, nextHash: SET_HASH.toUpperCase(), steps: ['one', bind(B, SET_HASH.toUpperCase())] },
+    { ...SET_PLAN, nextHash: createHash('sha256').update('x').digest('hex'), steps: ['one', bind(B, createHash('sha256').update('x').digest('hex'))] },
+  ];
+  for (const plan of bad) await assert.rejects(createCoreClient(ok(plan)).planLayoutSet(SET_TEXT), (error: unknown) => error instanceof CoreProtocolError && error.method === 'bowerloom.layout.plan', JSON.stringify(plan).slice(0, 60));
+  // A text in another order has the same canonical text, so the same hash.
+  const shuffled = JSON.stringify({ ...HOME_DOC, shelf: [...HOME_DOC.shelf].reverse() });
+  assert.deepEqual(await createCoreClient(ok({ ...SET_PLAN, text: shuffled })).planLayoutSet(shuffled), { ok: true, value: { ...SET_PLAN, text: shuffled } });
+  // A text that is not a layout cannot have a plan.
+  await assert.rejects(createCoreClient(ok({ ...SET_PLAN, text: '{"x":1}' })).planLayoutSet('{"x":1}'), CoreProtocolError);
 });

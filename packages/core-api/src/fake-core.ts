@@ -5,11 +5,11 @@ import {
   type AuditReason, type GaugeManifest, type GrantReason, type ManifestReason, type PermissionName,
 } from '../../gauge-manifest/src/index.js';
 import {
-  PAGE_IDS, canonicalText, checkLayout, defaultLayout, layoutObject, newFile, parseLayout, parseLayoutFile, proposeTile, saveRevision, serializeLayoutFile, swapPlace, defaultPlace, tileInfoOf, invalid as layoutInvalid,
-  type GaugeTable, type Layout, type LayoutFile, type LayoutRefusal, type TileInfo, type UnknownGaugeRefusal,
+  PAGE_IDS, canonicalText, checkLayout, defaultLayout, droppedRevision, layoutObject, newFile, parseLayout, parseLayoutFile, proposeTile, reconcileLayout, saveRevision, serializeLayoutFile, swapPlace, defaultPlace, tileInfoOf, invalid as layoutInvalid,
+  type GaugeInfo, type Layout, type LayoutFile, type LayoutRefusal, type TileInfo, type UnknownGaugeRefusal,
 } from '../../gauge-layout/src/index.js';
 import { FIXTURE_GAUGES, HOME_STOCK } from './fixtures.js';
-import { layoutSteps } from './layout-plan.js';
+import { layoutChangeSteps, layoutSteps } from './layout-plan.js';
 import { DEFAULT_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES, appendAuditStep, auditLine, grantSteps } from './grants.js';
 import { escapeForPlan } from './plan-text.js';
 import {
@@ -59,7 +59,8 @@ export interface FakeCoreOptions {
   readonly home?: boolean;
   /**
    * The saved layout file that the core finds when it starts, as text or UTF-8 bytes. The core keeps a copy. None means a first start, with the default layout. A file that is broken, or
-   * that no longer fits the Gauges the core holds, makes the core start in safe mode with the default layout. The core never refuses to start because of it.
+   * that no longer fits the Gauges the core holds, makes the core start in safe mode with the default layout, and so does a value that is not text or bytes (the reason `syntax`).
+   * The core never refuses to start because of it. The raw bytes are kept, and a change that leaves safe mode sets them aside as a backup (`layoutBackup()`).
    */
   readonly layoutFile?: string | Uint8Array;
 }
@@ -79,6 +80,10 @@ export interface FakeCore extends Core {
   auditFile(): string;
   /** The text of the saved layout file. In safe mode it is the broken text that was found, until the first change replaces it. A real core keeps this in a file on this computer. */
   layoutFile(): string;
+  /** The raw bytes of the saved layout file that a change set aside when it left safe mode, or `null` when none was set aside. A copy each time. A real core keeps the file itself. */
+  layoutBackup(): Uint8Array | null;
+  /** What the next start would find in the saved layout file against the Gauges as they are now: `null` when the core would start normally, or the cause of safe mode. Changes nothing. */
+  layoutStartCheck(): LayoutSafe | null;
 }
 
 interface Installed {
@@ -249,22 +254,51 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
 
   // The layout. The file on disk is `layoutDisk`. In safe mode `layoutSaved` is `null` and `layoutSafe` says why: the layout in use is then the default layout, which is not saved until the person makes a change.
   /** The Gauges as the layout sees them: whether each is enabled and protected, and what its tile allows. */
-  const gaugeTable = (): GaugeTable => new Map([...installed].map(([id, entry]) => [id, { enabled: entry.enabled, protected: entry.summary.protected, tile: entry.tile }]));
+  const gaugeTable = (): Map<string, GaugeInfo> => new Map([...installed].map(([id, entry]) => [id, { enabled: entry.enabled, protected: entry.summary.protected, tile: entry.tile }]));
   let layoutSaved: LayoutFile | null = null;
   let layoutSafe: LayoutSafe | null = null;
   let layoutDisk = '';
+  /** The bytes of the file found at the start, and the copy set aside when a change leaves safe mode. */
+  let layoutFound: Uint8Array = new Uint8Array();
+  let layoutKept: Uint8Array | null = null;
+  const safeFrom = (refusal: LayoutRefusal): LayoutSafe => (refusal.code === 'GAUGE_PROTECTED' ? { code: 'GAUGE_PROTECTED', reason: refusal.reason } : { code: 'GAUGE_LAYOUT_INVALID', reason: refusal.reason });
+  /** Reads a saved file against the Gauges as they are now: the file, or the cause that makes the core start in safe mode. A value that is not text or bytes is not a file. It never throws. */
+  const readSaved = (found: unknown): { readonly file: LayoutFile } | { readonly safe: LayoutSafe } => {
+    try {
+      if (typeof found !== 'string' && !(found instanceof Uint8Array)) return { safe: { code: 'GAUGE_LAYOUT_INVALID', reason: 'syntax' } };
+      const read = parseLayoutFile(found, gaugeTable());
+      return read.ok ? { file: read.file } : { safe: safeFrom(read) };
+    } catch {
+      return { safe: { code: 'GAUGE_LAYOUT_INVALID', reason: 'internal' } };
+    }
+  };
   {
     const found = options.layoutFile;
     if (found === undefined) {
       layoutSaved = newFile(defaultLayout(gaugeTable()));
       layoutDisk = serializeLayoutFile(layoutSaved);
     } else {
-      // The core keeps a copy of what it was given.
-      const copy = typeof found === 'string' ? found : Uint8Array.from(found);
-      layoutDisk = typeof copy === 'string' ? copy : new TextDecoder().decode(copy);
-      const read = parseLayoutFile(copy, gaugeTable());
-      if (read.ok) layoutSaved = read.file;
-      else layoutSafe = { code: read.code, reason: read.reason } as LayoutSafe;
+      // The core keeps a copy of what it was given, as the bytes of the file, so a backup is never a lossy decode.
+      const attempt = ((): { readonly file: LayoutFile } | { readonly safe: LayoutSafe } => {
+        try {
+          if (typeof found === 'string') {
+            layoutFound = new TextEncoder().encode(found);
+            layoutDisk = found;
+            return readSaved(found);
+          }
+          if (found instanceof Uint8Array) {
+            const copy = Uint8Array.from(found);
+            layoutFound = copy;
+            layoutDisk = new TextDecoder().decode(copy);
+            return readSaved(copy);
+          }
+          return readSaved(found);
+        } catch {
+          return { safe: { code: 'GAUGE_LAYOUT_INVALID', reason: 'internal' } };
+        }
+      })();
+      if ('file' in attempt) layoutSaved = attempt.file;
+      else layoutSafe = attempt.safe;
     }
   }
   const layoutInUse = (): Layout => layoutSaved?.current ?? defaultLayout(gaugeTable());
@@ -321,6 +355,27 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     return false;
   };
 
+  /**
+   * What a lifecycle step does to the layout, for its plan: the layout brought in line with the Gauges as they will be (`after` is the Gauge then, or `null` when it is removed), and the lines
+   * that say so. It is `undefined` when the layout does not change, and in safe mode, where the default layout follows the Gauges and nothing is saved.
+   */
+  function layoutEffect(id: string, after: GaugeInfo | null): { readonly steps: string[] } | undefined {
+    if (layoutSaved === null) return undefined;
+    const table = gaugeTable();
+    if (after === null) table.delete(id);
+    else table.set(id, after);
+    const steps = layoutChangeSteps(layoutSaved.current, reconcileLayout(layoutSaved.current, table), layoutSaved.revision, droppedRevision(layoutSaved));
+    return steps.length === 0 ? undefined : { steps };
+  }
+  /** Brings the saved layout in line with the Gauges after a lifecycle step, as a normal revision. When the counter is full the layout is replaced in place, since a step must never be refused for it. */
+  function reconcileSaved(): void {
+    if (layoutSaved === null) return;
+    const next = reconcileLayout(layoutSaved.current, gaugeTable());
+    if (canonicalText(next) === canonicalText(layoutSaved.current)) return;
+    layoutSaved = saveRevision(layoutSaved, next) ?? Object.freeze({ revision: layoutSaved.revision, current: next, revisions: layoutSaved.revisions });
+    layoutDisk = serializeLayoutFile(layoutSaved);
+  }
+
   function planInstallOrUpdate(action: 'install' | 'update', folderName: unknown): Planned {
     if (typeof folderName !== 'string') return refuse('UNKNOWN_GAUGE');
     const unsafe = unsafeNameReason(folderName);
@@ -360,6 +415,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
       ok: true, kind: 'folder', summary, details, hashes, declared,
       plan: sealed({ ...content, action, from: current.summary.version, to: summary.version, steps: [
         `check the manifest of ${escapeForPlan(summary.id)}`, ...details, `replace ${escapeForPlan(summary.id)} ${escapeForPlan(current.summary.version)} with ${escapeForPlan(summary.version)} from folder ${escapeForPlan(folder.name)}`, `drop every grant of ${escapeForPlan(summary.id)}, so each permission is granted again`, `keep ${escapeForPlan(summary.id)} ${current.enabled ? 'enabled' : 'disabled'}`,
+        ...(layoutEffect(summary.id, { enabled: current.enabled, protected: summary.protected, tile: declared.tile })?.steps ?? []),
       ] }),
     };
   }
@@ -371,9 +427,9 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     const { summary } = current, state = current.enabled ? 'enabled' : 'disabled';
     const id0 = escapeForPlan(summary.id), version = escapeForPlan(summary.version);
     const steps = {
-      enable: [...current.details, `enable ${id0} ${version} (now ${state})`, `add the route of ${id0}`],
-      disable: [...current.details, `disable ${id0} ${version} (now ${state})`, `clear the traces grants of ${id0}, and keep its other grants`, `remove the route of ${id0}`],
-      remove: [...current.details, `remove ${id0} ${version} (now ${state})`, `drop every grant of ${id0}`, `remove the route of ${id0}`, `delete the files of ${id0}`],
+      enable: [...current.details, `enable ${id0} ${version} (now ${state})`, `add the route of ${id0}`, ...(layoutEffect(summary.id, { enabled: true, protected: summary.protected, tile: current.tile })?.steps ?? [])],
+      disable: [...current.details, `disable ${id0} ${version} (now ${state})`, `clear the traces grants of ${id0}, and keep its other grants`, `remove the route of ${id0}`, ...(layoutEffect(summary.id, { enabled: false, protected: summary.protected, tile: current.tile })?.steps ?? [])],
+      remove: [...current.details, `remove ${id0} ${version} (now ${state})`, `drop every grant of ${id0}`, `remove the route of ${id0}`, `delete the files of ${id0}`, ...(layoutEffect(summary.id, null)?.steps ?? [])],
     }[action];
     return {
       ok: true, kind: 'installed',
@@ -475,6 +531,8 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
         result = { action, id, version: current.summary.version, enabled: current.enabled };
       }
     }
+    // The layout follows the Gauges inside the same approved plan, as a normal revision.
+    reconcileSaved();
     retire(plan.nonce, token);
     // The grants are gone. Their records come after, on a best effort, so a failure of the audit file never undoes the step.
     if (cleared) recordRevoked(cleared.via, id, cleared.version, cleared.held);
@@ -629,9 +687,13 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   const isLayoutKind = (value: unknown): value is LayoutKind => typeof value === 'string' && (LAYOUT_KINDS as readonly string[]).includes(value);
   const layoutRefusal = (reason: Parameters<typeof layoutInvalid>[0]): Refusal => layoutInvalid(reason);
 
-  /** Plans a change to the layout. Nothing changes. Every check runs here, so the plan the person sees is one that can be applied. */
+  /**
+   * Plans a change to the layout. Nothing changes. Every check of the change runs here, so the plan the person sees is one that can be applied, with one exception: a counter that is full
+   * (`bad_revision`) is found when the plan is applied. A start that broke inside the reader (`internal`) refuses every plan, so nothing overwrites a file that the core could not read.
+   */
   function planLayout(params: Readonly<Record<string, unknown>>): LayoutPlanned {
     const kind = params['kind'];
+    if (layoutSafe?.reason === 'internal') return layoutRefusal('internal');
     if (!isLayoutKind(kind)) return layoutRefusal('invalid_request');
     const table = gaugeTable();
     const base = layoutInUse();
@@ -687,7 +749,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     const baseHash = sha256(canonicalText(base)), nextHash = sha256(canonicalText(next));
     const place = (kind === 'swap' || kind === 'default') && typeof placeParam === 'string' ? placeParam : null;
     const gauge = (kind === 'swap' || kind === 'propose') && typeof gaugeParam === 'string' ? gaugeParam : null;
-    const steps = layoutSteps({ kind, place, gauge, revision, base, next, baseHash, nextHash, baseRevision: layoutNumber(), safe: layoutSafe !== null });
+    const steps = layoutSteps({ kind, place, gauge, revision, base, next, baseHash, nextHash, baseRevision: layoutNumber(), safe: layoutSafe !== null, dropped: layoutSaved === null ? null : droppedRevision(layoutSaved) });
     const content: LayoutContent = { kind, place, gauge, revision, text, steps, baseHash, nextHash };
     return { ok: true, ...content, digest: layoutDigest(content), next, owner };
   }
@@ -695,10 +757,13 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   /** Reads the layout plan a caller sends back. Anything that is not a whole plan reads as `undefined`. The digest is computed here, and the one the caller sent is ignored. */
   function readLayoutPlan(value: unknown): (LayoutContent & { readonly digest: string; readonly nonce: string }) | undefined {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
-    const { action, kind, place, gauge, revision, text, steps, baseHash, nextHash, nonce } = value as Record<string, unknown>;
+    // Own properties only: a field that the object inherits reads as missing.
+    const field = (key: string): unknown => (Object.hasOwn(value, key) ? (value as Record<string, unknown>)[key] : undefined);
+    const action = field('action'), kind = field('kind'), place = field('place'), gauge = field('gauge'), revision = field('revision'), text = field('text');
+    const steps = field('steps'), baseHash = field('baseHash'), nextHash = field('nextHash'), nonce = field('nonce');
     if (action !== 'layout' || !isLayoutKind(kind) || typeof nonce !== 'string' || typeof baseHash !== 'string' || typeof nextHash !== 'string') return undefined;
     const nullable = (field: unknown): field is string | null => field === null || typeof field === 'string';
-    if (!nullable(place) || !nullable(gauge) || !nullable(text) || !(revision === null || typeof revision === 'number') || !isDenseTexts(steps)) return undefined;
+    if (!nullable(place) || !nullable(gauge) || !nullable(text) || !(revision === null || (typeof revision === 'number' && Number.isSafeInteger(revision))) || !isDenseTexts(steps)) return undefined;
     const content: LayoutContent = { kind, place, gauge, revision, text, steps: [...steps], baseHash, nextHash };
     return { ...content, digest: layoutDigest(content), nonce };
   }
@@ -718,6 +783,8 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     const saved = layoutSaved === null ? newFile(fresh.next) : saveRevision(layoutSaved, fresh.next);
     if (!saved) return reply(layoutRefusal('bad_revision'));
     const changed = layoutSaved === null || saved !== layoutSaved;
+    // The saved file is replaced, so when it was never read as a layout its bytes are kept as a backup. Revisions are not salvaged from it.
+    if (layoutSafe !== null) layoutKept = Uint8Array.from(layoutFound);
     layoutSaved = saved;
     layoutSafe = null;
     layoutDisk = serializeLayoutFile(saved);
@@ -739,6 +806,11 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     },
     auditFile: () => auditLines.join(''),
     layoutFile: () => layoutDisk,
+    layoutBackup: () => (layoutKept === null ? null : Uint8Array.from(layoutKept)),
+    layoutStartCheck() {
+      const read = readSaved(layoutDisk);
+      return 'safe' in read ? read.safe : null;
+    },
     async call(method, params): Promise<CoreReply> {
       switch (method) {
         case 'bowerloom.gauges.list':

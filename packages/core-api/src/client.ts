@@ -1,6 +1,6 @@
 import { isGaugeCode, type GaugeCode } from '../../gauge-errors/src/index.js';
 import { isAuditReason, isGrantReason, isManifestReason, isPermission, isTracesPermission, type PermissionName } from '../../gauge-manifest/src/index.js';
-import { MAX_LAYOUT_BYTES, MAX_REVISIONS, canonicalText, isLayoutReason, isProtectedReason, layoutOf, parseLayoutText, type Layout } from '../../gauge-layout/src/index.js';
+import { MAX_LAYOUT_BYTES, MAX_REVISIONS, canonicalText, isLayoutReason, isProtectedReason, layoutOf, parseLayoutText, sha256Hex, type Layout } from '../../gauge-layout/src/index.js';
 import {
   LAYOUT_KINDS, PLAN_ACTIONS,
   type AuditEntry, type AuditRead, type Core, type CoreMethod, type CoreResult, type GaugeApplied, type GaugePlan, type GaugeSummary, type GrantApplied, type GrantEntry, type GrantPlan, type GrantRevoked,
@@ -325,6 +325,14 @@ export function createCoreClient(core: Core): CoreClient {
       if (plan.place !== (request.place ?? null) || plan.gauge !== (request.gauge ?? null) || plan.revision !== (request.revision ?? null) || plan.text !== (request.text ?? null)) {
         throw new CoreProtocolError(method, 'result is a plan for another target');
       }
+      // The last line is the one that binds the change to the two hashes, so the person reads the hashes that the plan holds.
+      if (plan.steps[plan.steps.length - 1] !== `bind the change to layout ${plan.baseHash} and result ${plan.nextHash}`) throw new CoreProtocolError(method, 'result plan does not end with the line that binds it to its hashes');
+      if (request.kind === 'set') {
+        // The result of a layout that is set is known from the text alone, so the hash can be checked here.
+        const parsed = parseLayoutText(request.text ?? '');
+        if (!parsed.ok) throw new CoreProtocolError(method, `result is a plan for a text that is not a layout: ${parsed.reason}`);
+        if (plan.nextHash !== sha256Hex(canonicalText(parsed.layout))) throw new CoreProtocolError(method, 'result plan holds a hash that is not the hash of the text that was sent');
+      }
       return plan;
     });
   return {
@@ -351,7 +359,7 @@ export function createCoreClient(core: Core): CoreClient {
       return Object.freeze(entries);
     }),
     exportLayout: () => ask('bowerloom.layout.export', {}, (method, result) => {
-      if (typeof result !== 'string' || Buffer.byteLength(result) > MAX_LAYOUT_BYTES) throw new CoreProtocolError(method, 'result is not a layout text');
+      if (typeof result !== 'string' || result.length > MAX_LAYOUT_BYTES || new TextEncoder().encode(result).byteLength > MAX_LAYOUT_BYTES) throw new CoreProtocolError(method, 'result is not a layout text');
       const parsed = parseLayoutText(result);
       if (!parsed.ok) throw new CoreProtocolError(method, `result is not a layout text: ${parsed.reason}`);
       if (canonicalText(parsed.layout) !== result) throw new CoreProtocolError(method, 'result is not in the canonical form');

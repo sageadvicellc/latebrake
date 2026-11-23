@@ -16,6 +16,8 @@ export interface LayoutHarness {
   approve(plan: { readonly nonce: string }): string | Promise<string>;
   /** Moves the clock of the core forward, in milliseconds. */
   advance(milliseconds: number): void | Promise<void>;
+  /** The raw bytes of the saved layout file that the core set aside when a change left safe mode, or `null` when it set none aside. */
+  layoutBackup(): Uint8Array | null | Promise<Uint8Array | null>;
 }
 export interface LayoutHarnessOptions {
   /** The text of the saved layout file that the core finds when it starts. None means a first start. */
@@ -36,6 +38,10 @@ export const LAYOUT_FOLDERS: readonly GaugeFolder[] = [
   { name: 'fixed-folder', location: 'user', manifest: manifestOf({ id: 'fixture-fixed', title: 'Fixture Fixed', permissions: ['layout.propose'], tile: { expandable: false, resizable: false, entry: 'ui/tile.js' } }), files: { 'ui/tile.js': FILE } },
   // A Gauge that is a page only.
   { name: 'page-folder', location: 'user', manifest: manifestOf({ id: 'fixture-pager', title: 'Fixture Pager', permissions: ['layout.propose'], tile: undefined, page: { entry: 'ui/page.js' } }), files: { 'ui/page.js': FILE } },
+  // The same Gauge, one version later, whose tile can no longer be resized.
+  { name: 'quiet-fixed-update', location: 'user', manifest: manifestOf({ id: 'fixture-quiet', title: 'Fixture Quiet', version: '1.1.0', tile: { expandable: false, resizable: false, entry: 'ui/tile.js' } }), files: { 'ui/tile.js': FILE } },
+  // A stock Gauge that is protected.
+  { name: 'guard-folder', location: 'bundled', manifest: manifestOf({ id: 'fixture-guard', title: 'Fixture Guard', protected: true, tile: { expandable: false, resizable: false, entry: 'ui/tile.js' } }), files: { 'ui/tile.js': FILE } },
   // A Gauge that tries to take the id of the Settings page.
   { name: 'settings-folder', location: 'user', manifest: manifestOf({ id: 'settings', title: 'Fixture Settings', tile: { expandable: false, resizable: true, entry: 'ui/tile.js' } }), files: { 'ui/tile.js': FILE } },
 ];
@@ -343,7 +349,7 @@ export function runLayoutSuite(name: string, makeHarness: (folders: readonly Gau
       ['models', 'fixture-clock', invalid('no_tile')],
       ['models', 'jobs', invalid('duplicate_gauge')],
       ['harnesses', 'library', protectedBy('replaced')],
-      ['models', 'gauge-manager', invalid('overlap')],
+      ['models', 'gauge-manager', invalid('no_room')],
     ];
     for (const [place, gauge, expected] of cases) {
       const before = await frozenState(s.client);
@@ -524,11 +530,13 @@ export function runLayoutSuite(name: string, makeHarness: (folders: readonly Gau
     assert.deepEqual(must(await client.listLayoutRevisions()), [{ revision: 2, layout: HOME_DOC }]);
   });
 
-  test(`${name}: a change from safe mode leaves safe mode: it saves the layout as revision 1 and drops the broken file`, async () => {
+  test(`${name}: a change from safe mode leaves safe mode: it saves the layout as revision 1, and keeps the saved file as a backup, byte for byte`, async () => {
     const s = await start({ layoutFile: 'not json at all' });
     assert.equal((await read(s.client)).safe?.reason, 'syntax');
+    assert.equal(await s.harness.layoutBackup(), null);
     const plan = must(await s.client.planLayoutSwap('models', 'tracing'));
-    assert.ok(plan.steps.includes('leave safe mode and save the layout as revision 1'));
+    assert.ok(plan.steps.includes('leave safe mode, keep the saved file as a backup, and save the layout as revision 1'));
+    assert.equal(await s.harness.layoutBackup(), null);
     const applied = must(await s.client.applyLayout(plan, await s.harness.approve(plan)));
     assert.deepEqual(applied, { kind: 'swap', revision: 1, changed: true });
     const state = await read(s.client);
@@ -536,6 +544,18 @@ export function runLayoutSuite(name: string, makeHarness: (folders: readonly Gau
     assert.equal(state.revision, 1);
     assert.equal(placeOf(state, 'models'), 'tracing');
     assert.deepEqual(must(await s.client.listLayoutRevisions()), []);
+    assert.deepEqual(await s.harness.layoutBackup(), Uint8Array.from(Buffer.from('not json at all', 'utf8')));
+  });
+
+  test(`${name}: the backup holds a broken file with its valid revisions as they were, and a normal start sets nothing aside`, async () => {
+    const broken = JSON.stringify({ format: 'bowerloom/layout-file/1', revision: 3, current: { ...HOME_DOC, shelf: [...HOME_DOC.shelf, 'no-such-gauge'] }, revisions: [{ revision: 2, layout: HOME_DOC }] });
+    const s = await start({ layoutFile: broken });
+    assert.equal((await read(s.client)).safe?.reason, 'unknown_gauge');
+    await change(s, s.client.planLayoutSwap('models', 'tracing'));
+    assert.deepEqual(await s.harness.layoutBackup(), Uint8Array.from(Buffer.from(broken, 'utf8')));
+    const normal = await start();
+    await change(normal, normal.client.planLayoutSwap('models', 'tracing'));
+    assert.equal(await normal.harness.layoutBackup(), null);
   });
 
   test(`${name}: the default layout of safe mode can be saved as it is, which leaves safe mode`, async () => {
@@ -625,6 +645,199 @@ export function runLayoutSuite(name: string, makeHarness: (folders: readonly Gau
       await assert.rejects(s.core.call(method as never, { text: homeText(), place: 'models', gauge: 'tracing' }), /unknown core method/, method);
     }
     assert.deepEqual(await frozenState(s.client), before);
+  });
+
+  // The default Gauge, when it fills another place
+
+  test(`${name}: the default Gauge is one action away even when it fills another place: the two places exchange their Gauges`, async () => {
+    const s = await start();
+    await change(s, s.client.planLayoutSwap('models', 'projects'));
+    await change(s, s.client.planLayoutSwap('memory', 'local-models'));
+    const plan = must(await s.client.planLayoutDefault('models'));
+    assert.equal(plan.steps[0], 'put the default Gauge local-models back in place models');
+    must(await s.client.applyLayout(plan, await s.harness.approve(plan)));
+    const state = await read(s.client);
+    assert.equal(placeOf(state, 'models'), 'local-models');
+    assert.equal(placeOf(state, 'memory'), 'projects');
+    const again = must(await s.client.planLayoutDefault('memory'));
+    must(await s.client.applyLayout(again, await s.harness.approve(again)));
+    const last = await read(s.client);
+    assert.equal(placeOf(last, 'memory'), 'memory-explorer');
+    assert.equal(placeOf(last, 'models'), 'local-models');
+  });
+
+  // Sizes in a swap
+
+  test(`${name}: a swap takes the first size that the new Gauge allows when the size of the place is not one, and says so when no size fits`, async () => {
+    const s = await start();
+    await bring(s, 'proposer-folder', 'fixture-proposer');
+    await change(s, s.client.planLayoutSwap('jobs', 'fixture-proposer'));
+    assert.equal((await read(s.client)).layout.tiles.find(tile => tile.place === 'jobs')?.size, 'medium');
+    assert.deepEqual(outcome(await s.client.planLayoutSwap('models', 'gauge-manager')), invalid('no_room'));
+  });
+
+  // The file cannot vouch for itself
+
+  test(`${name}: a place of the default home keeps its protected Gauge even when the text edits both the Gauge and the default of the place`, async () => {
+    const { client } = await start();
+    const edited = homeText(home => ({
+      ...home, tiles: home.tiles.map(tile => (tile.place === 'harnesses' ? { ...tile, gauge: 'projects', default: 'projects' } : tile)),
+      shelf: [...home.shelf.filter(id => id !== 'projects'), 'harnesses'].sort(),
+    }));
+    assert.deepEqual(outcome(await client.planLayoutSet(edited)), protectedBy('replaced'));
+  });
+
+  // The plan says what it drops and what it shows again
+
+  test(`${name}: a plan names the revision that it will drop when the history is full, and says nothing before`, async () => {
+    const s = await start();
+    const swaps = ['tracing', 'library'];
+    for (let step = 0; step < 9; step += 1) await change(s, s.client.planLayoutSwap('models', swaps[step % 2] ?? 'tracing'));
+    assert.equal(must(await s.client.planLayoutSwap('models', 'projects')).steps.some(line => line.startsWith('drop revision')), false);
+    await change(s, s.client.planLayoutSwap('models', 'projects'));
+    const full = must(await s.client.planLayoutSwap('models', 'tracing'));
+    assert.ok(full.steps.includes('drop revision 1, the oldest, because the file keeps at most 10 earlier revisions'));
+    assert.equal(full.steps.at(-2), 'drop revision 1, the oldest, because the file keeps at most 10 earlier revisions');
+    await s.client.applyLayout(full, await s.harness.approve(full));
+    assert.deepEqual(must(await s.client.listLayoutRevisions()).map(entry => entry.revision), [11, 10, 9, 8, 7, 6, 5, 4, 3, 2]);
+    const noChange = must(await s.client.planLayoutSet(must(await s.client.exportLayout())));
+    assert.equal(noChange.steps.some(line => line.startsWith('drop revision')), false);
+  });
+
+  test(`${name}: a plan says when a Gauge that was hidden will show again`, async () => {
+    const s = await start();
+    await bring(s, 'proposer-folder', 'fixture-proposer');
+    await grantPropose(s, 'fixture-proposer');
+    const hiding = homeText(home => ({ ...home, shelf: home.shelf.filter(id => id !== 'library'), hidden: ['fixture-proposer', 'library'].sort() }));
+    await change(s, s.client.planLayoutSet(hiding));
+    assert.ok(must(await s.client.planLayoutPropose('fixture-proposer')).steps.includes('fixture-proposer was hidden and will show again'));
+    assert.ok(must(await s.client.planLayoutSwap('models', 'library')).steps.includes('library was hidden and will show again'));
+    assert.equal(must(await s.client.planLayoutSwap('models', 'tracing')).steps.some(line => line.endsWith('will show again')), false);
+  });
+
+  // A lifecycle step keeps the layout in line with the Gauges, in the same approved plan
+
+  /** Every change that a person can make works, and an export imports again. */
+  const everyChangeWorks = async (s: Session) => {
+    const state = await read(s.client);
+    const free = ['projects', 'library', 'tracing'].find(id => state.layout.shelf.includes(id));
+    assert.ok(free, 'a free Gauge on the shelf');
+    const exported = must(await s.client.exportLayout());
+    const imported = await change(s, s.client.planLayoutSet(exported));
+    assert.equal(imported.applied.changed, false);
+    await change(s, s.client.planLayoutSwap('models', free));
+    await change(s, s.client.planLayoutDefault('models'));
+    await change(s, s.client.planLayoutPropose('fixture-proposer'));
+    assert.deepEqual(must(await s.client.exportLayout()).endsWith('\n'), true);
+    await change(s, s.client.planLayoutSet(must(await s.client.exportLayout())));
+  };
+  const ready = async () => {
+    const s = await start();
+    await bring(s, 'proposer-folder', 'fixture-proposer');
+    await grantPropose(s, 'fixture-proposer');
+    return s;
+  };
+  const layoutLines = (plan: { steps: readonly string[] }) => plan.steps.filter(line => line.startsWith('layout: '));
+
+  test(`${name}: disabling a Gauge on a tile drops the tile in the same approved plan, and every change still works`, async () => {
+    const s = await ready();
+    const before = await read(s.client);
+    const plan = must(await s.client.planDisable('jobs'));
+    assert.ok(plan.steps.includes('layout: drop tile jobs (jobs)'));
+    assert.ok(plan.steps.includes(`layout: keep the layout now in use as revision ${before.revision}, and keep at most 10 earlier revisions`));
+    await lifecycle(s, Promise.resolve({ ok: true as const, value: plan }));
+    const after = await read(s.client);
+    assert.equal(after.revision, before.revision + 1);
+    assert.equal(after.layout.tiles.some(tile => tile.gauge === 'jobs'), false);
+    assert.deepEqual(must(await s.client.listLayoutRevisions())[0]?.layout, before.layout);
+    await everyChangeWorks(s);
+  });
+
+  test(`${name}: disabling a Gauge on the shelf drops its shelf entry, and every change still works`, async () => {
+    const s = await ready();
+    const plan = must(await s.client.planDisable('tracing'));
+    assert.deepEqual(layoutLines(plan).slice(0, 1), ['layout: remove tracing from the shelf']);
+    await lifecycle(s, Promise.resolve({ ok: true as const, value: plan }));
+    assert.equal((await read(s.client)).layout.shelf.includes('tracing'), false);
+    await everyChangeWorks(s);
+  });
+
+  test(`${name}: removing a Gauge on a tile or on the shelf reconciles the layout the same way`, async () => {
+    const s = await ready();
+    const removeJobs = must(await s.client.planRemove('jobs'));
+    assert.ok(removeJobs.steps.includes('layout: drop tile jobs (jobs)'));
+    await lifecycle(s, Promise.resolve({ ok: true as const, value: removeJobs }));
+    const removeTracing = must(await s.client.planRemove('tracing'));
+    assert.deepEqual(layoutLines(removeTracing).slice(0, 1), ['layout: remove tracing from the shelf']);
+    await lifecycle(s, Promise.resolve({ ok: true as const, value: removeTracing }));
+    const state = await read(s.client);
+    assert.equal(state.layout.tiles.some(tile => tile.gauge === 'jobs'), false);
+    assert.equal(state.layout.shelf.includes('tracing'), false);
+    await everyChangeWorks(s);
+  });
+
+  test(`${name}: a tile whose Gauge is disabled goes back to the default Gauge of its place when that Gauge is free`, async () => {
+    const s = await ready();
+    await bring(s, 'quiet-folder', 'fixture-quiet');
+    await change(s, s.client.planLayoutSwap('models', 'fixture-quiet'));
+    const plan = must(await s.client.planDisable('fixture-quiet'));
+    assert.ok(plan.steps.includes('layout: tile models holds local-models small instead of fixture-quiet'));
+    await lifecycle(s, Promise.resolve({ ok: true as const, value: plan }));
+    const state = await read(s.client);
+    assert.deepEqual(state.layout.tiles.find(tile => tile.place === 'models'), { place: 'models', gauge: 'local-models', default: 'local-models', col: 4, row: 1, size: 'small' });
+    assert.equal(state.layout.shelf.includes('local-models'), false);
+    await everyChangeWorks(s);
+  });
+
+  test(`${name}: an update that no longer allows the size of a tile shrinks the tile in the same approved plan, and every change still works`, async () => {
+    const s = await ready();
+    await bring(s, 'quiet-folder', 'fixture-quiet');
+    const placing = homeText(tiles({ place: 'wide', gauge: 'fixture-quiet', default: 'fixture-quiet', col: 0, row: 2, size: 'large' }));
+    await change(s, s.client.planLayoutSet(placing));
+    const plan = must(await s.client.planUpdate('quiet-fixed-update'));
+    assert.ok(plan.steps.includes('layout: tile wide changes from large to small'));
+    await lifecycle(s, Promise.resolve({ ok: true as const, value: plan }));
+    assert.deepEqual((await read(s.client)).layout.tiles.find(tile => tile.place === 'wide'), { place: 'wide', gauge: 'fixture-quiet', default: 'fixture-quiet', col: 0, row: 2, size: 'small' });
+    await everyChangeWorks(s);
+  });
+
+  test(`${name}: enabling a protected stock Gauge puts it on the shelf in the same approved plan, and every change still works`, async () => {
+    const s = await ready();
+    await lifecycle(s, s.client.planInstall('guard-folder'));
+    assert.equal((await read(s.client)).layout.shelf.includes('fixture-guard'), false);
+    const plan = must(await s.client.planEnable('fixture-guard'));
+    assert.ok(plan.steps.includes('layout: add fixture-guard to the shelf'));
+    await lifecycle(s, Promise.resolve({ ok: true as const, value: plan }));
+    assert.equal((await read(s.client)).layout.shelf.includes('fixture-guard'), true);
+    await everyChangeWorks(s);
+  });
+
+  test(`${name}: a lifecycle step that does not touch the layout says nothing about it and saves no revision`, async () => {
+    const s = await ready();
+    await bring(s, 'quiet-folder', 'fixture-quiet', false);
+    const before = await read(s.client);
+    const plan = must(await s.client.planEnable('fixture-quiet'));
+    assert.deepEqual(layoutLines(plan), []);
+    await lifecycle(s, Promise.resolve({ ok: true as const, value: plan }));
+    assert.deepEqual(await read(s.client), before);
+  });
+
+  test(`${name}: a lifecycle plan that changes the layout is bound to the change: a changed layout line is GAUGE_PLAN_CHANGED`, async () => {
+    const s = await ready();
+    const plan = must(await s.client.planDisable('jobs'));
+    const approval = await s.harness.approve(plan);
+    assert.deepEqual(outcome(await s.client.applyPlan({ ...plan, steps: plan.steps.filter(line => !line.startsWith('layout: drop tile')) }, approval)), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+    assert.equal((await read(s.client)).layout.tiles.some(tile => tile.gauge === 'jobs'), true);
+    assert.equal((await s.client.applyPlan(plan, approval)).ok, true);
+  });
+
+  test(`${name}: a lifecycle plan names the revision that it will drop when the history is full`, async () => {
+    const s = await ready();
+    const swaps = ['tracing', 'library'];
+    for (let step = 0; step < 10; step += 1) await change(s, s.client.planLayoutSwap('models', swaps[step % 2] ?? 'tracing'));
+    // After 10 changes revision 11 is in use and the file holds 10 earlier revisions, so the step saves a revision and drops the oldest, revision 1.
+    const plan = must(await s.client.planDisable('jobs'));
+    assert.ok(plan.steps.includes('layout: drop revision 1, the oldest, because the file keeps at most 10 earlier revisions'));
   });
 
   // Reads
