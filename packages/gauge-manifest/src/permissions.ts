@@ -49,9 +49,9 @@ const DEFINITIONS: Readonly<Record<PermissionName, Definition>> = {
   'sessions.attach': define('act', 'engine', `Ask for a plan to attach to a running session on an engine the Gauge lists.${NEVER_SKIPS}`),
   'sessions.send': define('act', 'engine', `Ask for a plan to send text to a session on an engine the Gauge lists.${NEVER_SKIPS}`),
   'layout.propose': define('write', 'none', `Ask for a plan to add the Gauge to the layout.${NEVER_SKIPS}`),
-  'jobs.read': define('read', 'none', 'Read the saved jobs and their runs.'),
-  'jobs.write': define('write', 'none', `Ask for a plan to create or change a job.${NEVER_SKIPS}`),
-  'jobs.run': define('act', 'none', `Ask for a plan to run a job.${NEVER_SKIPS}`),
+  'jobs.read': define('read', 'none', 'Read every saved job, with the folder and the task text of each session, and the runs of the jobs.'),
+  'jobs.write': define('write', 'none', `Ask for a plan to create, change, or delete a job, and see the title of that job in the plan.${NEVER_SKIPS}`),
+  'jobs.run': define('act', 'none', `Ask for a plan to run a job, which also needs the start-session grant for the engine of each session.${NEVER_SKIPS}`),
   'traces.facts': define('read', 'engine', 'Read the recorded facts of traces from the engines the Gauge lists. Denied until the person grants it.', true),
   'traces.text': define('read', 'engine', 'Read the prompt and reply text of traces, together with traces.facts. Denied until the person grants it.', true),
 };
