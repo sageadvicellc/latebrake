@@ -13,7 +13,7 @@ export { createLog, redactText } from './log.js';
 export type { RelayLog } from './log.js';
 export {
   ADAPTER_FIDELITIES, DEFAULT_ABANDON_MS, DEFAULT_DECLINE_CAP, DEFAULT_DELIVER_TIMEOUT_MS, DEFAULT_KEEP_KEYS, DEFAULT_KEEP_SETTLED, DEFAULT_LOOP_CAP, DEFAULT_MESSAGE_CAP, DEFAULT_RUN_CAP, FAILURE_REASONS, FIDELITIES,
-  KEEP_DECLINED_BODIES, MAX_BODY_BYTES, MAX_KEEP_KEYS, MAX_KEEP_SETTLED, MAX_KEY_LENGTH, MAX_LOOP_CAP, MAX_MESSAGE_CAP, MAX_ROUTES, MAX_WAITING_PER_ROUTE, MESSAGE_INVALID_REASONS, MESSAGE_STATES, QUEUE_REASONS,
-  ROUTE_REASONS, ROUTE_RULES, SECRET_REASONS, STOP_CAUSES, isAdapterFidelity, isFailureReason, isFidelity, isMessageInvalidReason, isMessageState, isRouteReason, isRouteRule,
+  DECLINED_SLACK, MAX_BODY_BYTES, MAX_KEEP_KEYS, MAX_KEEP_SETTLED, MAX_KEY_LENGTH, MAX_LOOP_CAP, MAX_MESSAGE_CAP, MAX_ROUTES, MAX_WAITING_PER_ROUTE, MESSAGE_INVALID_REASONS, MESSAGE_STATES, QUEUE_REASONS,
+  ROUTE_REASONS, ROUTE_RULES, SECRET_REASONS, STOP_CAUSES, WAITING_CAUSES, isAdapterFidelity, isFailureReason, isFidelity, isMessageInvalidReason, isMessageState, isRouteReason, isRouteRule,
 } from './vocab.js';
-export type { AdapterFidelity, FailureReason, Fidelity, MessageInvalidReason, MessageState, QueueReason, RouteReason, RouteRule, SecretReason, StopCause } from './vocab.js';
+export type { AdapterFidelity, FailureReason, Fidelity, MessageInvalidReason, MessageState, QueueReason, RouteReason, RouteRule, SecretReason, StopCause, WaitingCause } from './vocab.js';

@@ -34,7 +34,7 @@ test('a decline of a message that waits for the person does not take a place fro
   assert.equal(relay.control.routes()[0]?.exchanged, 1);
 });
 
-test('a receipt that arrives while the engine takes a message frees the engine, and the next message goes at once', async () => {
+test('a receipt that arrives while the engine takes a message does not free the engine: the next message goes when the adapter settles', async () => {
   const { relay, engines, send, confirm } = build({ routes: auto });
   if (engines['sess-b']) engines['sess-b'].mode = 'hang';
   send('sess-a', 'route-1', 'k1', 'first');
@@ -42,6 +42,9 @@ test('a receipt that arrives while the engine takes a message frees the engine, 
   await tick();
   assert.equal(engines['sess-b']?.inputs.length, 1);
   confirm('sess-b', 'msg-1', engines['sess-b']?.lastReceipt()?.receipt ?? '');
+  assert.equal(engines['sess-b']?.inputs.length, 1);
+  engines['sess-b']?.releaseFirst();
+  await tick();
   assert.equal(engines['sess-b']?.inputs.length, 2);
   assert.equal(relay.control.message('msg-2')?.state, 'sending');
 });
@@ -294,7 +297,7 @@ test('while an engine takes a message it counts as waiting, and a route that is 
 });
 
 test('the history keeps 256 settled messages by default, and a relay takes 8 sessions and 32 routes', async () => {
-  const { relay, send } = build({ routes: auto });
+  const { relay, send } = build({ routes: auto, options: { runCap: 10_000 } });
   for (let i = 0; i < 270; i += 1) {
     send('sess-a', 'route-1', `k${i}`, `body ${i}`);
     await tick();

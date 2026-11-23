@@ -57,7 +57,7 @@ test('a person resumes a route that a cap stopped, and the count starts again fr
   send('sess-a', 'route-1', 'k1', 'one');
   send('sess-a', 'route-1', 'k2', 'two');
   assert.equal(send('sess-a', 'route-1', 'k3', 'three').ok, false);
-  assert.deepEqual(relay.control.resume('route-1'), { ok: true });
+  assert.deepEqual(relay.control.resume('route-1'), { ok: true, reopened: ['route-1'] });
   assert.equal(relay.control.routes()[0]?.state, 'open');
   assert.equal(relay.control.routes()[0]?.stoppedBy, null);
   assert.equal(relay.control.routes()[0]?.stoppedAt, null);
@@ -70,7 +70,7 @@ test('a person resumes a route that a cap stopped, and the count starts again fr
 test('a resume of a route that is open changes nothing, and a resume of an unknown route is refused', () => {
   const { relay, send } = build({ routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 5, 4)] });
   send('sess-a', 'route-1', 'k1', 'one');
-  assert.deepEqual(relay.control.resume('route-1'), { ok: true });
+  assert.deepEqual(relay.control.resume('route-1'), { ok: true, reopened: [] });
   assert.equal(relay.control.routes()[0]?.accepted, 1);
   for (const id of ['route-9', '', 5, null, {}, '__proto__']) assert.deepEqual(relay.control.resume(id), { ok: false, code: 'GAUGE_ROUTE_UNKNOWN' });
 });
@@ -171,7 +171,7 @@ test('a person resumes a loop: both routes open, the counts start again, and the
   send('sess-a', 'route-1', 'k1', 'ping');
   send('sess-b', 'route-2', 'k2', 'pong');
   assert.equal(send('sess-a', 'route-1', 'k3', 'ping').ok, false);
-  assert.deepEqual(relay.control.resume('route-2'), { ok: true });
+  assert.deepEqual(relay.control.resume('route-2'), { ok: true, reopened: ['route-1', 'route-2'] });
   assert.deepEqual(relay.control.routes().map(view => view.state), ['open', 'open']);
   assert.equal(relay.control.routes()[0]?.exchanged, 0);
   assert.equal(send('sess-a', 'route-1', 'k5', 'ping').ok, true);
@@ -244,7 +244,7 @@ test('a person resumes a ring: every route that the run cap stopped opens, the c
   const built = ring(5);
   await around(built, 5);
   assert.equal(built.send('sess-b', 'route-2', 'ring-5', 'lap 5').ok, false);
-  assert.deepEqual(built.relay.control.resume('route-3'), { ok: true });
+  assert.deepEqual(built.relay.control.resume('route-3'), { ok: true, reopened: ['route-1', 'route-2', 'route-3'] });
   assert.deepEqual(built.relay.control.routes().map(view => view.state), ['open', 'open', 'open']);
   assert.deepEqual(await around(built, 5, 6), [true, true, true, true, true]);
   assert.equal(built.send('sess-a', 'route-1', 'ring-99', 'again').ok, false);
@@ -257,7 +257,7 @@ test('the run cap is 200 by default, and a ring of 200 messages is stopped at th
   assert.equal(results[200], false);
 });
 
-test('the run cap counts the messages of auto routes only: an approval of the person is an act that starts the count again', async () => {
+test('the run cap counts the messages of auto routes only, and an approval does not start its count again', () => {
   const built = build({
     sessions: ['sess-a', 'sess-b', 'sess-c'],
     routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 1000, 100), route('route-2', 'sess-b', 'sess-c', 'accepted-output', 1000, 100), route('route-3', 'sess-c', 'sess-a', 'auto', 1000, 100)],
@@ -266,14 +266,12 @@ test('the run cap counts the messages of auto routes only: an approval of the pe
   assert.equal(built.send('sess-a', 'route-1', 'k1', 'one').ok, true);
   assert.equal(built.send('sess-c', 'route-3', 'k2', 'two').ok, true);
   assert.equal(built.send('sess-b', 'route-2', 'k3', 'three').ok, true, 'a message that waits for the person is not counted');
-  assert.equal(built.relay.control.approve('msg-3').ok, true);
-  assert.equal(built.send('sess-a', 'route-1', 'k4', 'four').ok, true, 'the approval started the count again');
-  assert.equal(built.send('sess-c', 'route-3', 'k5', 'five').ok, true);
-  assert.deepEqual(built.send('sess-a', 'route-1', 'k6', 'six'), { ok: false, code: 'GAUGE_RELAY_LOOP_CAP' });
+  assert.equal(built.relay.control.approve('msg-3').ok, true, 'an approved message is not counted in the run either');
+  assert.deepEqual(built.send('sess-a', 'route-1', 'k4', 'four'), { ok: false, code: 'GAUGE_RELAY_LOOP_CAP' }, 'the approval did not give the run two more messages');
 });
 
-test('an approval that is refused because its route is already stopped does not start the counts again', () => {
-  const { relay, send } = build({ routes: [route('route-1', 'sess-a', 'sess-b', 'accepted-output', 1, 5), route('route-2', 'sess-b', 'sess-a', 'auto', 100, 2)] });
+test('an approval that is refused because its route is stopped starts no count again', () => {
+  const { relay, send } = build({ routes: [route('route-1', 'sess-a', 'sess-b', 'accepted-output', 1, 5), route('route-2', 'sess-b', 'sess-a', 'auto', 100, 3)] });
   send('sess-a', 'route-1', 'k1', 'one');
   send('sess-a', 'route-1', 'k2', 'two');
   send('sess-a', 'route-1', 'k3', 'three');

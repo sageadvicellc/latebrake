@@ -155,7 +155,7 @@ test('a message that is sent and waits for a receipt is dropped after the ones t
 });
 
 test('a long run keeps the history, the keys, and the counts inside their bounds, and ends with no timer', async () => {
-  const { relay, send, engines, timers } = build({ routes: auto, options: { keepSettled: 8 } });
+  const { relay, send, engines, timers } = build({ routes: auto, options: { keepSettled: 8, runCap: 10_000 } });
   for (let i = 0; i < 300; i += 1) {
     if (engines['sess-b']) engines['sess-b'].mode = i % 4 === 0 ? 'reject' : 'accept';
     send('sess-a', 'route-1', `k${i}`, `body ${i}`);

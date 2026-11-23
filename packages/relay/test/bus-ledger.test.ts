@@ -128,29 +128,12 @@ test('3,200 declined proposals do not leave the route open: the route is paused 
   assert.equal(refused, 32);
 });
 
-test('the declined bodies of a run are bounded at 256, oldest first, and the first ones are asked again once they left', () => {
-  const names = ['sess-a', 'sess-b', 'sess-c', 'sess-d'];
-  const routes = [route('route-1', 'sess-a', 'sess-b'), route('route-2', 'sess-a', 'sess-c'), route('route-3', 'sess-a', 'sess-d')];
-  const { relay, send } = build({ sessions: names, routes, options: { declineCap: 100, keepSettled: 4 } });
-  for (const [r, name] of routes.map((value, index) => [value.id, index] as const)) {
-    void name;
-    for (let i = 0; i < 100; i += 1) {
-      const reply = send('sess-a', r, `k-${r}-${i}`, `proposal ${r} ${i}`);
-      assert.ok(reply.ok);
-      relay.control.decline(reply.id);
-    }
-  }
-  assert.equal(relay.control.sizes().declined, 256);
-  // The first body of route-1 left the memory (300 were declined, 256 fit), and the last of route-3 is held.
-  assert.deepEqual(send('sess-a', 'route-3', 'again', 'proposal route-3 99'), { ok: false, code: 'GAUGE_MESSAGE_NOT_ACCEPTED', reason: 'declined' });
-});
-
 test('a resume clears the pause: the route opens, the count of declines starts at zero, and the other routes are not touched', () => {
   const { relay, send } = build({ options: { declineCap: 1 } });
   send('sess-a', 'route-1', 'k1', 'one');
   relay.control.decline('msg-1');
   assert.equal(relay.control.routes()[0]?.state, 'stopped');
-  assert.deepEqual(relay.control.resume('route-1'), { ok: true });
+  assert.deepEqual(relay.control.resume('route-1'), { ok: true, reopened: ['route-1'] });
   assert.deepEqual([relay.control.routes()[0]?.state, relay.control.routes()[0]?.stoppedBy, relay.control.routes()[0]?.stoppedAt, relay.control.routes()[0]?.declines], ['open', null, null, 0]);
 });
 
@@ -236,7 +219,7 @@ test('a port is read once: the relay never reads state or deliver of a port agai
 });
 
 test('the ledger keeps 4,096 keys by default', async () => {
-  const { relay, send } = build({ routes: auto });
+  const { relay, send } = build({ routes: auto, options: { runCap: 10_000 } });
   for (let i = 0; i < 4100; i += 1) {
     let reply = send('sess-a', 'route-1', `k${i}`, `body ${i}`);
     // A cap that the run reaches is the person's to lift, and the person does it here.
@@ -294,7 +277,7 @@ test('a message that was sent is dropped after the ones that ended: a delivered 
   assert.deepEqual(relay.control.messages().map(view => [view.id, view.state]), [['msg-1', 'sent'], ['msg-3', 'sent']]);
 });
 
-test('the waiting messages of a full route are told apart: for the person, for a receiver that does not run, for a receiver that is busy', async () => {
+test('the waiting messages of a full route are told apart to the writer as the person, or the receiver that is busy; the person sees also that the receiver does not run', async () => {
   const person = build();
   for (let i = 0; i < 16; i += 1) person.send('sess-a', 'route-1', `k${i}`, `m${i}`);
   assert.deepEqual(person.send('sess-a', 'route-1', 'x', 'x'), { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'pending_approval' });
@@ -302,12 +285,13 @@ test('the waiting messages of a full route are told apart: for the person, for a
 
   const waiting = build({ routes: auto, states: { 'sess-b': 'waiting' } });
   for (let i = 0; i < 16; i += 1) waiting.send('sess-a', 'route-1', `k${i}`, `m${i}`);
-  assert.deepEqual(waiting.send('sess-a', 'route-1', 'x', 'x'), { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'receiver_not_running' });
+  assert.deepEqual(waiting.send('sess-a', 'route-1', 'x', 'x'), { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'receiver_busy' });
   assert.equal(waiting.relay.control.routes()[0]?.waitingOn, 'receiver_not_running');
 
   const unreadable = build({ routes: auto, prepare: made => { const engine = made['sess-b']; if (engine) engine.state = () => { throw new Error('no state'); }; } });
   for (let i = 0; i < 16; i += 1) unreadable.send('sess-a', 'route-1', `k${i}`, `m${i}`);
-  assert.deepEqual(unreadable.send('sess-a', 'route-1', 'x', 'x'), { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'receiver_not_running' });
+  assert.deepEqual(unreadable.send('sess-a', 'route-1', 'x', 'x'), { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'receiver_busy' });
+  assert.equal(unreadable.relay.control.routes()[0]?.waitingOn, 'receiver_not_running');
 
   const busy = build({ routes: auto });
   if (busy.engines['sess-b']) busy.engines['sess-b'].mode = 'hang';

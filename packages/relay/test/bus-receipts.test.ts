@@ -205,14 +205,14 @@ test('an answer in time cancels the timer, and the message reads as sent', async
   assert.equal(timers.live(), 0);
 });
 
-test('a receipt that arrives while the engine is still taking the message proves delivery, the timer is cancelled, and the late answer does not take the proof back', async () => {
+test('a receipt that arrives while the engine is still taking the message proves delivery, the timer of the delivery is replaced by the wait for the adapter, and the late answer does not take the proof back', async () => {
   const { relay, engines, send, confirm, timers } = build({ routes: auto });
   if (engines['sess-b']) engines['sess-b'].mode = 'hang';
   send('sess-a', 'route-1', 'k1', 'first');
   await tick();
   const receipt = engines['sess-b']?.lastReceipt()?.receipt ?? '';
   assert.deepEqual(confirm('sess-b', 'msg-1', receipt), { ok: true, state: 'delivered' });
-  assert.equal(timers.live(), 0);
+  assert.deepEqual(timers.delays(), [30_000]);
   engines['sess-b']?.release();
   await tick();
   assert.equal(relay.control.message('msg-1')?.state, 'delivered');
@@ -273,7 +273,7 @@ test('the receiver is asked for its state at the time of the delivery: a state t
   await tick();
   assert.deepEqual(relay.control.messages().map(view => view.state), ['queued', 'queued']);
   const reads = lines.filter(line => line.includes('could not read the state of sess-b'));
-  assert.deepEqual(reads, ['relay run-1: could not read the state of sess-b: the state reader broke', 'relay run-1: could not read the state of sess-b: the state reader broke (2 times so far)', 'relay run-1: could not read the state of sess-b: the state reader broke (4 times so far)', 'relay run-1: could not read the state of sess-b: the state reader broke (8 times so far)']);
+  assert.deepEqual(reads, ['relay run-1: could not read the state of sess-b: the state reader broke', 'relay run-1: could not read the state of sess-b: the state reader broke (2 times so far)', 'relay run-1: could not read the state of sess-b: the state reader broke (4 times so far)']);
   void engines;
 });
 

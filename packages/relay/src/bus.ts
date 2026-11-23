@@ -5,13 +5,13 @@ import { MAX_START_GROUP } from '../../engine-sessions/src/vocab.js';
 import { isRunId } from '../../jobs/src/ids.js';
 import { isMessageId, isNonce, isReceipt, isRouteId, isSessionSecret, MAX_TOKEN_LENGTH, type MessageId, type Nonce, type Receipt, type RouteId, type SessionSecret } from './brand.js';
 import { checkBody, checkEnvelope, checkKey, fenceText, frameOf, type Envelope } from './envelope.js';
-import { createLog } from './log.js';
+import { createLog, redactText } from './log.js';
 import { hasExactly, plainRecord } from './read.js';
 import type { Route } from './routes.js';
 import {
-  DEFAULT_ABANDON_MS, DEFAULT_DECLINE_CAP, DEFAULT_DELIVER_TIMEOUT_MS, DEFAULT_KEEP_KEYS, DEFAULT_KEEP_SETTLED, DEFAULT_RUN_CAP, KEEP_DECLINED_BODIES, MAX_ABANDON_MS, MAX_DECLINE_CAP, MAX_DELIVER_TIMEOUT_MS,
+  DEFAULT_ABANDON_MS, DEFAULT_DECLINE_CAP, DEFAULT_DELIVER_TIMEOUT_MS, DEFAULT_KEEP_KEYS, DEFAULT_KEEP_SETTLED, DEFAULT_RUN_CAP, DECLINED_SLACK, MAX_ABANDON_MS, MAX_DECLINE_CAP, MAX_DELIVER_TIMEOUT_MS,
   MAX_KEEP_KEYS, MAX_KEEP_SETTLED, MAX_LOOP_CAP, MAX_MESSAGE_CAP, MAX_ROUTES, MAX_RUN_CAP, MAX_WAITING_PER_ROUTE, MIN_KEEP_KEYS, isAdapterFidelity, isEnded, isRouteRule,
-  type AdapterFidelity, type FailureReason, type Fidelity, type MessageInvalidReason, type MessageState, type QueueReason, type RouteRule, type SecretReason, type StopCause,
+  type AdapterFidelity, type FailureReason, type Fidelity, type MessageInvalidReason, type MessageState, type QueueReason, type RouteRule, type SecretReason, type StopCause, type WaitingCause,
 } from './vocab.js';
 
 /**
@@ -110,8 +110,8 @@ export interface RouteView {
   readonly accepted: number;
   /** The messages of the route that wait for the person, for a receiver that does not run, or for the engine. */
   readonly waiting: number;
-  /** What the waiting messages wait for, or `null` when none waits. */
-  readonly waitingOn: QueueReason | null;
+  /** What the waiting messages wait for, in the detail that the person may see, or `null` when none waits. */
+  readonly waitingOn: WaitingCause | null;
   /** The messages that the person declined on this route since the last resume. */
   readonly declines: number;
   readonly state: 'open' | 'stopped';
@@ -133,8 +133,10 @@ export type SendRefusal = Invalid | SecretFound | QueueFull | NotAccepted | Stop
 /** A message that was taken, or a repeat of one: then `duplicate` is true, and `state` and `reason` are those of the first message, or `evicted` when the relay dropped it. */
 export type SendReply = { readonly ok: true; readonly id: string; readonly state: MessageState | 'evicted'; readonly reason: FailureReason | null; readonly duplicate: boolean } | SendRefusal;
 export type ConfirmReply = { readonly ok: true; readonly state: 'delivered' } | Invalid | NotAccepted | Unknown | Fail<'GAUGE_RELAY_CLOSED' | 'GAUGE_RELAY_UNAUTHENTICATED' | 'GAUGE_RELAY_SESSION_ENDED' | 'GAUGE_RELAY_RECEIPT_INVALID'>;
-export type ControlReply = { readonly ok: true; readonly state: MessageState } | NotAccepted | Stopped | Fail<'GAUGE_RELAY_CLOSED' | 'GAUGE_MESSAGE_UNKNOWN' | 'GAUGE_RELAY_RECEIVER_GONE'>;
-export type ResumeReply = { readonly ok: true } | Fail<'GAUGE_RELAY_CLOSED' | 'GAUGE_ROUTE_UNKNOWN'>;
+/** A control reply that worked: the state of the message after the call, and the reason when it failed in the same call (a message that could not be made for the engine fails at once). */
+export type ControlReply = { readonly ok: true; readonly state: MessageState; readonly reason: FailureReason | null } | NotAccepted | Stopped | Fail<'GAUGE_RELAY_CLOSED' | 'GAUGE_MESSAGE_UNKNOWN' | 'GAUGE_RELAY_RECEIVER_GONE'>;
+/** `reopened` lists the routes that the resume opened. */
+export type ResumeReply = { readonly ok: true; readonly reopened: readonly string[] } | Fail<'GAUGE_RELAY_CLOSED' | 'GAUGE_ROUTE_UNKNOWN'>;
 
 /** What an engine reaches: two writes, each with the secret of its own session. Nothing here approves, declines, resumes, reads, or closes. Hand an adapter this object and not the whole relay. */
 export interface RelayWrites {
@@ -164,7 +166,7 @@ export interface RelayControl {
   readonly closed: boolean;
   /**
    * How much the relay holds now. `messages` is the live messages and up to `keepSettled` settled ones. `keys` is the ledger of keys (up to `keepKeys`), which dropping a message does not shrink. `secrets` is the live session secrets.
-   * `inflight` is the engines that are busy with a delivery. `declined` is the declined bodies that are remembered (at most 256).
+   * `inflight` is the engines that are busy with a delivery. `declined` is the declined bodies that are remembered, for each route at most its decline cap and 16 more.
    */
   sizes(): { readonly messages: number; readonly keys: number; readonly secrets: number; readonly inflight: number; readonly declined: number };
   /** The messages the relay keeps, in the order they were sent (the order in which the relay made them). They are given to an engine in the order in which they were accepted. */
@@ -197,9 +199,10 @@ interface Rec {
   acceptSeq: number | null;
   /** True while the message holds a place in the count of its route and in the counts of the loop caps. */
   counted: boolean;
-  /** The epochs of the route and of the loop counts when it was counted. A reset by the person ends an epoch, and a message of an earlier epoch holds no place. */
+  /** The epochs of the route, of its pair, and of the run count when it was counted. A reset by the person ends an epoch, and a message of an earlier epoch holds no place. */
   epoch: number;
-  loopEpoch: number;
+  pairEpoch: number;
+  runEpoch: number;
   runCounted: boolean;
   cancel: (() => void) | null;
   abort: AbortController | null;
@@ -212,6 +215,14 @@ interface RouteState {
   accepted: number;
   epoch: number;
   declines: number;
+  /** What a loop stop covered, so a resume opens what the stop closed: `pair` (the two routes of a pair) or `run` (every route that the run cap stopped). The public cause stays `loop_cap`. */
+  scope: 'pair' | 'run' | null;
+}
+
+/** The messages accepted between two sessions since the last act of the person that reopened or approved in this pair. */
+interface PairState {
+  count: number;
+  epoch: number;
 }
 
 /** An engine that a delivery is running into. It stays until the adapter settles its promise, or a receipt comes, so two deliveries never overlap. */
@@ -232,6 +243,8 @@ const REQUEST_SEND = ['session', 'secret', 'route', 'key', 'body'] as const;
 const REQUEST_CONFIRM = ['session', 'secret', 'id', 'receipt'] as const;
 const ROUTE_FIELDS = ['id', 'from', 'to', 'rule', 'messageCap', 'loopCap'] as const;
 const NEVER = digestOf(`relay never matches ${randomBytes(16).toString('hex')}`);
+/** The text that is hashed in place of a secret when a session has none, so the work of a check is the same whether the session has a live secret or not. It is never equal to a secret that a session holds, and a match is refused in any case. */
+const DUMMY_SECRET = `relay has no secret for this session ${randomBytes(16).toString('hex')}`;
 
 function digestOf(text: string): Buffer {
   return createHash('sha256').update(text).digest();
@@ -330,15 +343,15 @@ export function createRelay(options: RelayOptions): Relay {
   const ledger = new Map<string, { readonly hash: string; readonly id: MessageId }>();
   /** The ids of the messages that the history dropped, with their receivers, oldest first. */
   const gone = new Map<string, string>();
-  /** The bodies that the person declined, route and hash, oldest first. They stay refused on their route until the person resumes it. */
-  const declined = new Set<string>();
-  const routeStates = new Map<string, RouteState>(routes.map(route => [route.id, { route, stopped: null, stoppedAt: null, accepted: 0, epoch: 0, declines: 0 }]));
+  /** The bodies that the person declined, for each route, as hashes, oldest first. A set holds at most the decline cap and 16 more. They stay refused on their route until the person resumes it. */
+  const declined = new Map<string, Set<string>>();
+  const routeStates = new Map<string, RouteState>(routes.map(route => [route.id, { route, stopped: null, stoppedAt: null, accepted: 0, epoch: 0, declines: 0, scope: null }]));
   const pairCaps = new Map<string, number>();
   for (const route of routes) pairCaps.set(pairKey(route.from, route.to), Math.min(pairCaps.get(pairKey(route.from, route.to)) ?? MAX_LOOP_CAP, route.loopCap));
-  /** The messages accepted between each pair of sessions, and the `auto` messages accepted in the run, since the last act of the person. */
-  const pairCounts = new Map<string, number>();
+  /** The messages accepted between each pair of sessions since the last act of the person on that pair, and the `auto` messages accepted in the run since the last act of the person on a run stop. */
+  const pairs = new Map<string, PairState>(routes.map(route => [pairKey(route.from, route.to), { count: 0, epoch: 0 }]));
   let runCount = 0;
-  let loopEpoch = 0;
+  let runEpoch = 0;
   const busy = new Map<string, Busy>();
   let seq = 0;
   let acceptSeq = 0;
@@ -353,12 +366,8 @@ export function createRelay(options: RelayOptions): Relay {
     }
     return hidden;
   };
-  /** What a log line must not hold: the same values, and the body of each message that an engine is taking, since the error of an adapter may echo it. */
-  const logHidden = (): string[] => {
-    const hidden = relayValues();
-    for (const rec of records.values()) if (rec.state === 'sending') hidden.push(rec.envelope.body);
-    return hidden;
-  };
+  /** What a log line must not hold: the same values. The body of a message that an engine is taking is cut out of the error text of its adapter only (`printableFor`), since a body that holds a word of a fixed line would blank it. */
+  const logHidden = (): string[] => relayValues();
   const log = createLog({ run, hidden: logHidden, log: options.log });
 
   const time = (): number => {
@@ -371,6 +380,8 @@ export function createRelay(options: RelayOptions): Relay {
     if (!guard(value)) throw new TypeError('relay: a made token is not 16 to 256 characters');
     return value;
   }
+  /** The text of an error of the adapter of a message, with the body of the message cut out of it: an adapter may echo what it was given. */
+  const printableFor = (rec: Rec, error: unknown): string => redactText([rec.envelope.body], printable(error));
   /** Calls a function that cancels a timer or a delivery. It must be a function and it must not throw. */
   const safely = (name: string, call: (() => void) | null | undefined): void => {
     if (typeof call !== 'function') return;
@@ -407,8 +418,8 @@ export function createRelay(options: RelayOptions): Relay {
     return undefined;
   }
 
-  /** What the waiting messages of a route wait for. The person when most of them are pending, else the receiver: not running (or unreadable), or busy with an earlier delivery. */
-  function queueCause(state: RouteState): QueueReason {
+  /** What the waiting messages of a route wait for, in the detail that the person sees: the person when most of them are pending, else the receiver (stuck, not running or unreadable, or busy with an earlier delivery). */
+  function waitingCause(state: RouteState): WaitingCause {
     let pending = 0, accepted = 0;
     for (const rec of records.values()) {
       if (rec.route.id !== state.route.id) continue;
@@ -416,15 +427,21 @@ export function createRelay(options: RelayOptions): Relay {
       else if (rec.state === 'queued' || rec.state === 'sending') accepted += 1;
     }
     if (pending >= accepted) return 'pending_approval';
+    if (busy.get(state.route.to)?.stuck === true) return 'receiver_stuck';
     return readState(state.route.to) === 'running' ? 'receiver_busy' : 'receiver_not_running';
   }
+  /** The same cause as the writer of the route is told: a receiver that does not run is a receiver that does not take the messages now, and the writer is not told which. */
+  const queueCause = (state: RouteState): QueueReason => {
+    const cause = waitingCause(state);
+    return cause === 'receiver_not_running' ? 'receiver_busy' : cause;
+  };
 
   const routeView = (state: RouteState): RouteView => {
     const waiting = waitingOf(state.route.id);
     return Object.freeze({
       id: state.route.id, from: state.route.from, to: state.route.to, rule: state.route.rule, messageCap: state.route.messageCap, loopCap: state.route.loopCap,
-      accepted: state.accepted, waiting, waitingOn: waiting === 0 ? null : queueCause(state), declines: state.declines,
-      state: state.stopped === null ? 'open' as const : 'stopped' as const, stoppedBy: state.stopped, stoppedAt: state.stoppedAt, exchanged: pairCounts.get(pairKey(state.route.from, state.route.to)) ?? 0,
+      accepted: state.accepted, waiting, waitingOn: waiting === 0 ? null : waitingCause(state), declines: state.declines,
+      state: state.stopped === null ? 'open' as const : 'stopped' as const, stoppedBy: state.stopped, stoppedAt: state.stoppedAt, exchanged: pairs.get(pairKey(state.route.from, state.route.to))?.count ?? 0,
     });
   };
 
@@ -461,11 +478,17 @@ export function createRelay(options: RelayOptions): Relay {
 
   // ---- the counts of a route, and the caps of the loops
 
-  /** The person has acted: the counts of the loop caps start again. A message that was counted before holds no place in the new counts. */
-  function resetLoopCounts(): void {
-    pairCounts.clear();
+  /** The person has acted on a pair: its count starts again. A message that was counted before holds no place in the new count. */
+  function resetPair(key: string): void {
+    const pair = pairs.get(key);
+    if (pair === undefined) return;
+    pair.count = 0;
+    pair.epoch += 1;
+  }
+  /** The person has reopened a stop of the run cap: the run count starts again. */
+  function resetRun(): void {
     runCount = 0;
-    loopEpoch += 1;
+    runEpoch += 1;
   }
 
   /** Gives back the place of a message in the count of its route and in the counts of the loop caps. It is for a message that failed before the engine was asked. It does nothing for a message that holds no place. */
@@ -474,10 +497,9 @@ export function createRelay(options: RelayOptions): Relay {
     rec.counted = false;
     const state = routeStates.get(rec.route.id);
     if (state !== undefined && state.epoch === rec.epoch) state.accepted -= 1;
-    if (rec.loopEpoch !== loopEpoch) return;
-    const key = pairKey(rec.route.from, rec.route.to);
-    pairCounts.set(key, (pairCounts.get(key) ?? 1) - 1);
-    if (rec.runCounted) runCount -= 1;
+    const pair = pairs.get(pairKey(rec.route.from, rec.route.to));
+    if (pair !== undefined && pair.epoch === rec.pairEpoch) pair.count -= 1;
+    if (rec.runCounted && rec.runEpoch === runEpoch) runCount -= 1;
   }
   function failBeforeEngine(rec: Rec, reason: FailureReason): void {
     refund(rec);
@@ -486,40 +508,46 @@ export function createRelay(options: RelayOptions): Relay {
 
   const pairRoutes = (state: RouteState): RouteState[] => [...routeStates.values()].filter(other => pairKey(other.route.from, other.route.to) === pairKey(state.route.from, state.route.to));
 
-  function stopAll(targets: readonly RouteState[], cause: StopCause, at: number, line: string): void {
+  function stopAll(targets: readonly RouteState[], cause: StopCause, scope: 'pair' | 'run' | null, at: number, line: string): void {
     for (const target of targets) {
       if (target.stopped !== null) continue;
       target.stopped = cause;
       target.stoppedAt = at;
+      target.scope = scope;
     }
     log.write(line);
   }
 
   /**
    * A stop is about new acceptances: a message that was accepted within a cap goes on, and a message that waits for the person stays as it is, and cannot be approved until the person resumes the route.
-   * A loop cap stops both routes of its pair. The run cap stops every route.
+   * A loop cap stops both routes of its pair. The run cap stops every route that is open.
    */
   const stopPair = (state: RouteState, at: number, cap: number): void => {
     const [low, high] = [state.route.from, state.route.to].sort();
-    stopAll(pairRoutes(state), 'loop_cap', at, `route ${state.route.id} stopped: the loop cap of ${cap} is reached between ${low} and ${high}`);
+    stopAll(pairRoutes(state), 'loop_cap', 'pair', at, `route ${state.route.id} stopped: the loop cap of ${cap} is reached between ${low} and ${high}`);
   };
 
   const stoppedRefusal = (cause: StopCause): Stopped => ({
     ok: false, code: cause === 'loop_cap' ? 'GAUGE_RELAY_LOOP_CAP' : cause === 'message_cap' ? 'GAUGE_RELAY_MESSAGE_CAP' : 'GAUGE_RELAY_ROUTE_PAUSED',
   });
 
-  /** Takes a message into the count of its route and the counts of the loop caps, or refuses it, and stops routes when a cap is reached. It changes nothing for a refusal except the stop. */
-  function accept(rec: Rec, at: number): Stopped | undefined {
+  /**
+   * Takes a message into the count of its route and the counts of the loop caps, or refuses it, and stops routes when a cap is reached. It changes nothing for a refusal except the stop. An approval (`approved`) is an act of the person
+   * on its own pair: the count of the pair starts again at this message. It starts nothing again before the message is taken, so a refused approval changes no count.
+   */
+  function accept(rec: Rec, at: number, approved = false): Stopped | undefined {
     const state = routeStates.get(rec.route.id);
     if (state === undefined) throw new Error('relay: a message names a route that the relay does not hold');
     if (state.stopped !== null) return stoppedRefusal(state.stopped);
     if (state.accepted >= state.route.messageCap) {
-      stopAll([state], 'message_cap', at, `route ${state.route.id} stopped: the cap of ${state.route.messageCap} messages is reached`);
+      stopAll([state], 'message_cap', null, at, `route ${state.route.id} stopped: the cap of ${state.route.messageCap} messages is reached`);
       return stoppedRefusal('message_cap');
     }
     // Every message between a pair counts, in both directions, and a repeat of one sender is no reset: two engines cannot talk on with a trick of order.
     const key = pairKey(rec.route.from, rec.route.to);
-    const exchanged = (pairCounts.get(key) ?? 0) + 1;
+    const pair = pairs.get(key);
+    if (pair === undefined) throw new Error('relay: a message names a pair that the relay does not hold');
+    const exchanged = (approved ? 0 : pair.count) + 1;
     const cap = pairCaps.get(key) ?? MAX_LOOP_CAP;
     if (exchanged > cap) {
       stopPair(state, at, cap);
@@ -527,29 +555,31 @@ export function createRelay(options: RelayOptions): Relay {
     }
     const automatic = rec.route.rule === 'auto';
     if (automatic && runCount + 1 > runCap) {
-      stopAll([...routeStates.values()], 'loop_cap', at, `route ${state.route.id} stopped: the run cap of ${runCap} messages is reached, so every route of the run is stopped`);
+      stopAll([...routeStates.values()], 'loop_cap', 'run', at, `route ${state.route.id} stopped: the run cap of ${runCap} messages is reached, so every route of the run is stopped`);
       return stoppedRefusal('loop_cap');
     }
     state.accepted += 1;
-    pairCounts.set(key, exchanged);
+    if (approved) pair.epoch += 1;
+    pair.count = exchanged;
     if (automatic) runCount += 1;
     rec.counted = true;
     rec.runCounted = automatic;
     rec.epoch = state.epoch;
-    rec.loopEpoch = loopEpoch;
+    rec.pairEpoch = pair.epoch;
+    rec.runEpoch = runEpoch;
     rec.acceptSeq = (acceptSeq += 1);
     return undefined;
   }
 
   // ---- secrets
 
-  /** Compares the secret that was given with the live secret of the session, and with the digest of the secret of a session that ended. Both digests are made in every case, so the work does not tell which case it was. */
+  /** Compares the secret that was given with the live secret of the session, and with the digest of the secret of a session that ended. The given secret is hashed once, and the live secret (or a dummy text when the session has none) is hashed once, in every case. The digest of an ended session is stored, and is compared as it is. */
   function authenticate(session: unknown, secret: unknown): { readonly kind: 'ok'; readonly session: string } | { readonly kind: 'ended' } | { readonly kind: 'bad' } {
     const usable = typeof session === 'string' && typeof secret === 'string' && secret.length <= MAX_TOKEN_LENGTH;
     const given = digestOf(usable ? secret : '');
     const live = usable ? secrets.get(session) : undefined;
     const old = usable ? retired.get(session) : undefined;
-    const liveMatch = timingSafeEqual(given, live === undefined ? NEVER : digestOf(live)) && live !== undefined;
+    const liveMatch = timingSafeEqual(given, digestOf(live ?? DUMMY_SECRET)) && live !== undefined;
     const oldMatch = timingSafeEqual(given, old ?? NEVER) && old !== undefined;
     if (usable && liveMatch) return { kind: 'ok', session };
     return oldMatch ? { kind: 'ended' } : { kind: 'bad' };
@@ -598,22 +628,25 @@ export function createRelay(options: RelayOptions): Relay {
     log.write(`session ${session} ended, so what waited for it has failed`);
   }
 
-  /** Reads the state of a session, and ends its life in the relay when it has ended. True when the session has ended. */
-  function refresh(session: string): boolean {
-    if (ended.has(session)) return true;
+  /** Looks at a session once: reads its state, and ends its life in the relay when it has ended. Gives `'ended'` for a session that has ended, the state that was read, or `undefined` when the port could not say. */
+  function look(session: string): SessionState | 'ended' | undefined {
+    if (ended.has(session)) return 'ended';
     const state = readState(session);
     if (state !== undefined && isEnded(state)) {
       sessionEnded(session);
-      return true;
+      return 'ended';
     }
-    return false;
+    return state;
   }
+  /** True when the session has ended. */
+  const refresh = (session: string): boolean => look(session) === 'ended';
 
   function failQueued(receiver: string, reason: FailureReason): void {
     for (const rec of [...records.values()]) if (rec.state === 'queued' && rec.envelope.receiver === receiver) failBeforeEngine(rec, reason);
   }
 
-  function pump(session: string): void {
+  /** Gives what waits for a session to its engine, when it runs and is free. `known` is a state that the caller read just now, so it is not read twice. */
+  function pump(session: string, known?: { readonly state: SessionState | undefined }): void {
     if (closed) return;
     const entry = busy.get(session);
     if (entry !== undefined) {
@@ -626,7 +659,8 @@ export function createRelay(options: RelayOptions): Relay {
       if (rec.state === 'queued' && rec.envelope.receiver === session && (next === undefined || (rec.acceptSeq ?? 0) < (next.acceptSeq ?? 0))) next = rec;
     }
     if (next === undefined) return;
-    if (refresh(session) || readState(session) !== 'running') return;
+    // One look: the state is read once, so the log of a state that cannot be read keeps its schedule.
+    if ((known === undefined ? look(session) : known.state) !== 'running') return;
     startDelivery(next);
   }
 
@@ -668,12 +702,23 @@ export function createRelay(options: RelayOptions): Relay {
     } catch (error) {
       pending = Promise.reject(error);
     }
-    pending.then(answer => onAnswer(rec, answer), error => onFailure(rec, error)).catch(error => log.write(`message ${rec.id}: a late step threw: ${printable(error)}`));
+    pending.then(answer => onAnswer(rec, answer), error => onFailure(rec, error)).catch(error => log.write(`message ${rec.id}: a late step threw: ${printableFor(rec, error)}`));
   }
 
-  /** An answer that came after the message left the sending state: it is kept as the fidelity when none is known, and the state does not change. */
+  /**
+   * An answer that came after the message left the sending state. A fidelity is kept when none is known. The fidelity `unknown` (a receipt came first) is replaced by an answer, except `absent`, which contradicts the receipt: that is logged
+   * and the fidelity stays. The state never changes.
+   */
   function lateFidelity(rec: Rec, answer: unknown): void {
-    if ((rec.fidelity === null || rec.fidelity === 'unknown') && isAdapterFidelity(answer)) rec.fidelity = answer;
+    if (!isAdapterFidelity(answer)) {
+      log.write(`the engine of ${rec.envelope.receiver} gave an answer that is no fidelity, for message ${rec.id}, after the message was settled`);
+      return;
+    }
+    if (rec.fidelity === null) rec.fidelity = answer;
+    else if (rec.fidelity === 'unknown') {
+      if (answer === 'absent') log.write(`the adapter of ${rec.envelope.receiver} said absent for message ${rec.id}, which a receipt had proved delivered`);
+      else rec.fidelity = answer;
+    }
   }
 
   function onAnswer(rec: Rec, answer: unknown): void {
@@ -699,13 +744,27 @@ export function createRelay(options: RelayOptions): Relay {
   function onFailure(rec: Rec, error: unknown): void {
     releaseBusy(rec.envelope.receiver, rec.id);
     if (rec.state !== 'sending') {
+      // The rejection is the only account of why an engine hung. The line is fixed and holds no text of the error: the body is hidden only while the engine takes it.
+      log.write(`the adapter of ${rec.envelope.receiver} rejected its delivery of message ${rec.id} after the message was settled`);
       pump(rec.envelope.receiver);
       return;
     }
     leaveSending(rec);
-    log.write(`delivery of message ${rec.id} to ${rec.envelope.receiver} failed: ${printable(error)}`);
+    log.write(`delivery of message ${rec.id} to ${rec.envelope.receiver} failed: ${printableFor(rec, error)}`);
     settle(rec, 'failed', 'delivery_failed');
     pump(rec.envelope.receiver);
+  }
+
+  /** Arms the wait for an adapter that has not settled: after `abandonMs` the engine reads as stuck. */
+  function armStuck(rec: Rec): void {
+    const entry = busy.get(rec.envelope.receiver);
+    if (entry === undefined || entry.id !== rec.id) return;
+    try {
+      entry.cancelStuck = schedule(guarded(`the stuck timer of ${rec.envelope.receiver}`, () => onStuck(rec)), abandonMs);
+    } catch (error) {
+      log.write(`the stuck timer of ${rec.envelope.receiver} could not be set: ${printable(error)}`);
+      onStuck(rec);
+    }
   }
 
   function onTimeout(rec: Rec): void {
@@ -716,16 +775,8 @@ export function createRelay(options: RelayOptions): Relay {
     abortDelivery(rec);
     log.write(`delivery of message ${rec.id} to ${rec.envelope.receiver} timed out after ${timeoutMs} ms, and the text may still reach the engine`);
     settle(rec, 'failed', 'delivery_timeout');
-    const entry = busy.get(rec.envelope.receiver);
-    if (entry !== undefined && entry.id === rec.id) {
-      try {
-        entry.cancelStuck = schedule(guarded(`the stuck timer of ${rec.envelope.receiver}`, () => onStuck(rec)), abandonMs);
-      } catch (error) {
-        log.write(`the stuck timer of ${rec.envelope.receiver} could not be set: ${printable(error)}`);
-        onStuck(rec);
-      }
-    }
     // The engine stays busy, so nothing else goes into it until the adapter settles, a receipt comes, or the wait for the adapter ends.
+    armStuck(rec);
   }
 
   function onStuck(rec: Rec): void {
@@ -751,7 +802,6 @@ export function createRelay(options: RelayOptions): Relay {
     ledger.set(`${route}\u0000${key}`, { hash, id });
     trim(ledger, keepKeys);
   };
-  const declinedKey = (route: RouteId, hash: string): string => `${route}\u0000${hash}`;
 
   function send(request: unknown): SendReply {
     if (closed) return { ok: false, code: 'GAUGE_RELAY_CLOSED' };
@@ -779,9 +829,14 @@ export function createRelay(options: RelayOptions): Relay {
       return { ok: true, id: known.id, state: first === undefined ? 'evicted' : first.state, reason: first?.reason ?? null, duplicate: true };
     }
     // A body that the person declined on this route is not asked again, under another key either, until the person resumes the route.
-    if (declined.has(declinedKey(state.route.id, bodyHash))) return { ok: false, code: 'GAUGE_MESSAGE_NOT_ACCEPTED', reason: 'declined' };
+    if (declined.get(state.route.id)?.has(bodyHash) === true) return { ok: false, code: 'GAUGE_MESSAGE_NOT_ACCEPTED', reason: 'declined' };
     if (state.stopped !== null) return stoppedRefusal(state.stopped);
     if (refresh(state.route.to)) return { ok: false, code: 'GAUGE_RELAY_RECEIVER_GONE' };
+    // An engine that never settled an earlier delivery is written to no more: no message, no key, no count, and a line at counts 1, 2, 4, 8, and so on.
+    if (busy.get(state.route.to)?.stuck === true) {
+      log.counted(`stuck:${state.route.to}`, `a write to ${state.route.to} was refused, because its engine never settled an earlier delivery`);
+      return { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'receiver_stuck' };
+    }
     if (waitingOf(state.route.id) >= MAX_WAITING_PER_ROUTE) return { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: queueCause(state) };
     // Everything that can throw comes before the first change: the clock and the id.
     const at = time();
@@ -792,7 +847,7 @@ export function createRelay(options: RelayOptions): Relay {
     if (!checked.ok) throw new Error('relay: the envelope of a message is refused by its own check');
     const rec: Rec = {
       id, route: state.route, envelope: checked.value, bodyHash, state: 'pending', reason: null, failedBefore: null, fidelity: null, token: null, nonce: null, endSeq: null, sentSeq: null, acceptSeq: null,
-      counted: false, epoch: 0, loopEpoch: 0, runCounted: false, cancel: null, abort: null,
+      counted: false, epoch: 0, pairEpoch: 0, runEpoch: 0, runCounted: false, cancel: null, abort: null,
     };
     if (state.route.rule === 'auto') {
       const refused = accept(rec, at);
@@ -803,7 +858,8 @@ export function createRelay(options: RelayOptions): Relay {
     records.set(id, rec);
     rememberKey(state.route.id, key.value, bodyHash, id);
     if (rec.state === 'queued') pump(state.route.to);
-    return { ok: true, id, state: rec.state, reason: null, duplicate: false };
+    // A message can fail in this very call (the engine is stuck, or the text could not be made), and then the first reply says why.
+    return { ok: true, id, state: rec.state, reason: rec.reason, duplicate: false };
   }
 
   function confirm(request: unknown): ConfirmReply {
@@ -825,8 +881,12 @@ export function createRelay(options: RelayOptions): Relay {
     // `absent` says that the adapter had no way to give the engine a message, so no receipt for it can be right.
     if (rec.fidelity === 'absent' || typeof given !== 'string' || given.length > MAX_TOKEN_LENGTH || !timingSafeEqual(digestOf(given), digestOf(rec.token))) return { ok: false, code: 'GAUGE_RELAY_RECEIPT_INVALID' };
     // The receipt is in the text that the engine was given, so it proves that the text reached the engine: also when the answer of the engine is late, or the timeout came first.
-    if (rec.state === 'sending') leaveSending(rec);
-    releaseBusy(rec.envelope.receiver, rec.id);
+    // The adapter may still hold its promise, so the engine stays busy until it settles or the wait for it ends, and the signal is aborted: it must write no more.
+    if (rec.state === 'sending') {
+      leaveSending(rec);
+      abortDelivery(rec);
+      armStuck(rec);
+    }
     rec.failedBefore = rec.state === 'failed' ? rec.reason : null;
     if (rec.fidelity === null) rec.fidelity = 'unknown';
     settle(rec, 'delivered', null);
@@ -843,14 +903,12 @@ export function createRelay(options: RelayOptions): Relay {
     if (rec.state !== 'pending') return { ok: false, code: 'GAUGE_MESSAGE_NOT_ACCEPTED', reason: rec.state };
     // The end of the receiver has failed this message already, when it is seen here.
     if (refresh(rec.envelope.receiver)) return { ok: false, code: 'GAUGE_RELAY_RECEIVER_GONE' };
-    const at = time();
-    // An approval is an act of the person: the counts of the loop caps start again. A route that is stopped is not helped by it.
-    if (routeStates.get(rec.route.id)?.stopped === null) resetLoopCounts();
-    const refused = accept(rec, at);
+    // An approval is an act of the person on the pair of its route: the count of the pair starts again, once the message is taken. A refused approval changes no count.
+    const refused = accept(rec, time(), true);
     if (refused !== undefined) return refused;
     rec.state = 'queued';
     pump(rec.envelope.receiver);
-    return { ok: true, state: rec.state };
+    return { ok: true, state: rec.state, reason: rec.reason };
   }
 
   function decline(id: unknown): ControlReply {
@@ -862,41 +920,57 @@ export function createRelay(options: RelayOptions): Relay {
     const state = routeStates.get(rec.route.id);
     refund(rec);
     settle(rec, 'declined', null);
-    declined.add(declinedKey(rec.route.id, rec.bodyHash));
-    trim(declined, KEEP_DECLINED_BODIES);
+    let held = declined.get(rec.route.id);
+    if (held === undefined) {
+      held = new Set<string>();
+      declined.set(rec.route.id, held);
+    }
+    held.add(rec.bodyHash);
+    trim(held, declineCap + DECLINED_SLACK);
     if (state !== undefined) {
       state.declines += 1;
       // A sender that keeps proposing what the person declines is paused: the person decides when it goes on.
-      if (state.declines >= declineCap && state.stopped === null) stopAll([state], 'declines', at, `route ${state.route.id} paused: the person declined ${state.declines} of its messages`);
+      if (state.declines >= declineCap && state.stopped === null) stopAll([state], 'declines', null, at, `route ${state.route.id} paused: the person declined ${state.declines} of its messages`);
     }
-    return { ok: true, state: rec.state };
+    return { ok: true, state: rec.state, reason: null };
   }
 
   function resume(routeValue: unknown): ResumeReply {
     if (closed) return { ok: false, code: 'GAUGE_RELAY_CLOSED' };
     const state = isRouteId(routeValue) ? routeStates.get(routeValue) : undefined;
     if (state === undefined) return { ok: false, code: 'GAUGE_ROUTE_UNKNOWN' };
-    const cause = state.stopped;
-    if (cause === 'message_cap') {
+    const reopened: string[] = [];
+    const reopen = (target: RouteState): void => {
+      if (target.stopped === null) return;
+      target.stopped = null;
+      target.stoppedAt = null;
+      target.scope = null;
+      reopened.push(target.route.id);
+    };
+    if (state.stopped === 'message_cap') {
       state.accepted = 0;
       state.epoch += 1;
-    } else if (cause === 'loop_cap') {
+      reopen(state);
+    } else if (state.stopped === 'declines') {
+      reopen(state);
+    } else if (state.stopped === 'loop_cap' && state.scope === 'run') {
+      // A stop of the run cap is reopened as a whole, with the pair of each route that it opened. A route that a pair or a cap stopped before stays stopped.
       for (const other of routeStates.values()) {
-        if (other.stopped !== 'loop_cap') continue;
-        other.stopped = null;
-        other.stoppedAt = null;
+        if (other.stopped !== 'loop_cap' || other.scope !== 'run') continue;
+        reopen(other);
+        resetPair(pairKey(other.route.from, other.route.to));
       }
+      resetRun();
+    } else if (state.stopped === 'loop_cap') {
+      // A stop of a pair opens the routes of that pair, and no other.
+      for (const other of pairRoutes(state)) if (other.stopped === 'loop_cap' && other.scope === 'pair') reopen(other);
     }
-    // A resume is an act of the person, on any route: the counts of the loop caps start again.
-    resetLoopCounts();
-    if (cause !== null) {
-      state.stopped = null;
-      state.stoppedAt = null;
-    }
-    // A resume forgets what the person declined on the route: the route is trusted again.
+    // A resume is an act of the person on the route that it names: the count of its pair starts again.
+    resetPair(pairKey(state.route.from, state.route.to));
+    // It also forgets what the person declined on the route: the route is trusted again.
     state.declines = 0;
-    for (const entry of [...declined]) if (entry.startsWith(`${state.route.id}\u0000`)) declined.delete(entry);
-    return { ok: true };
+    declined.delete(state.route.id);
+    return { ok: true, reopened: Object.freeze(reopened) };
   }
 
   function close(): void {
@@ -931,11 +1005,12 @@ export function createRelay(options: RelayOptions): Relay {
     resume,
     sessionChanged(session: unknown): void {
       if (closed || typeof session !== 'string' || !ports.has(session)) return;
-      if (!refresh(session)) pump(session);
+      const seen = look(session);
+      if (seen !== 'ended') pump(session, { state: seen });
     },
     close,
     get closed(): boolean { return closed; },
-    sizes: () => Object.freeze({ messages: records.size, keys: ledger.size, secrets: secrets.size, inflight: busy.size, declined: declined.size }),
+    sizes: () => Object.freeze({ messages: records.size, keys: ledger.size, secrets: secrets.size, inflight: busy.size, declined: [...declined.values()].reduce((total, held) => total + held.size, 0) }),
     messages: (): readonly MessageView[] => Object.freeze([...records.values()].map(view)),
     message(id: unknown): MessageView | undefined {
       const rec = typeof id === 'string' ? records.get(id) : undefined;

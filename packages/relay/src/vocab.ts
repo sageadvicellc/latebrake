@@ -26,8 +26,8 @@ export const MAX_DECLINE_CAP = 100;
 export const DEFAULT_KEEP_KEYS = 4096;
 export const MIN_KEEP_KEYS = 16;
 export const MAX_KEEP_KEYS = 65_536;
-/** How many declined bodies the relay remembers for a run, oldest first. */
-export const KEEP_DECLINED_BODIES = 256;
+/** How many declined bodies the relay remembers for each route, oldest first: the decline cap and this many more, which is the most that a route can hold, since a paused route takes no new message and at most 16 wait. */
+export const DECLINED_SLACK = 16;
 /** How long the core waits, after a delivery timed out, for the adapter to settle its promise, in milliseconds, and the range of the option. After it the receiver reads as stuck. */
 export const DEFAULT_ABANDON_MS = 30_000;
 export const MAX_ABANDON_MS = 600_000;
@@ -104,9 +104,16 @@ export const isAdapterFidelity = (value: unknown): value is AdapterFidelity => t
 export const SECRET_REASONS = Object.freeze(['pattern', 'relay_value'] as const);
 export type SecretReason = (typeof SECRET_REASONS)[number];
 
-/** What the messages of a full route wait for, with `GAUGE_RELAY_QUEUE_FULL`. `pending_approval`: the person. `receiver_not_running`: the receiver does not run, or its state cannot be read. `receiver_busy`: the receiver runs, and its engine is taking an earlier message. */
-export const QUEUE_REASONS = Object.freeze(['pending_approval', 'receiver_not_running', 'receiver_busy'] as const);
+/**
+ * What the messages of a full route wait for, as the writer of the route is told, with `GAUGE_RELAY_QUEUE_FULL`. `pending_approval`: the person. `receiver_busy`: the receiver does not take them now (its engine is busy with an earlier
+ * message, or the receiver does not run). `receiver_stuck`: an earlier delivery to the engine never settled, so nothing more is given to it. The writer is not told which of the two causes of `receiver_busy` it is, since that would tell it
+ * that the receiver sits at a prompt. The person sees it in `waitingOn`.
+ */
+export const QUEUE_REASONS = Object.freeze(['pending_approval', 'receiver_busy', 'receiver_stuck'] as const);
 export type QueueReason = (typeof QUEUE_REASONS)[number];
+/** What the person is told that the waiting messages of a route wait for: the reasons above, and `receiver_not_running`. */
+export const WAITING_CAUSES = Object.freeze([...QUEUE_REASONS, 'receiver_not_running'] as const);
+export type WaitingCause = (typeof WAITING_CAUSES)[number];
 
 /** What stopped a route. `loop_cap`: the messages between two sessions, or of the whole run, reached a cap that no act of the person broke. `message_cap`: the route reached its cap on messages. `declines`: the person declined too many of its messages. */
 export const STOP_CAUSES = Object.freeze(['loop_cap', 'message_cap', 'declines'] as const);

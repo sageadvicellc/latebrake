@@ -32,14 +32,14 @@ test('every delivery carries a signal that is not aborted at the start, and is a
   assert.equal(ending.engines['sess-b']?.deliveries[0]?.signal.aborted, true);
 });
 
-test('a delivery that finishes or is confirmed in time is never aborted', async () => {
+test('a delivery that the adapter settles in time is never aborted, also when its receipt comes later', async () => {
   const { engines, send, confirm } = build({ routes: auto });
   if (engines['sess-b']) engines['sess-b'].mode = 'hang';
   send('sess-a', 'route-1', 'k1', 'first');
   await tick();
-  confirm('sess-b', 'msg-1', engines['sess-b']?.lastReceipt()?.receipt ?? '');
   engines['sess-b']?.release();
   await tick();
+  confirm('sess-b', 'msg-1', engines['sess-b']?.lastReceipt()?.receipt ?? '');
   assert.equal(engines['sess-b']?.deliveries[0]?.signal.aborted, false);
 });
 
@@ -112,7 +112,7 @@ test('a rejection of the adapter after the timeout frees the engine too, and the
   assert.equal(relay.control.message('msg-2')?.state, 'sent');
 });
 
-test('an adapter that never settles leaves the engine stuck after the wait: what waits fails with receiver_stuck, a new message fails the same way, and the engine is free again when the adapter does settle', async () => {
+test('an adapter that never settles leaves the engine stuck after the wait: what waits fails with receiver_stuck, a new message is refused with the same reason, and the engine is free again when the adapter does settle', async () => {
   const { relay, engines, send, timers, lines } = build({ routes: auto, options: { abandonMs: 7000 } });
   const engine = engines['sess-b'];
   if (engine) engine.mode = 'hang';
@@ -125,8 +125,8 @@ test('an adapter that never settles leaves the engine stuck after the wait: what
   assert.equal(relay.control.message('msg-2')?.reason, 'receiver_stuck');
   assert.equal(relay.control.routes()[0]?.accepted, 1, 'a message that never reached the engine gives its count back');
   assert.equal(lines.some(line => line === 'relay run-1: the engine of sess-b never settled its delivery of message msg-1, so nothing more is given to it until it does'), true);
-  send('sess-a', 'route-1', 'k3', 'third');
-  assert.equal(relay.control.message('msg-3')?.reason, 'receiver_stuck');
+  assert.deepEqual(send('sess-a', 'route-1', 'k3', 'third'), { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'receiver_stuck' });
+  assert.equal(relay.control.message('msg-3'), undefined, 'a write to a stuck engine makes no message');
   assert.equal(engine?.deliveries.length, 1);
   assert.equal(timers.live(), 0);
   if (engine) engine.mode = 'accept';
@@ -134,11 +134,11 @@ test('an adapter that never settles leaves the engine stuck after the wait: what
   await tick();
   send('sess-a', 'route-1', 'k4', 'fourth');
   await tick();
-  assert.equal(relay.control.message('msg-4')?.state, 'sent');
+  assert.equal(relay.control.message('msg-3')?.state, 'sent');
   assert.equal(engine?.maxActive, 1);
 });
 
-test('a receipt frees a busy engine at once, also after the timeout, and its stuck timer is cancelled', async () => {
+test('a receipt does not free a busy engine, also after the timeout: the next message waits until the adapter settles, and the stuck timer goes with the settle', async () => {
   const { relay, engines, send, confirm, timers } = build({ routes: auto });
   const engine = engines['sess-b'];
   if (engine) engine.mode = 'hang';
@@ -151,8 +151,13 @@ test('a receipt frees a busy engine at once, also after the timeout, and its stu
   if (engine) engine.mode = 'accept';
   assert.equal(confirm('sess-b', 'msg-1', receipt).ok, true);
   await tick();
+  assert.equal(relay.control.message('msg-2')?.state, 'queued');
+  assert.equal(timers.live(), 1);
+  engine?.releaseFirst();
+  await tick();
   assert.equal(relay.control.message('msg-2')?.state, 'sent');
-  assert.equal(timers.live(), 0, 'the stuck timer of the first message and the timer of the second are both gone');
+  assert.equal(timers.live(), 0);
+  assert.equal(engine?.maxActive, 1);
 });
 
 test('the end of the receiver and a close free the busy marker and cancel the stuck timer, so nothing is held', async () => {
@@ -318,7 +323,7 @@ test('a receipt for a message that failed with delivery_failed or delivery_timeo
   assert.deepEqual([timed.relay.control.message('msg-1')?.state, timed.relay.control.message('msg-1')?.reason, timed.relay.control.message('msg-1')?.failedBefore, timed.relay.control.message('msg-1')?.fidelity], ['delivered', null, 'delivery_timeout', 'weakened']);
 });
 
-test('the settle of an old delivery frees only its own engine slot: a late answer of a message that a receipt already proved does not free the engine of the message that runs now', async () => {
+test('the settle of an old delivery frees only its own engine slot: the answer of a message whose receipt came does not free the engine of a message that runs now', async () => {
   const { relay, engines, send, confirm } = build({ routes: auto });
   const engine = engines['sess-b'];
   if (engine) engine.mode = 'hang';
@@ -327,15 +332,15 @@ test('the settle of an old delivery frees only its own engine slot: a late answe
   send('sess-a', 'route-1', 'k3', 'third');
   await tick();
   confirm('sess-b', 'msg-1', engine?.lastReceipt()?.receipt ?? '');
-  assert.equal(engine?.deliveries.length, 2, 'the second message runs now');
+  assert.equal(engine?.deliveries.length, 1, 'the receipt does not free the engine');
   engine?.releaseFirst();
   await tick();
-  assert.equal(engine?.deliveries.length, 2, 'the answer of the first message does not free the engine of the second');
+  assert.equal(engine?.deliveries.length, 2, 'the answer of the first message frees the engine, and the second runs');
   assert.equal(relay.control.message('msg-3')?.state, 'queued');
   engine?.releaseFirst();
   await tick();
   assert.equal(engine?.deliveries.length, 3);
-  assert.equal(engine?.maxActive, 2, 'the first delivery was still open when the second began, because its receipt had proved it: only the receipt frees an engine before the adapter settles');
+  assert.equal(engine?.maxActive, 1);
 });
 
 test('a late answer that is no fidelity is not recorded', async () => {

@@ -7,7 +7,7 @@ test('an approval moves the message that it names, and no other: of two pending 
   const { relay, engines, send } = build();
   send('sess-a', 'route-1', 'k1', 'first body');
   send('sess-a', 'route-1', 'k2', 'second body');
-  assert.deepEqual(relay.control.approve('msg-2'), { ok: true, state: 'sending' });
+  assert.deepEqual(relay.control.approve('msg-2'), { ok: true, state: 'sending', reason: null });
   await tick();
   assert.equal(engines['sess-b']?.inputs.length, 1);
   assert.equal(engines['sess-b']?.inputs[0]?.includes('second body'), true);
@@ -43,7 +43,7 @@ test('an approval of an id that no message has, or of a value that is not an id,
 test('a decline is final: the message is never delivered, an approval after it is refused, and a repeat of the message is dropped', async () => {
   const { relay, engines, send } = build();
   send('sess-a', 'route-1', 'k', 'hello');
-  assert.deepEqual(relay.control.decline('msg-1'), { ok: true, state: 'declined' });
+  assert.deepEqual(relay.control.decline('msg-1'), { ok: true, state: 'declined', reason: null });
   assert.deepEqual(relay.control.approve('msg-1'), { ok: false, code: 'GAUGE_MESSAGE_NOT_ACCEPTED', reason: 'declined' });
   assert.deepEqual(relay.control.decline('msg-1'), { ok: false, code: 'GAUGE_MESSAGE_NOT_ACCEPTED', reason: 'declined' });
   await tick();
@@ -62,9 +62,9 @@ test('a decline of an unknown id is a refusal, and a decline of a message that w
 test('the person may withdraw a message that is accepted and waits for a receiver that does not run yet', async () => {
   const { relay, engines, send } = build({ states: { 'sess-b': 'waiting' } });
   send('sess-a', 'route-1', 'k', 'hello');
-  assert.deepEqual(relay.control.approve('msg-1'), { ok: true, state: 'queued' });
+  assert.deepEqual(relay.control.approve('msg-1'), { ok: true, state: 'queued', reason: null });
   assert.equal(relay.control.routes()[0]?.accepted, 1);
-  assert.deepEqual(relay.control.decline('msg-1'), { ok: true, state: 'declined' });
+  assert.deepEqual(relay.control.decline('msg-1'), { ok: true, state: 'declined', reason: null });
   assert.equal(relay.control.routes()[0]?.accepted, 0, 'the count of the message is given back');
   engines['sess-b']?.setState('running');
   relay.control.sessionChanged('sess-b');
@@ -112,7 +112,7 @@ test('an approval never applies to a message that a close or the end of the rece
 test('an approved message waits while the receiver is not running, and moves when it runs', async () => {
   const { relay, engines, send } = build({ states: { 'sess-b': 'starting' } });
   send('sess-a', 'route-1', 'k', 'hello');
-  assert.deepEqual(relay.control.approve('msg-1'), { ok: true, state: 'queued' });
+  assert.deepEqual(relay.control.approve('msg-1'), { ok: true, state: 'queued', reason: null });
   await tick();
   assert.deepEqual(engines['sess-b']?.inputs, []);
   engines['sess-b']?.setState('running');
