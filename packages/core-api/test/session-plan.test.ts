@@ -6,7 +6,7 @@ import { escapeForPlan } from '../src/plan-text.js';
 
 const BREAKS = new RegExp('[\\n\\r\\u2028\\u2029\\u202e]');
 const BASE: StartStepsInput = {
-  gauge: 'fixture-sessioner', engine: 'fixture-engine', title: 'Fixture Engine', program: '/usr/bin/fake', folder: '/work/alpha', model: null, billing: 'engine-plan', variables: ['HOME', 'PATH'], sharedWith: [],
+  gauge: 'fixture-sessioner', engine: 'fixture-engine', title: 'Fixture Engine', program: '/usr/bin/fake', folder: '/work/alpha', requestedFolder: null, model: null, billing: 'engine-plan', variables: ['HOME', 'PATH'], sharedWith: [],
 };
 
 test('a plain start plan reads exactly like this', () => {
@@ -42,7 +42,7 @@ test('a start plan with a model choice, a local billing source, no variables, an
 });
 
 test('a stop plan reads exactly like this, for a first stop and for a session that is stopping already', () => {
-  const input = { gauge: 'fixture-sessioner', session: 's-1', engine: 'fixture-engine', folder: '/work/alpha', force: false, ended: false, timeoutMs: 5000 };
+  const input = { gauge: 'fixture-sessioner', session: 's-1', engine: 'fixture-engine', folder: '/work/alpha', requestedFolder: null, force: false, ended: false, timeoutMs: 5000 };
   assert.deepEqual(stopSteps(input), [
     'Gauge fixture-sessioner asks to stop session s-1 of the engine fixture-engine',
     'folder: /work/alpha',
@@ -66,7 +66,7 @@ test('a stop plan reads exactly like this, for a first stop and for a session th
 test('every value is escaped, so no value can add or forge a line of the plan', () => {
   const hostile = 'x\n\u2028forged line\r\\\u202e';
   const escaped = 'x\\u{a}\\u{2028}forged line\\u{d}\\\\\\u{202e}';
-  const lines = startSteps({ gauge: hostile, engine: hostile, title: hostile, program: hostile, folder: hostile, model: { provider: hostile, model: hostile }, billing: 'local', variables: [hostile], sharedWith: [hostile] });
+  const lines = startSteps({ gauge: hostile, engine: hostile, title: hostile, program: hostile, folder: hostile, requestedFolder: null, model: { provider: hostile, model: hostile }, billing: 'local', variables: [hostile], sharedWith: [hostile] });
   assert.equal(lines.length, 11);
   for (const line of lines) assert.equal(BREAKS.test(line), false, line);
   assert.equal(lines[0], `Gauge ${escaped} asks for a new session of the engine ${escaped} (${escaped})`);
@@ -75,7 +75,7 @@ test('every value is escaped, so no value can add or forge a line of the plan', 
   assert.equal(lines[3], `model: ${escaped} ${escaped}, as the Gauge asks`);
   assert.equal(lines[5], `variables passed: ${escaped}`);
   assert.equal(lines[8], `notice: ${escaped} already runs in this folder, and two engines in one folder can overwrite each other's files`);
-  const stop = stopSteps({ gauge: hostile, session: hostile, engine: hostile, folder: hostile, force: false, ended: false, timeoutMs: 1 });
+  const stop = stopSteps({ gauge: hostile, session: hostile, engine: hostile, folder: hostile, requestedFolder: null, force: false, ended: false, timeoutMs: 1 });
   for (const line of stop) assert.equal(BREAKS.test(line), false, line);
   assert.equal(stop[0], `Gauge ${escaped} asks to stop session ${escaped} of the engine ${escaped}`);
   assert.equal(stop[1], `folder: ${escaped}`);
@@ -89,4 +89,32 @@ test('the look-alike spaces, the blank letters, and the combining marks are esca
   for (const [value, expected] of cases) assert.equal(escapeForPlan(value), expected, JSON.stringify(value));
   const lines = startSteps({ ...BASE, folder: '/work/a\u00a0b\u3164' });
   assert.equal(lines[2], 'folder: /work/a\\u{a0}b\\u{3164}');
+});
+
+test('a start plan for the person says when the Gauge named the folder in another way than the real one, and a plan for a Gauge never does', () => {
+  const real = '/real/alpha', named = '/link/alpha';
+  const steps = startSteps({ ...BASE, folder: real, requestedFolder: named });
+  assert.deepEqual(steps.slice(0, 4), [
+    'Gauge fixture-sessioner asks for a new session of the engine fixture-engine (Fixture Engine)',
+    'program: /usr/bin/fake',
+    'folder: /real/alpha',
+    'the Gauge named this folder as /link/alpha',
+  ]);
+  assert.equal(steps.length, startSteps(BASE).length + 1, 'one line is added, and no other');
+  assert.deepEqual(startSteps({ ...BASE, folder: real, requestedFolder: real }), startSteps({ ...BASE, folder: real }), 'the same name says nothing more');
+  assert.deepEqual(startSteps({ ...BASE, folder: named }), startSteps({ ...BASE, folder: named, requestedFolder: named }));
+  assert.equal(startSteps({ ...BASE, folder: real, requestedFolder: 'a\nb' })[3], 'the Gauge named this folder as a\\u{a}b', 'the name is escaped');
+});
+
+test('a stop plan for the person says when the session was asked for in another folder name than the real one', () => {
+  const input = { gauge: 'fixture-sessioner', session: 's-1', engine: 'fixture-engine', folder: '/real/alpha', requestedFolder: null, force: false, ended: false, timeoutMs: 5000 };
+  assert.deepEqual(stopSteps({ ...input, requestedFolder: '/link/alpha' }), [
+    'Gauge fixture-sessioner asks to stop session s-1 of the engine fixture-engine',
+    'folder: /real/alpha',
+    'the session was asked for in the folder /link/alpha',
+    'send the stop signal to the program and everything it started, and wait up to 5000 ms for them to go',
+    'if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT',
+  ]);
+  assert.deepEqual(stopSteps({ ...input, requestedFolder: '/real/alpha' }), stopSteps(input));
+  assert.equal(stopSteps({ ...input, requestedFolder: 'a\nb' })[2], 'the session was asked for in the folder a\\u{a}b');
 });

@@ -30,9 +30,12 @@ export function makeRig(folders: readonly GaugeFolder[], options: { readonly sto
   roots.push(root);
   const launcher = recording(createProcessLauncher());
   const stopTimeoutMs = options.stopTimeoutMs ?? 250;
+  // The engines are configured with a link to the program, so that the real program is another path from the one that a Gauge reads.
+  const programLink = path.join(root, 'engine-program');
+  fs.symlinkSync(process.execPath, programLink);
   const engines = SESSION_ENGINES.map(fixture => {
     const spec = fakeEngine({ id: fixture.id, tag, steps: fixture.steps, ...(fixture.env === undefined ? {} : { env: fixture.env }), ...(fixture.takesModel === true ? { takesModel: true } : {}) });
-    return fixture.missing === true ? { ...spec, program: path.join(root, 'no-such-program') } : spec;
+    return fixture.missing === true ? { ...spec, program: path.join(root, 'no-such-program') } : { ...spec, program: programLink };
   });
   const host = createEngineHost({ engines, launcher, stopTimeoutMs, environment: () => SESSION_ENVIRONMENT });
   const fake = createFakeCore({ folders, now: () => now, engineHost: host });
@@ -45,7 +48,9 @@ export function makeRig(folders: readonly GaugeFolder[], options: { readonly sto
     approveShared: plan => fake.approveShared(plan.nonce),
     advance: milliseconds => { now += milliseconds; },
     folder: name => { const full = path.join(root, name); fs.mkdirSync(full, { recursive: true }); return full; },
-    program: fs.realpathSync(process.execPath),
+    link: (name, target) => { const full = path.join(root, name); fs.symlinkSync(target, full); return full; },
+    person: plan => { const full = fake.personSessionPlan(plan.nonce); return { folder: full.realFolder, program: full.realProgram, sharedWith: full.allSharedWith }; },
+    program: programLink,
     stopTimeoutMs,
     launches: () => host.launched,
     output: index => launcher.lines[index] ?? [],
@@ -175,7 +180,7 @@ test('the core reads the plan it is sent from own properties, and treats a missi
   assert.deepEqual(await apply('plan'), changed);
   assert.deepEqual(await apply([]), changed);
   assert.deepEqual(await apply(Object.create(planned)), changed, 'a plan that only inherits its fields');
-  for (const key of ['action', 'gauge', 'engine', 'folder', 'session', 'program', 'model', 'billing', 'variables', 'sharedWith', 'force', 'steps', 'nonce']) {
+  for (const key of ['action', 'gauge', 'engine', 'folder', 'session', 'program', 'model', 'billing', 'variables', 'sharedWith', 'force', 'steps', 'digest', 'nonce']) {
     const copy: Record<string, unknown> = { ...planned };
     delete copy[key];
     assert.deepEqual(await apply(copy), changed, `without ${key}`);
@@ -184,8 +189,9 @@ test('the core reads the plan it is sent from own properties, and treats a missi
     assert.deepEqual(await apply({ ...planned, [key]: value }), changed, `with a bad ${key}`);
   }
   assert.deepEqual(await apply({ ...planned, variables: [...planned.variables, undefined] }), changed, 'a list with a hole or a non-text item');
-  const stillGood = await apply({ ...planned, digest: 'f'.repeat(64) });
-  assert.equal(stillGood.ok, true, 'the digest of the caller is ignored, and no refusal used the approval up');
+  assert.deepEqual(await apply({ ...planned, digest: 'f'.repeat(64) }), changed, 'the digest is part of the plan that the Gauge read');
+  const stillGood = await apply(planned);
+  assert.equal(stillGood.ok, true, 'the plan as it was issued still applies, since no refusal used the approval up');
 });
 
 test('a stop plan that claims force while the session is not stopping is a changed plan, and so is one for another session', async t => {
@@ -245,15 +251,15 @@ test('the person who disables the Gauge ends its access to sessions at once', as
   assert.deepEqual(await client.listSessions(GAUGE, ENGINE), { ok: false, code: 'GAUGE_GRANT_MISSING', reason: 'gauge_disabled' });
 });
 
-test('two plans that are the same plan, with the same digest and two nonces: the second approval of one never starts the other', async t => {
+test('two plans of the same content and two nonces: the second approval of one never starts the other', async t => {
   const { rig, client, fake } = await ready(t);
   const folder = rig.folder('alpha');
   const first = must(await client.planSessionStart(GAUGE, { engine: ENGINE, folder }));
   must(await client.applySession(first, fake.approve(first.nonce)));
   const a = must(await client.planSessionStart(GAUGE, { engine: 'fixture-other', folder }));
   const b = must(await client.planSessionStart(GAUGE, { engine: 'fixture-other', folder }));
-  assert.equal(a.digest, b.digest);
   assert.notEqual(a.nonce, b.nonce);
+  assert.notEqual(a.digest, b.digest, 'the digest holds the nonce, so no two plans share one');
   const approvalB = fake.approve(b.nonce), sharedA = fake.approveShared(a.nonce);
   assert.deepEqual(await client.applySession(b, approvalB, sharedA), { ok: false, code: 'ENGINE_FOLDER_SHARED' });
   assert.equal(rig.host.launched, 1);

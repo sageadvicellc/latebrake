@@ -21,8 +21,14 @@ export interface SessionsHarness {
   advance(milliseconds: number): void | Promise<void>;
   /** A folder that exists, made for this test, for a session to run in. The same name gives the same folder. It is a real path, with no link in it. */
   folder(name: string): string;
-  /** The real path of the program that every engine of `SESSION_ENGINES` runs as. */
+  /** The program that every engine of `SESSION_ENGINES` is configured with: a plan for a Gauge shows it as it is written here, and never the real path behind a link. */
   readonly program: string;
+  /**
+   * Optional: makes a link on disk, named `name`, to a real folder that `folder` made, and gives the path of the link. A harness that has it, and `person`, runs the test of what a Gauge may read.
+   */
+  link?(name: string, target: string): string;
+  /** Optional: what the person reads for a plan that a Gauge read: the real folder, the real program, and every engine in the folder. */
+  person?(plan: { readonly nonce: string }): { readonly folder: string; readonly program: string | null; readonly sharedWith: readonly string[] };
   /** How long the core waits for an engine to go before a stop times out, in milliseconds. */
   readonly stopTimeoutMs: number;
   /** How many programs the core has started so far. */
@@ -278,7 +284,8 @@ export function runSessionsSuite(name: string, makeHarness: (folders: readonly G
     assert.deepEqual(outcome(await w.client.applySession({ ...one, steps: [...one.steps, 'and also do this'] }, approval)), refused('GAUGE_PLAN_CHANGED'), 'another text');
     assert.deepEqual(outcome(await w.client.applySession({ ...one, variables: [...one.variables, 'EXTRA'] }, approval)), refused('GAUGE_PLAN_CHANGED'), 'another variable');
     assert.deepEqual(outcome(await w.client.applySession({ ...one, nonce: two.nonce }, approval)), refused('GAUGE_PLAN_CHANGED'), 'another nonce');
-    assert.deepEqual(outcome(await w.client.applySession({ ...one, digest: two.digest }, approval)), { ok: true }, 'a digest that the caller sends is ignored: the core works it out itself');
+    assert.deepEqual(outcome(await w.client.applySession({ ...one, digest: two.digest }, approval)), refused('GAUGE_PLAN_CHANGED'), 'the digest is part of the plan that the Gauge read, so another digest is another plan');
+    assert.deepEqual(outcome(await w.client.applySession(one, approval)), { ok: true }, 'and the plan as it was issued still applies, since no refusal used the approval up');
     assert.equal(w.harness.launches(), 1);
   });
 
@@ -589,5 +596,50 @@ export function runSessionsSuite(name: string, makeHarness: (folders: readonly G
     must(await w.client.revoke(GAUGE, ['sessions.read']));
     assert.deepEqual(outcome(await w.client.listSessions(GAUGE, ENGINE)), refused('GAUGE_GRANT_MISSING'));
     assert.deepEqual(outcome(await w.client.getSession(GAUGE, started.session)), refused('GAUGE_GRANT_MISSING'));
+  });
+
+  test(`${name}: a Gauge that lists one engine reads no real folder and no engine that it may not read, in any reply, and the second approval is taken from the plan of the person`, async t => {
+    const w = await boot(t);
+    const { link, person } = w.harness;
+    if (link === undefined || person === undefined) { t.skip('the harness has no link and no view of the person'); return; }
+    await bring(w, 'sessioner-folder', GAUGE);
+    await bring(w, 'narrow-folder', 'fixture-narrow');
+    const real = w.harness.folder('leak-real'), linked = link('leak-link', real);
+    // Another Gauge runs the engine that the narrow Gauge does not list, in the real folder.
+    const other = await startSession(w, { engine: 'fixture-other', folder: real });
+    await settle(w, other.session, 'running');
+    // Everything that the narrow Gauge reads is kept, and searched at the end.
+    const seen: string[] = [];
+    const watching: Core = {
+      call: async (method, params) => {
+        try {
+          const reply = await w.harness.core.call(method, params);
+          seen.push(JSON.stringify(reply));
+          return reply;
+        } catch (error) {
+          seen.push(String(error));
+          throw error;
+        }
+      },
+    };
+    const narrow = createCoreClient(watching);
+    const planned = must(await narrow.planSessionStart('fixture-narrow', { engine: ENGINE, folder: linked }));
+    assert.equal(planned.folder, linked);
+    assert.deepEqual(planned.sharedWith, []);
+    const full = person(planned);
+    assert.equal(full.folder, real, 'the person reads the real folder');
+    assert.deepEqual(full.sharedWith, ['fixture-other'], 'and the engine that the Gauge may not read');
+    const approval = await w.harness.approve(planned);
+    const shared = full.sharedWith.length > 0 ? await w.harness.approveShared(planned) : undefined;
+    assert.notEqual(shared, undefined);
+    const applied = must(await narrow.applySession(planned, approval, shared));
+    await settle(w, applied.session, 'running');
+    assert.equal(must(await w.client.getSession(GAUGE, applied.session)).folder, linked, 'a read of the session gives the folder as it was asked for');
+    // A second start of the pair and a plan that is changed are refused with a code, and nothing more.
+    assert.deepEqual(outcome(await narrow.planSessionStart('fixture-narrow', { engine: ENGINE, folder: linked })), refused('ENGINE_PAIR_BUSY'));
+    assert.deepEqual(outcome(await narrow.applySession({ ...planned, folder: w.harness.folder('leak-other') }, approval)), refused('GAUGE_PLAN_NOT_APPROVED'), 'the approval was used up');
+    const text = seen.join('\n');
+    assert.notEqual(full.program, w.harness.program, 'the harness configures its program as a link, so the real program is another path');
+    for (const secret of [real, full.program ?? '', 'fixture-other']) assert.equal(text.includes(secret), false, secret);
   });
 }

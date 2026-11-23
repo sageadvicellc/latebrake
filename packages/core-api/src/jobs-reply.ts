@@ -4,9 +4,8 @@ import { hasPlanUnsafeChar, hasUnsafeChar } from '../../engine-sessions/src/text
 import { isBilling } from '../../engine-sessions/src/vocab.js';
 import { MAX_JOB_SESSIONS, canonicalDefinition, checkDefinition, checkTaskText, hashDefinition, isLabel, isTitle, type JobDefinition } from '../../jobs/src/definition.js';
 import { checkJobId, isRunId } from '../../jobs/src/ids.js';
-import type { RunSessionPlan } from '../../jobs/src/runs.js';
 import { HEX_64, MAX_PROGRAM_LENGTH, denseTexts, isEngineName, isRecord, isVariableName, orderedNames, ownData } from './reading.js';
-import { JOB_KINDS, type JobKind, type JobListing, type JobPlan, type JobRecord, type RunPlan, type RunSessionSummary, type RunSummary } from './types.js';
+import { JOB_KINDS, type JobKind, type JobListing, type JobPlan, type JobRecord, type RunPlan, type RunPlanSession, type RunSessionSummary, type RunSummary } from './types.js';
 
 /**
  * The readers of a reply to a job or a run call. Each reads own data properties only, once, checks every field, and gives a new frozen value, or `undefined` when the reply is not one. The client turns
@@ -81,7 +80,7 @@ export function jobPlanOf(value: unknown): JobPlan | undefined {
 /** True when two definitions are the same: the same canonical text. */
 export const sameDefinition = (left: JobDefinition, right: JobDefinition): boolean => canonicalDefinition(left) === canonicalDefinition(right);
 
-function runSessionPlanOf(value: unknown): RunSessionPlan | undefined {
+function runSessionPlanOf(value: unknown): RunPlanSession | undefined {
   if (!isRecord(value) || Reflect.ownKeys(value).length !== 11) return undefined;
   const label = ownData(value, 'label'), engine = ownData(value, 'engine'), engineTitle = ownData(value, 'engineTitle'), harness = ownData(value, 'harness'), program = ownData(value, 'program'), folder = ownData(value, 'folder');
   const rawModel = ownData(value, 'model'), billing = ownData(value, 'billing'), variables = orderedNames(ownData(value, 'variables'), isVariableName), sharedWith = orderedNames(ownData(value, 'sharedWith'), isEngineName), task = ownData(value, 'task');
@@ -104,7 +103,7 @@ export function runPlanOf(value: unknown): RunPlan | undefined {
   const items = readList(ownData(value, 'sessions'), MAX_JOB_SESSIONS), steps = stepsOf(ownData(value, 'steps')), digest = ownData(value, 'digest'), nonce = ownData(value, 'nonce');
   if (action !== 'run' || !checkEngineId(gauge).ok || typeof gauge !== 'string' || !checkJobId(job).ok || typeof job !== 'string' || !isTitle(title) || typeof shared !== 'boolean') return undefined;
   if (items === undefined || items.length === 0 || steps === undefined || !hex(digest) || !hex(nonce)) return undefined;
-  const sessions: RunSessionPlan[] = [];
+  const sessions: RunPlanSession[] = [];
   for (const item of items) {
     const session = runSessionPlanOf(item);
     if (session === undefined || sessions.some(earlier => earlier.label === session.label)) return undefined;

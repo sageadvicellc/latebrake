@@ -14,7 +14,10 @@ export { isRunId };
  * group of its sessions, and undoes a run whose start failed part way. It never starts an engine that the plan does not list, and no call adds a session to a run that has begun.
  */
 
-/** What the person approves for one session of a run. `sharedWith` lists every other engine in the folder: those that run there now and those that the run starts there. */
+/**
+ * What the person approves for one session of a run. `sharedWith` lists every other engine in the folder: those that run there now and those that the run starts there. `program` and `folder` are real paths: a link is followed.
+ * `requestedFolder` is the folder as the job names it, and `configuredProgram` is the program as the engine is configured. A core shows the real values to the person, and the others to a Gauge.
+ */
 export interface RunSessionPlan {
   readonly label: string;
   readonly engine: string;
@@ -27,6 +30,8 @@ export interface RunSessionPlan {
   readonly variables: readonly string[];
   readonly sharedWith: readonly string[];
   readonly task: string;
+  readonly requestedFolder: string;
+  readonly configuredProgram: string;
 }
 
 /** What the person approves for a run: every session, in the order of the job. `shared` is true when any session shares its folder, and then the run needs the second approval. */
@@ -226,6 +231,7 @@ export function createRunBook(options: RunBookOptions): RunBook {
         return Object.freeze({
           label: defined.label, engine: start.engine, engineTitle: start.title, harness: defined.harness, program: start.program, folder: start.folder, model: start.model, billing: start.billing,
           variables: Object.freeze([...start.variables]), sharedWith: Object.freeze(sortedUnique([...start.sharedWith, ...others])), task: defined.task,
+          requestedFolder: start.requestedFolder, configuredProgram: start.configuredProgram,
         });
       });
       const plan: RunPlanContent = Object.freeze({ job: job.id, title: job.definition.title, shared: sessions.some(session => session.sharedWith.length > 0), sessions: Object.freeze(sessions) });

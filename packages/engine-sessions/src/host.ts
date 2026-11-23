@@ -10,6 +10,24 @@ import { isTerminal, type SessionState } from './states.js';
 import { escapeText, hasUnsafeChar } from './text.js';
 import { BILLING_SOURCES, KEEP_ENDED_SESSIONS, MAX_START_GROUP, isBilling, type Billing, type NotFoundReason, type StartFailedReason } from './vocab.js';
 
+/**
+ * The error of a begin whose plan no longer matches the state: the host planned again, and the answer was another plan. The core plans again in the same tick, so this happens only when the world moves between its read
+ * and the host's: a link that was swapped for another folder between the two reads of it. No session was made and nothing started. A core turns it into a changed plan. Any other mistake of a caller is a plain error.
+ */
+export class StalePlanError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StalePlanError';
+    // The mark does not show when the error is listed or copied. With the name, it tells a stale plan of another copy of this module, which `instanceof` does not.
+    // It protects against accidents (a second copy of the module), and not against code in this process that means to forge it: such code can set a name and a mark too.
+    Object.defineProperty(this, 'stalePlan', { value: true, enumerable: false });
+  }
+}
+
+/** True for a `StalePlanError` of this module or of another copy of it: by its class, or by its name and its mark together. A name alone, or a mark alone, is not enough. */
+export const isStalePlanError = (error: unknown): error is StalePlanError => error instanceof StalePlanError
+  || (error instanceof Error && error.name === 'StalePlanError' && Object.getOwnPropertyDescriptor(error, 'stalePlan')?.value === true);
+
 export { BILLING_SOURCES };
 export type { Billing };
 
@@ -77,7 +95,11 @@ export interface HostOptions {
   readonly newId?: () => string;
 }
 
-/** What a start plan holds. `variables` are those the engine declares and those the person allowed, sorted. `sharedWith` are the engines that already run in the folder, sorted. */
+/**
+ * What a start plan holds. `variables` are those the engine declares and those the person allowed, sorted. `sharedWith` are the engines that already run in the folder, sorted.
+ * `program` and `folder` are real paths: a link is followed. `requestedFolder` is the folder as the caller wrote it, and `configuredProgram` is the program as the engine is configured. A core shows the real
+ * values to the person who approves, and the values as they were written to a Gauge, so a Gauge learns no path behind a link. The host plans again from `requestedFolder`, so a link that moved makes a plan stale.
+ */
 export interface StartPlanContent {
   readonly engine: string;
   readonly title: string;
@@ -87,6 +109,8 @@ export interface StartPlanContent {
   readonly billing: Billing;
   readonly variables: readonly string[];
   readonly sharedWith: readonly string[];
+  readonly requestedFolder: string;
+  readonly configuredProgram: string;
 }
 
 /** What a stop plan holds. `force` is true when the session is stopping already, and the stop sends the signal that cannot be ignored. */
@@ -94,14 +118,17 @@ export interface StopPlanContent {
   readonly session: string;
   readonly engine: string;
   readonly folder: string;
+  /** The folder as the session was asked for. */
+  readonly requestedFolder: string;
   readonly force: boolean;
 }
 
-/** What a read of a session gives. It holds no output of the engine. */
+/** What a read of a session gives. It holds no output of the engine. `folder` is the real folder, and `requestedFolder` is the folder as the session was asked for. */
 export interface SessionInfo {
   readonly id: string;
   readonly engine: string;
   readonly folder: string;
+  readonly requestedFolder: string;
   readonly state: SessionState;
   readonly billing: Billing;
   readonly model: ModelChoice | null;
@@ -191,6 +218,7 @@ interface Tracked {
   readonly session: Session;
   readonly engine: EngineSpec;
   readonly folder: string;
+  readonly requestedFolder: string;
   readonly model: ModelChoice | null;
   /** The key of the folder, which the pair rule and the shared folder rule compare. `folder` is for display. */
   readonly key: string;
@@ -381,6 +409,13 @@ export function createEngineHost(options: HostOptions): EngineHost {
     logged.add(key);
     report(log, { session: '', from: 'detected', to: 'detected', message: `engine host: ${message}` });
   };
+  /** The engines whose program was logged as a mistake of the configuration. One flag for each engine and kind, so at most twice the engines (16 at most), and no request can clear it. */
+  const warned = new Set<string>();
+  const warn = (key: string, message: string): void => {
+    if (warned.has(key)) return;
+    warned.add(key);
+    report(log, { session: '', from: 'detected', to: 'detected', message: `engine host: ${message}` });
+  };
   const locate = options.locate ?? ((program: string) => locateProgram(program, (folder, code) => logOnce(`program\u0000${folder}\u0000${code}`, `could not search the folder ${escapeText(folder)} for the program: ${escapeText(code)}`)));
   const canonical = options.canonical ?? ((folder: string) => canonicalFolder(folder, code => logOnce(`folder\u0000${folder}\u0000${code}`, `could not read the folder ${escapeText(folder)}: ${escapeText(code)}`)));
   const log = options.log;
@@ -393,7 +428,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
   let closed = false;
 
   const info = (record: Tracked): SessionInfo => Object.freeze({
-    id: record.session.id, engine: record.engine.id, folder: record.folder, state: record.session.state, billing: record.engine.billing,
+    id: record.session.id, engine: record.engine.id, folder: record.folder, requestedFolder: record.requestedFolder, state: record.session.state, billing: record.engine.billing,
     model: record.model === null ? null : Object.freeze({ provider: record.model.provider, model: record.model.model }), failure: record.session.failure,
   });
   /** The sessions that hold a place: those that have not ended, and those that have ended in state while their process still lives, because a process that lives is a process that runs. */
@@ -533,6 +568,12 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!spec) return notFound('engine');
     // The denylist is for the names that a caller asks for. A name that the engine declares itself passes, since the plan lists it and a plan that is planned again must be accepted.
     if (allowed.value.some(name => isRefusedVariable(name) && !spec.env.includes(name))) return invalid('variables');
+    // The program as the engine is configured is shown to a Gauge, so it is held to the same rule as the real path, and before the program is looked for: a program that is not there is still a mistake of the configuration.
+    // It is a mistake that the person must find, so it is logged once for each engine, in a record of its own that no request can clear.
+    if (hasUnsafeChar(spec.program)) {
+      warn(`configured:${spec.id}`, `the program of the engine ${spec.id} is configured with a control, format, or separator character: ${escapeText(spec.program)}`);
+      return notFound('program_missing');
+    }
     const located = locate(spec.program);
     if (located === undefined) return notFound('program_missing');
     if (typeof located !== 'string') {
@@ -542,7 +583,10 @@ export function createEngineHost(options: HostOptions): EngineHost {
     }
     const program = located;
     // A program whose path holds a control or separator character is not offered to the person: the plan shows the real path as it is.
-    if (hasUnsafeChar(program)) return notFound('program_missing');
+    if (hasUnsafeChar(program)) {
+      warn(`real:${spec.id}`, `the real path of the program of the engine ${spec.id} holds a control, format, or separator character: ${escapeText(program)}`);
+      return notFound('program_missing');
+    }
     const real = canonical(folder.value);
     if (real === undefined || !checkFolder(real.path).ok) return invalid('folder');
     if (typeof real.key !== 'string' || real.key === '') throw new Error('engine host: canonical gave a folder with no key');
@@ -561,6 +605,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
         engine: spec.id, title: spec.title, program, folder: real.path, model: model.value, billing: spec.billing,
         variables: Object.freeze(variables),
         sharedWith: Object.freeze(sorted(live.filter(record => record.key === real.key).map(record => record.engine))),
+        requestedFolder: folder.value, configuredProgram: spec.program,
       }),
     };
   }
@@ -581,8 +626,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
     return Object.fromEntries(entries);
   }
 
-  /** The request that makes a plan again. */
-  const requestOf = (plan: StartPlanContent): unknown => ({ engine: plan.engine, folder: plan.folder, model: plan.model, variables: plan.variables });
+  /** The request that makes a plan again: from the folder as it was asked for, so a link that moved gives another plan. */
+  const requestOf = (plan: StartPlanContent): unknown => ({ engine: plan.engine, folder: plan.requestedFolder, model: plan.model, variables: plan.variables });
 
   function beginStart(plan: StartPlanContent, approvals: { readonly sharedApproved: boolean }): BegunStart | HostRefusal {
     // The caller's objects are read once. Everything below runs from the plan that the host made itself and checked, and never from a second read of the caller's plan.
@@ -591,7 +636,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!fresh.ok) return fresh;
     const verified = fresh.plan;
     // The core plans again from live state, in the same tick, before it calls this. A plan that differs here is a bug in the caller, so it throws.
-    if (JSON.stringify(verified) !== JSON.stringify(plan)) throw new Error('engine host: the plan does not match the state now, so the core must plan again before it begins a start');
+    if (JSON.stringify(verified) !== JSON.stringify(plan)) throw new StalePlanError('engine host: the plan does not match the state now, so the core must plan again before it begins a start');
     // Only the value true is the second approval: a truthy value of another kind is not.
     if (verified.sharedWith.length > 0 && sharedApproved !== true) return refusal('ENGINE_FOLDER_SHARED');
     return startVerified(verified, fresh.key);
@@ -629,7 +674,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     let resolveStarted: Tracked['resolveStarted'] = () => undefined;
     const started = new Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal>(resolve => { resolveStarted = resolve; });
     const record: Tracked = {
-      session: createSession(id, sink, () => leftStarting(record)), engine: spec, folder: verified.folder, key, model: verified.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [], secrets, tailMargin, sink,
+      session: createSession(id, sink, () => leftStarting(record)), engine: spec, folder: verified.folder, requestedFolder: verified.requestedFolder, key, model: verified.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [], secrets, tailMargin, sink,
       killedByHost: false, startReason: undefined, resolveStarted,
     };
     records.set(id, record);
@@ -730,10 +775,12 @@ export function createEngineHost(options: HostOptions): EngineHost {
     const own = (key: string): unknown => { const descriptor = Object.getOwnPropertyDescriptor(value, key); return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined; };
     const texts = (item: unknown): string[] => { const list = readList(item, MAX_VARIABLES); return list !== undefined && list.every((entry): entry is string => typeof entry === 'string') ? list : bad(); };
     const engine = own('engine'), title = own('title'), program = own('program'), folder = own('folder'), billing = own('billing'), model = checkModel(own('model'));
+    const requestedFolder = own('requestedFolder'), configuredProgram = own('configuredProgram');
     if (typeof engine !== 'string' || typeof title !== 'string' || typeof program !== 'string' || typeof folder !== 'string' || !model.ok || own('model') === undefined) return bad();
+    if (typeof requestedFolder !== 'string' || typeof configuredProgram !== 'string') return bad();
     if (!isBilling(billing)) return bad();
     return Object.freeze({
-      engine, title, program, folder, model: model.value, billing, variables: Object.freeze(texts(own('variables'))), sharedWith: Object.freeze(texts(own('sharedWith'))),
+      engine, title, program, folder, model: model.value, billing, variables: Object.freeze(texts(own('variables'))), sharedWith: Object.freeze(texts(own('sharedWith'))), requestedFolder, configuredProgram,
     });
   }
 
@@ -764,7 +811,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     const fresh = planGroup(given.map(requestOf));
     if (!fresh.ok) return fresh;
     // The caller plans again in the same tick, before it calls this. Plans that differ here, or that come in another order, are a bug in the caller, so it throws.
-    if (JSON.stringify(fresh.plans) !== JSON.stringify(given)) throw new Error('engine host: the plans do not match the state now, so the core must plan again before it begins a group');
+    if (JSON.stringify(fresh.plans) !== JSON.stringify(given)) throw new StalePlanError('engine host: the plans do not match the state now, so the core must plan again before it begins a group');
     const unapproved = fresh.plans.findIndex(plan => plan.sharedWith.length > 0);
     if (unapproved !== -1 && sharedApproved !== true) return { ok: false, code: 'ENGINE_FOLDER_SHARED', index: unapproved };
     const members: BegunStart[] = [];
@@ -789,7 +836,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!record) return refusal('ENGINE_SESSION_UNKNOWN');
     // A session that has ended but whose program has not been seen to go still holds its place, and its kill may have been refused. A stop of it is the kill again, and it is a forced stop.
     if (isTerminal(record.session.state) && record.exited) return refusal('ENGINE_SESSION_ENDED');
-    return { ok: true, plan: Object.freeze({ session: id.value, engine: record.engine.id, folder: record.folder, force: record.session.state === 'stopping' || isTerminal(record.session.state) }) };
+    return { ok: true, plan: Object.freeze({ session: id.value, engine: record.engine.id, folder: record.folder, requestedFolder: record.requestedFolder, force: record.session.state === 'stopping' || isTerminal(record.session.state) }) };
   }
 
   function beginStop(sessionId: unknown): BegunStop | HostRefusal {

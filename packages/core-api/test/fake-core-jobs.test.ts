@@ -36,9 +36,12 @@ export function makeJobsRig(folders: readonly GaugeFolder[], options: { readonly
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jobs-suite-')));
   roots.push(root);
   const launcher = recording(createProcessLauncher());
+  // The engines are configured with a link to the program, so that the real program is another path from the one that a Gauge reads.
+  const programLink = path.join(root, 'engine-program');
+  fs.symlinkSync(process.execPath, programLink);
   const engines = JOB_ENGINES.map(fixture => {
     const spec = fakeEngine({ id: fixture.id, tag, steps: fixture.steps, ...(fixture.env === undefined ? {} : { env: fixture.env }), ...(fixture.takesModel === true ? { takesModel: true } : {}) });
-    return fixture.missing === true ? { ...spec, program: path.join(root, 'no-such-program') } : spec;
+    return fixture.missing === true ? { ...spec, program: path.join(root, 'no-such-program') } : { ...spec, program: programLink };
   });
   const host = createEngineHost({ engines, launcher, stopTimeoutMs: options.stopTimeoutMs ?? 250, environment: () => SESSION_ENVIRONMENT });
   const fake = createFakeCore({ folders, now: () => now, engineHost: host, jobIds: () => `job-${(jobs += 1)}`, runIds: () => `run-${(runs += 1)}` });
@@ -51,6 +54,8 @@ export function makeJobsRig(folders: readonly GaugeFolder[], options: { readonly
     approveShared: plan => fake.approveShared(plan.nonce),
     advance: milliseconds => { now += milliseconds; },
     folder: name => { const full = path.join(root, name); fs.mkdirSync(full, { recursive: true }); return full; },
+    link: (name, target) => { const full = path.join(root, name); fs.symlinkSync(target, full); return full; },
+    person: plan => fake.personRunPlan(plan.nonce).sessions.map(session => ({ label: session.label, folder: session.realFolder, program: session.realProgram, sharedWith: session.allSharedWith })),
     launches: () => host.launched,
     close: async () => { await host.killAll(); await assertNoLeaks(tag); },
   };

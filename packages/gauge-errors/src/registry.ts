@@ -36,7 +36,7 @@ const ENTRIES = [
   // Layout
   { code: 'GAUGE_LAYOUT_INVALID', meaning: 'The layout file does not match the layout rules.' },
   // Plans
-  { code: 'GAUGE_PLAN_NOT_APPROVED', meaning: 'The write needs a plan that the person has approved, and none was approved.' },
+  { code: 'GAUGE_PLAN_NOT_APPROVED', meaning: 'The write needs an approval that is missing: the plan has no approval, or it needs a second approval that the person has not given.' },
   { code: 'GAUGE_PLAN_CHANGED', meaning: 'The plan to run is not the plan the person approved.' },
   // Engine sessions
   { code: 'ENGINE_NOT_FOUND', meaning: 'No engine has that id, or its program is missing or cannot run. The reason says which.' },

@@ -3,7 +3,7 @@ export { CoreProtocolError, createCoreClient } from './client.js';
 export type { CoreClient } from './client.js';
 export { ENGINE_CODES, JOB_CODES, JOB_KINDS, LAYOUT_KINDS, PLAN_ACTIONS, SESSION_ACTIONS } from './types.js';
 export type {
-  AuditEntry, AuditRead, CoreRefusal, Core, CoreMethod, CoreReply, CoreResult, GaugeApplied, GaugePlan, GaugeSummary, GrantApplied, GrantEntry, GrantPlan, GrantRevoked, LayoutApplied, LayoutKind, LayoutPlan, LayoutRevisionEntry, LayoutSafe, LayoutState, PermissionCheck, PlanAction, EngineCode, SessionAction, SessionApplied, SessionModel, SessionPlan, SessionSummary,
-  JobApplied, JobCode, JobKind, JobListing, JobPlan, JobReasonCode, JobRecord, RefusalExtras, RunRollbackCode, RunPlan, RunSessionSummary, RunSummary,
+  AuditEntry, AuditRead, CoreRefusal, Core, CoreMethod, CoreReply, CoreResult, GaugeApplied, GaugePlan, GaugeSummary, GrantApplied, GrantEntry, GrantPlan, GrantRevoked, LayoutApplied, LayoutKind, LayoutPlan, LayoutRevisionEntry, LayoutSafe, LayoutState, PermissionCheck, PersonNotice, PersonNoticeCause, PersonPlan, PersonRunPlan, PersonRunPlanSession, PersonSessionPlan, PersonView, PlanAction, EngineCode, SessionAction, SessionApplied, SessionModel, SessionPlan, SessionSummary,
+  JobApplied, JobCode, JobKind, JobListing, JobPlan, JobReasonCode, JobRecord, RefusalExtras, RunRollbackCode, RunPlan, RunPlanSession, RunSessionSummary, RunSummary,
 } from './types.js';
 export { DEFAULT_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES } from './grants.js';

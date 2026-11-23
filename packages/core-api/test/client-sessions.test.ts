@@ -148,6 +148,9 @@ test('a plan for another action, Gauge, engine, session, model, or variable than
   await assert.rejects(starting(STOP), protocolError('bowerloom.sessions.plan'), 'a stop for a start');
   await assert.rejects(starting({ ...START, gauge: 'fixture-other' }), protocolError('bowerloom.sessions.plan'), 'another Gauge');
   await assert.rejects(starting({ ...START, engine: 'fixture-other' }), protocolError('bowerloom.sessions.plan'), 'another engine');
+  // A Gauge reads the folder as it asked for it, never the real folder behind a link: a core that answers with another folder is refused.
+  await assert.rejects(starting({ ...START, folder: '/real/alpha' }), protocolError('bowerloom.sessions.plan'), 'a real folder instead of the folder that was asked for');
+  assert.ok((await starting({ ...START, folder: '/link/alpha' }, { engine: 'fixture-engine', folder: '/link/alpha' })).ok);
   await assert.rejects(starting({ ...START, model }), protocolError('bowerloom.sessions.plan'), 'a model that was not asked');
   await assert.rejects(starting(START, { engine: 'fixture-engine', folder: '/work/alpha', model }), protocolError('bowerloom.sessions.plan'), 'a model left out');
   await assert.rejects(starting({ ...START, model: { provider: 'p', model: 'other' } }, { engine: 'fixture-engine', folder: '/work/alpha', model }), protocolError('bowerloom.sessions.plan'), 'another model');

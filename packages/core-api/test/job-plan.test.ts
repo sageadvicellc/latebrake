@@ -81,7 +81,7 @@ test('a value cannot add a line or forge one: the title, the folder, and the gau
   assert.ok(steps.some(line => line.includes('folder /work/b\\u{301} c,')));
 });
 
-const SHARE = { sharedWith: [] as readonly string[] };
+const SHARE = { sharedWith: [] as readonly string[], requestedFolder: null };
 const RUN: RunStepsInput = {
   gauge: 'fixture-jobber', job: 'job-1', title: 'Morning review', shared: false,
   sessions: [
@@ -159,4 +159,17 @@ test('a plan that is missing the definition or the job it needs is a bug of the 
   assert.throws(() => jobSteps({ kind: 'update', gauge: 'g', job: 'job-1', before: null, definition: defined(), baseHash: HASH_A, nextHash: HASH_B }), /job/);
   assert.throws(() => jobSteps({ kind: 'delete', gauge: 'g', job: 'job-1', before: null, definition: null, baseHash: HASH_A, nextHash: null }), /job/);
   assert.throws(() => jobSteps({ kind: 'delete', gauge: 'g', job: null, before: defined(), definition: null, baseHash: HASH_A, nextHash: null }), /id/);
+});
+
+test('a run plan for the person says when the job names a folder in another way than the real one', () => {
+  const steps = runSteps({ ...RUN, sessions: [{ ...RUN.sessions[0]!, folder: '/real/alpha', requestedFolder: '/link/alpha' }, { ...RUN.sessions[1]!, requestedFolder: '/work/beta' }] });
+  assert.deepEqual(steps.slice(1, 5), [
+    'session 1 of 2, writer: the engine fixture-engine (Fixture Engine), harness plain-harness',
+    'program: /usr/bin/fake',
+    'folder: /real/alpha',
+    'the job names the folder of session 1 as /link/alpha',
+  ]);
+  assert.equal(steps.filter(line => line.includes('the job names the folder')).length, 1, 'a session whose name is the real folder says nothing more');
+  assert.equal(steps.length, runSteps(RUN).length + 1);
+  assert.ok(runSteps({ ...RUN, sessions: [{ ...RUN.sessions[0]!, folder: '/real/alpha', requestedFolder: 'a\nb' }] }).includes('the job names the folder of session 1 as a\\u{a}b'));
 });

@@ -93,6 +93,8 @@ export interface RunStepsSession {
   readonly harness: string;
   readonly program: string;
   readonly folder: string;
+  /** The folder as the job names it, in the plan of the person: when it is not the folder above, the plan says so. `null` in the plan of a Gauge, whose folder is the one the job names. */
+  readonly requestedFolder: string | null;
   readonly model: ModelChoice | null;
   readonly billing: Billing;
   readonly variables: readonly string[];
@@ -117,12 +119,14 @@ const BILLING_TEXT: Readonly<Record<Billing, string>> = {
  * The lines of a run plan, which the person reads and approves once for the whole run. This is the contract, in this order. Every value goes through `escapeForPlan`.
  *
  * 1. `Gauge <gauge> asks to run the job <id>, <title>: <n> session(s) start(s) together`
- * 2. For each session, in the order of the job: `session <i> of <n>, <label>: the engine <engine> (<title>), harness <harness>`, then `program:`, `folder:`, the model line, the billing line, `variables passed:`,
- *    and the task (the full count of characters and the first 120). A session that shares its folder has `notice for session <i>: <engines> also run(s) in this folder, and two engines in one folder can overwrite each other's files`.
+ * 2. For each session, in the order of the job: `session <i> of <n>, <label>: the engine <engine> (<title>), harness <harness>`, then `program:`, `folder:` (the plan of the person shows the real program and the real folder, and the plan of a Gauge shows
+ *    the program as the engine is configured and the folder as the job names it), the model line, the billing line, `variables passed:`, and the task (the full count of characters and the first 120).
+ *    In the plan of the person, a session whose folder the job names in another way than the real one has `the job names the folder of session <i> as <name>` after its `folder:` line.
+ *    A session that shares its folder has `notice for session <i>: <engines> also run(s) in this folder, and two engines in one folder can overwrite each other's files`: the plan of the person names every engine, and the plan of a Gauge names the engines it may read only.
  * 3. The closing lines, in this order: how the programs start, that the core never answers a permission prompt, that the core does not send a task to an engine, the harness line (as in a job plan), that the run waits until every
  *    session has said that it runs (and a session that has not said so when the start timeout of the host ends counts as failed), what happens when a session fails (the sessions that started are stopped, only the first failure is
  *    reported, and a session that cannot be stopped is left running for the person to stop), and that the run is interactive.
- * 4. When any session shares a folder: `a second approval is needed, once for the whole run, for the shared folder`
+ * 4. When any session shares a folder (for a Gauge: a folder shared with an engine it may read): `a second approval is needed, once for the whole run, for the shared folder`
  * 5. `start every program in its folder at once, and keep each session until it stops or fails`
  */
 export function runSteps(input: RunStepsInput): string[] {
@@ -134,6 +138,7 @@ export function runSteps(input: RunStepsInput): string[] {
       `session ${at} of ${total}, ${escapeForPlan(session.label)}: the engine ${escapeForPlan(session.engine)} (${escapeForPlan(session.engineTitle)}), harness ${escapeForPlan(session.harness)}`,
       `program: ${escapeForPlan(session.program)}`,
       `folder: ${escapeForPlan(session.folder)}`,
+      ...(session.requestedFolder !== null && session.requestedFolder !== session.folder ? [`the job names the folder of session ${at} as ${escapeForPlan(session.requestedFolder)}`] : []),
       session.model === null ? "model: the engine's own default, and the core picks none" : `model: ${escapeForPlan(session.model.provider)} ${escapeForPlan(session.model.model)}, as the job says`,
       BILLING_TEXT[session.billing],
       `variables passed: ${session.variables.length > 0 ? session.variables.map(escapeForPlan).join(', ') : 'none'}`,

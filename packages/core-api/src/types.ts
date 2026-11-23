@@ -6,7 +6,7 @@ import type { SessionFailure } from '../../engine-sessions/src/session.js';
 import type { SessionState } from '../../engine-sessions/src/states.js';
 import type { Billing, NotFoundReason, StartFailedReason } from '../../engine-sessions/src/vocab.js';
 import type { JobReason, JobSession, NotInteractiveReason } from '../../jobs/src/definition.js';
-import type { RunMember, RunSessionPlan, RunSessionState } from '../../jobs/src/runs.js';
+import type { RunMember, RunSessionState } from '../../jobs/src/runs.js';
 
 /** The wire names of the calls the core offers. Wire identifiers keep the `bowerloom` prefix until the rename. */
 export type CoreMethod =
@@ -208,12 +208,15 @@ export type SessionAction = (typeof SESSION_ACTIONS)[number];
 export type SessionModel = ModelChoice;
 
 /**
- * What a start or a stop of a session would do, shown to the person before anything changes. `gauge` is the Gauge that asked. `engine` and `folder` are the engine and the real folder of the session
- * (a link is followed, so two names for one folder are one folder). The fields of a start: `program` is the real path of the program, `model` is the choice (or `null` for the engine's own default),
- * `billing` is where the tokens are billed, `variables` are the names that pass to the program (those the engine declares and those the person allowed, sorted), and `sharedWith` are the engines
- * that already run in the folder (sorted): a start with some needs a second approval. The fields of a stop: `session` is the session to stop and `force` is true when it is stopping already,
- * and the stop sends the signal that cannot be ignored. A field that the action does not use is `null`, `[]`, or `false`. `digest` is the SHA-256 of the plan, and `nonce` is issued by the core and is
- * exactly 64 lowercase hexadecimal characters. A Gauge never makes an approval.
+ * What a start or a stop of a session would do. The core makes two views of one plan, which differ in four fields only. The person who approves reads the full plan. A Gauge reads a plan whose `folder` is the folder
+ * as it asked for it (so it learns no path behind a link), whose `program` is the program as the engine is configured (the same reason), whose `sharedWith` holds only the engines that the Gauge may read (`sessions.read`),
+ * and whose `steps` are the text of those values. `digest` is the digest of the full plan, so it is the same in both views, and an approval of the full plan is an approval of what a Gauge applies.
+ *
+ * `gauge` is the Gauge that asked. `engine` is the engine of the session. The fields of a start: `folder` (the real folder in the full plan, with a link followed, so two names for one folder are one folder), `program` (the real
+ * path of the program in the full plan), `model` is the choice (or `null` for the engine's own default), `billing` is where the tokens are billed, `variables` are the names that pass to the program (those the engine declares and
+ * those the person allowed, sorted), and `sharedWith` are the engines that already run in the folder (sorted): a start with some needs a second approval. The fields of a stop: `session` is the session to stop and `force` is true when it
+ * is stopping already, and the stop sends the signal that cannot be ignored. A field that the action does not use is `null`, `[]`, or `false`. `digest` is a keyed hash of the full plan and the nonce, which only the core can work out:
+ * a Gauge cannot test a guess of a hidden path or a hidden engine against it. `nonce` is issued by the core and is exactly 64 lowercase hexadecimal characters. A Gauge never makes an approval.
  */
 export interface SessionPlan {
   readonly action: SessionAction;
@@ -240,7 +243,7 @@ export interface SessionApplied {
   readonly state: SessionState;
 }
 
-/** What a read of a session gives. It holds no output of the engine: reading output is a stream, and needs the `sessions.stream` permission. */
+/** What a read of a session gives. It holds no output of the engine: reading output is a stream, and needs the `sessions.stream` permission. `folder` is the folder as the session was asked for, and never the real folder behind a link. */
 export interface SessionSummary {
   readonly id: string;
   readonly engine: string;
@@ -295,9 +298,24 @@ export interface JobApplied {
   readonly job: string;
 }
 
+/** One session of a run plan, as a Gauge reads it: the program as configured, the folder as the job names it, and the engines that share the folder that the Gauge may read (see `SessionPlan`). */
+export interface RunPlanSession {
+  readonly label: string;
+  readonly engine: string;
+  readonly engineTitle: string;
+  readonly harness: string;
+  readonly program: string;
+  readonly folder: string;
+  readonly model: ModelChoice | null;
+  readonly billing: Billing;
+  readonly variables: readonly string[];
+  readonly sharedWith: readonly string[];
+  readonly task: string;
+}
+
 /**
- * What a run would do, shown to the person before anything starts: every session of the run, in the order of the job, with its real program, its real folder, and what it shares. `shared` is true when any session
- * shares its folder with another engine, and then the run needs the second approval, once for the whole run. `digest` binds the plan to the job as it is now and to the state of the host. A run starts
+ * What a run would do, shown to the person before anything starts: every session of the run, in the order of the job, with its real program, its real folder, and what it shares (a Gauge reads the trimmed view of `RunPlanSession`). `shared` is true when any session
+ * shares its folder with another engine, and then the run needs the second approval, once for the whole run (in a Gauge's view, only when it may read an engine that shares). `digest` is a keyed hash of the full plan and the nonce, and it binds the plan to the job as it is now and to the state of the host. A run starts
  * through this one plan: an engine never starts another engine, and no call adds a session to a run.
  */
 export interface RunPlan {
@@ -306,10 +324,92 @@ export interface RunPlan {
   readonly job: string;
   readonly title: string;
   readonly shared: boolean;
-  readonly sessions: readonly RunSessionPlan[];
+  readonly sessions: readonly RunPlanSession[];
   readonly steps: readonly string[];
   readonly digest: string;
   readonly nonce: string;
+}
+
+/**
+ * The plan of a start or a stop as the person reads it, and the only thing that an approval screen may be built from. It is a type of its own, with its own names, so that no plan of the person can be given as a reply that a
+ * Gauge reads, and no plan that a Gauge read can stand for it: the real folder is `realFolder` (not `folder`), the real path of the program is `realProgram`, and every engine in the folder is `allSharedWith`. `requestedFolder` and
+ * `configuredProgram` are what a Gauge reads as `folder` and `program`. `digest` and `nonce` are those of the plan that the Gauge read.
+ */
+export interface PersonSessionPlan {
+  readonly action: SessionAction;
+  readonly gauge: string;
+  readonly engine: string;
+  readonly realFolder: string;
+  readonly requestedFolder: string;
+  readonly session: string | null;
+  readonly realProgram: string | null;
+  readonly configuredProgram: string | null;
+  readonly model: SessionModel | null;
+  readonly billing: Billing;
+  readonly variables: readonly string[];
+  readonly allSharedWith: readonly string[];
+  readonly force: boolean;
+  readonly steps: readonly string[];
+  readonly digest: string;
+  readonly nonce: string;
+}
+
+/** One session of a run plan as the person reads it (see `PersonSessionPlan`). */
+export interface PersonRunPlanSession {
+  readonly label: string;
+  readonly engine: string;
+  readonly engineTitle: string;
+  readonly harness: string;
+  readonly realProgram: string;
+  readonly configuredProgram: string;
+  readonly realFolder: string;
+  readonly requestedFolder: string;
+  readonly model: ModelChoice | null;
+  readonly billing: Billing;
+  readonly variables: readonly string[];
+  readonly allSharedWith: readonly string[];
+  readonly task: string;
+}
+
+/** A run plan as the person reads it (see `PersonSessionPlan`). `shared` is true when any session shares its folder with any engine. */
+export interface PersonRunPlan {
+  readonly action: 'run';
+  readonly gauge: string;
+  readonly job: string;
+  readonly title: string;
+  readonly shared: boolean;
+  readonly sessions: readonly PersonRunPlanSession[];
+  readonly steps: readonly string[];
+  readonly digest: string;
+  readonly nonce: string;
+}
+
+export type PersonPlan = PersonSessionPlan | PersonRunPlan;
+
+/**
+ * What a core must offer to the part that shows the person a plan before it approves it. It is not on the `Core` seam: no call reaches it, and so no Gauge can. An approval screen is built from `personView(nonce)`, and never from the
+ * plan that a Gauge read, which lacks the real folder, the real program, and the engines that the Gauge may not read. A nonce that the core did not issue, or whose plan is retired, is a `TypeError`.
+ */
+export interface PersonView {
+  personView(nonce: string): PersonPlan;
+}
+
+/** Why the person is told something that a Gauge is not: the second approval that a plan needs was not given, or the plan changed for a cause that the Gauge cannot read (an engine began or ended in the folder, or a link moved). */
+export type PersonNoticeCause = 'second_approval_missing' | 'plan_changed_hidden';
+
+/**
+ * What the core tells the person when it gives a Gauge a refusal that holds back the cause. `shown` is the refusal that the Gauge got. `engines` are all the engines in the folder, those that the Gauge may read and those that it may not.
+ * `member` is the true session of a run that shares its folder, and `null` for a start. A real core shows this to the person, and never to a Gauge.
+ */
+export interface PersonNotice {
+  readonly action: 'start' | 'run';
+  readonly gauge: string;
+  /** The nonce of the plan, so the person can tell which plan a notice is about, and a Gauge that asks again for the same plan makes one notice. */
+  readonly nonce: string;
+  readonly shown: 'ENGINE_FOLDER_SHARED' | 'GAUGE_PLAN_NOT_APPROVED' | 'GAUGE_PLAN_CHANGED';
+  readonly cause: PersonNoticeCause;
+  readonly engines: readonly string[];
+  readonly member: RunMember | null;
 }
 
 /**

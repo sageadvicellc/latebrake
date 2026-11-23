@@ -171,3 +171,7 @@ test('the job and run codes name what they refuse, in one line each', () => {
   assert.equal(GAUGE_MEANINGS.GAUGE_RUN_UNKNOWN, 'No run has that id.');
   assert.equal(GAUGE_MEANINGS.GAUGE_RUN_ROLLBACK_FAILED, 'A session of the run failed to start, and a session that had started could not be stopped.');
 });
+
+test('the code for a missing approval says that a required approval is missing, and not that the plan has none', () => {
+  assert.equal(GAUGE_MEANINGS.GAUGE_PLAN_NOT_APPROVED, 'The write needs an approval that is missing: the plan has no approval, or it needs a second approval that the person has not given.');
+});
