@@ -14,6 +14,8 @@ A Gauge reaches the core only through the client (`createCoreClient`). The clien
 - `planGrant(id, permissions)`, `applyGrant(plan, approval?)`, `revoke(id, permissions)`, `revokeTraces(id)`, `listGrants(id)`, `checkPermission(gauge, permission, engine?)`, and `readAudit()` are the grants calls. See "Permissions and grants".
 - `readLayout()`, `listLayoutRevisions()`, `exportLayout()`, `planLayoutSet(text)`, `planLayoutSwap(place, gauge)`, `planLayoutDefault(place)`, `planLayoutRestore(revision)`, `planLayoutPropose(gauge)`, and `applyLayout(plan, approval?)` are the layout calls. See "The layout".
 
+- `planSessionStart(gauge, request)`, `planSessionStop(gauge, session)`, `applySession(plan, approval?, sharedApproval?)`, `listSessions(gauge, engine)`, and `getSession(gauge, session)` are the session calls. See "Engine sessions".
+
 Each call gives `{ ok: true, value }` or `{ ok: false, code }`. Wire names keep the `bowerloom` prefix, such as `bowerloom.gauges.list`.
 
 ## Install, enable, disable, update, and remove
@@ -164,6 +166,54 @@ The grid, the layout file, its revisions, the way back, and safe mode are in `pa
 
 `FakeCoreOptions` has two options for this: `home` (the core holds the nine stock Gauges of the bento home after the fixture Gauges, off by default so that the older suites keep their list) and `layoutFile` (the saved layout file that the core finds when it starts, as text or bytes, kept as a copy). `FakeCore.layoutFile()` gives the text of the saved file, for a test. Without `home` the default layout has no tile, since none of the five default Gauges is there. A real core holds all nine.
 
+## Engine sessions
+
+The states, the legal moves, the cap, the pair rule, the shared folder rule, the host, and the process launcher are in `packages/engine-sessions`, and its README is the contract. This package carries them over the seam, with a plan and an approval for every start and every stop. The wire names are `bowerloom.sessions.plan`, `bowerloom.sessions.apply`, `bowerloom.sessions.list`, and `bowerloom.sessions.get`.
+
+- **A start is a plan.** `planSessionStart(gauge, { engine, folder, model?, variables? })` needs the `sessions.start` grant for the engine (the one enforcement point, `checkPermission`). It gives a plan and changes nothing. The plan lists the engine, the real program, the real folder, the model choice, the billing source, and the variables. No start happens without the person's approval of this exact plan. A Gauge never starts an engine on its own.
+- **A stop is a plan too.** `sessions.stop` is an act permission, which lets a Gauge ask for a plan and never skip it. `planSessionStop(gauge, session)` needs the grant for the engine of the session. A stop of a session that is `stopping` already gets a plan that kills it (`force`).
+- **A read** (`listSessions`, `getSession`) needs `sessions.read` for the engine, so a Gauge that lists one engine reads that engine only. A read holds no output of the engine. `listSessions` gives the sessions of one engine, oldest first.
+- **Which refusal first.** For a start: the grant check (`UNKNOWN_GAUGE`, then the reasons of `GAUGE_GRANT_MISSING`), then the host (the request, the engine, the model, the pair, the cap). For a stop and a get: an unknown Gauge, a malformed id, an unknown session (`ENGINE_SESSION_UNKNOWN`), and only then the grant for the engine of the session. So a Gauge that holds no grant learns whether a session id exists. A session id is 64 random bits, so that is no new leak.
+
+### A plan of a session
+
+A plan has `action` (`start` or `stop`), `gauge`, `engine`, `folder`, `session`, `program`, `model`, `billing`, `variables`, `sharedWith`, `force`, `steps`, `digest`, and `nonce`. A field that the action does not use is `null`, `[]`, or `false`. A start has `session` null, and a stop has `program` and `model` null. `digest` is the SHA-256 of every field but the nonce, and the core works it out itself: a digest that the caller sends is ignored. The nonce is exactly 64 lowercase hexadecimal characters.
+
+The core applies a session plan only when all of these hold, in this order:
+
+1. It holds an approval for the plan: no approval, an unknown one, an old one, or one the state has moved past is `GAUGE_PLAN_NOT_APPROVED`. The rules of the other plans hold: an approval works once, lasts 15 minutes, and ends when any applied step changes the state.
+2. The plan is the one that was approved: another plan, a changed plan, or another nonce is `GAUGE_PLAN_CHANGED`.
+3. The plan would still be the same plan now. The core plans again from live state, the permission included, and a plan that no longer applies gives the code of that refusal. A plan whose engines in the folder changed, for example because the other engine went, is `GAUGE_PLAN_CHANGED`.
+4. A start whose plan has `sharedWith` also needs the second approval (`sharedApproval`). Without it the refusal is `ENGINE_FOLDER_SHARED`, and nothing starts.
+
+Only then the core asks the host. The approval is used up, and every older plan is retired, before the core waits for the program, so a second call in the same tick finds the approval gone. A start that gets past every check uses up its approval even when the program then fails to start (`ENGINE_START_FAILED`), because a session record, in the state `failed`, now exists. A throw from the host before it makes the session leaves the approval, the nonce, the epoch, and the audit file as they were.
+
+### The text of a session plan
+
+The `steps` are the text the person approves. They are a contract, in this order, and every value goes through `escapeForPlan`. `src/session-plan.ts` has the lines, and the tests pin the full text.
+
+Start: `Gauge <gauge> asks for a new session of the engine <engine> (<title>)`; `program: <path>`; `folder: <path>`; `model: <provider> <model>, as the Gauge asks` or `model: the engine's own default, and the core picks none`; `billing source: ...`; `variables passed: <names>` or `none`; `the program gets these variables only, and it starts with an argument list and never through a shell`; `the core never answers a permission prompt of the engine: you answer it yourself`; for a shared folder, the `notice: ...` line and `a second approval is needed, for the shared folder`; and `start the program in the folder, and keep the session until it stops or fails`.
+
+Stop: `Gauge <gauge> asks to stop session <session> of the engine <engine>`; `folder: <path>`; the stop signal line with the wait in milliseconds, or the kill signal line for a session that is stopping already; and `if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT`.
+
+### The second approval
+
+A start in a folder that another engine uses needs a second approval, as the spec says: "Two engines in one folder need a notice and approval before the second start." The notice is in the plan. The approval is a second token, of another kind. The fake core mints it with `approveShared(nonce)`, which refuses a plan that names no other engine. The first token never stands for the second, and the second never stands for the first. A real core ties each to its own click in the app.
+
+### What an applied plan gives
+
+`{ action, session, engine, state }`. A start gives the state when the program has started, which is usually `starting`. A stop gives `stopped`. A stop that times out is `ENGINE_STOP_TIMEOUT`: the session stays `stopping`, and a second stop plan kills it.
+
+### The fake core and the host
+
+`FakeCoreOptions.engineHost` is the host that holds the sessions (`createEngineHost`). The default is a host with no engine, so every engine is `ENGINE_NOT_FOUND`. A test passes a host over the scriptable fake engines of `packages/engine-sessions`. `FakeCore.approveShared(nonce)` is for tests, and is not on the `Core` seam.
+
+A start and a stop write nothing to the audit file: it holds grants and revokes only.
+
+### What is not covered
+
+Who may call these methods (the call identity work); the live stream of a session and sending to it (`sessions.stream`, `sessions.attach`, `sessions.send`); runs and jobs; engines and usage reads (`engines.read`, `usage.read`); and a cap or a pair that the core could not already see. The cap and the pair checks cannot fail at apply through the core, since a start ends every older plan, so those two checks at apply are a second line, and the host tests drive them directly.
+
 ## What the client checks in a reply
 
 The client does not trust the core. It throws `CoreProtocolError` when any of these is false:
@@ -181,6 +231,8 @@ The client checks the result of an apply against the plan: an install returns `e
 The grants calls are checked as strictly, from own properties, into fresh frozen objects. A grant plan must be for the Gauge and the permissions that were asked, with sorted permissions that are all in the list, and all traces or none. An applied grant must name the plan's Gauge and permissions. A revoke may name only permissions that were asked, and a traces revoke only traces permissions. A list of grants is sorted by permission with no repeat, and has no `current` field. A permission check must name the Gauge, the permission, and the engine that were asked, and `engine` is `null` when none was asked. An audit read has records that follow each other by one in `seq`, with a valid time, and an action that fits its way (`grant` by `plan`, `revoke` by `revoke`, `remove`, `disable`, or `update`), and its `firstSeq` and `droppedCount` must fit the first record. Every list that a reply holds is read with no hole, so a sparse list is a protocol error. A refusal reason is typed by its code: `GAUGE_GRANT_MISSING` has a grant reason or none, `GAUGE_AUDIT_FAILED` always has an audit reason, `GAUGE_LAYOUT_INVALID` always has a layout reason, `GAUGE_PROTECTED` has a protected reason or none, and every other code has a manifest reason or none.
 
 The layout calls are checked the same way. A layout is read from own properties, with the grid and the tiles checked and no unknown field, and it must be in canonical order. A state in safe mode has revision 0 and a cause, and a saved state has a revision of 1 or more. A list of revisions is newest first, with falling numbers, at most 10. An export must be the canonical text of a layout. A layout plan must answer the request: the same kind, place, Gauge, revision, and text. Its last line must be the bind line that names its own two hashes, and for a plan that sets a layout the `nextHash` must be the SHA-256 of the canonical text of the text that was sent (a text that is not a layout has no plan). The client's own code uses no platform module: the hash is pure code, and a text is measured with `TextEncoder` after a cheap check of its length. The client still imports `node:crypto` through `packages/gauge-errors` and `Buffer` through `packages/gauge-manifest`, so a webview bundle needs a polyfill until a later ticket removes them. An applied change must name the plan's kind, and a plan that changes the layout cannot come back as unchanged.
+
+The session calls are checked the same way, into fresh frozen objects, from own properties. A session plan must have every field, with the fields of the other action empty (a start has no session and no `force`, a stop has no program, model, variables, or shared engines). Its Gauge, engine, folder, billing source, and nonce are checked, its `variables` and `sharedWith` must be dense lists in strict order, and no step may hold a line break. A plan must answer the request: the same action, Gauge, and engine; a start has the model that was asked and every variable that was asked; a stop has the session that was asked. An applied plan must fit its plan: the same action and engine, a stop for the same session that gives `stopped`, and a start in a state past `ready`. A session has a failure if and only if it is `failed`. A list holds only sessions of the asked engine, with no repeat. `ENGINE_REQUEST_INVALID` always has a request reason of the closed set, and every other engine code has no reason.
 
 A Gauge summary has these six fields, all present: `id`, `title`, and `version` are strings, `kind` is `ui` or `data`, `origin` is `stock` or `third-party`, and `protected` is a boolean. The client reads each field once and checks the value it read. It hands back a new frozen object made from those six values. Any other field is dropped. A list is frozen too.
 
@@ -211,6 +263,10 @@ Codes come from the registry in `packages/gauge-errors`, which is the package `@
 ## The layout suite
 
 `test/layout-suite.ts` exports `runLayoutSuite(name, makeHarness)`, built the same way. `makeHarness(folders, options)` gives a core that holds the nine stock Gauges of the bento home, the three fixture Gauges, and the given folders, with a way to approve a plan and a way to move the clock. `options.layoutFile` is the saved file the core finds when it starts. The suite covers the home, export and import (with the hostile texts), the way back, the sizes a Gauge allows, swap, the default action, plans and approvals, the 10 revisions, restore, safe mode, and a Gauge that proposes to add itself. Every expected value is written out in the suite. `test/fake-core-layout.test.ts` runs it on the fake core and adds the fake's own checks. `test/client-layout.test.ts` tests the strict reply checks.
+
+## The sessions suite
+
+`test/sessions-suite.ts` exports `runSessionsSuite(name, makeHarness)`, built the same way. `makeHarness(folders)` gives a core that holds those Gauge folders and the engines of `SESSION_ENGINES`, each behaving as its steps say, with an environment of `SESSION_ENVIRONMENT`, a way to approve a plan (and to give the second approval), a way to move the clock, folders that exist, and the means to count the programs the core started and to read what each wrote. The suite covers the plan, the approval rules, the states a session moves through, the cap, the pair rule, the shared folder, the stop, a stop that times out, the reads, and the scope of the grants. `test/fake-core-sessions.test.ts` runs it on the fake core over real fake engines, with a check at the end of every test that no process is left behind, and adds the fake's own checks. `test/client-sessions.test.ts` tests the strict reply checks, and `test/session-plan.test.ts` pins the text of a plan.
 
 ## The client suite
 

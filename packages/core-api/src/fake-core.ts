@@ -8,12 +8,15 @@ import {
   MAX_REVISION, PAGE_IDS, canonicalText, checkLayout, defaultLayout, droppedRevision, layoutObject, newFile, parseLayout, parseLayoutFile, proposeTile, reconcileLayout, saveRevision, serializeLayoutFile, swapPlace, defaultPlace, tileInfoOf, invalid as layoutInvalid,
   type GaugeInfo, type Layout, type LayoutFile, type LayoutRefusal, type TileInfo, type UnknownGaugeRefusal,
 } from '../../gauge-layout/src/index.js';
+import { BILLING_SOURCES, checkModel, checkSessionId, createEngineHost, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
 import { FIXTURE_GAUGES, HOME_STOCK } from './fixtures.js';
 import { layoutChangeSteps, layoutSteps } from './layout-plan.js';
 import { DEFAULT_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES, appendAuditStep, auditLine, grantSteps } from './grants.js';
 import { escapeForPlan } from './plan-text.js';
+import { startSteps, stopSteps } from './session-plan.js';
 import {
-  LAYOUT_KINDS, PLAN_ACTIONS, type AuditEntry, type AuditRead, type Core, type CoreRefusal, type CoreReply, type GaugeApplied, type GaugePlan, type GaugeSummary, type LayoutKind, type LayoutSafe, type PlanAction,
+  LAYOUT_KINDS, PLAN_ACTIONS, SESSION_ACTIONS, type AuditEntry, type AuditRead, type Core, type CoreRefusal, type CoreReply, type EngineCode, type GaugeApplied, type GaugePlan, type GaugeSummary, type LayoutKind, type LayoutSafe, type PlanAction,
+  type SessionAction, type SessionModel,
 } from './types.js';
 
 export { escapeForPlan };
@@ -65,6 +68,8 @@ export interface FakeCoreOptions {
   readonly layoutFile?: string | Uint8Array;
   /** Only for a test: the function that brings the layout in line with the Gauges after a lifecycle step. `reconcileLayout` by default. A test passes one that throws, to prove that a step is all or nothing. */
   readonly reconcile?: typeof reconcileLayout;
+  /** The Engine Host that starts, watches, and stops sessions (`packages/engine-sessions`). A host with no engine by default, so every engine is `ENGINE_NOT_FOUND`. A test passes one over scripted fake engines. */
+  readonly engineHost?: EngineHost;
 }
 
 /**
@@ -76,6 +81,11 @@ export interface FakeCoreOptions {
 export interface FakeCore extends Core {
   /** The person approves the plan that the core issued with this nonce. Gives back an approval: a random token that applies that plan once, within 15 minutes. */
   approve(nonce: string): string;
+  /**
+   * The person gives the second approval that a start in a shared folder needs. It is for the plan that the core issued with this nonce, and the plan must name another engine in its folder.
+   * It is a token of another kind: it never applies a plan as the first approval, and the first approval never stands for it.
+   */
+  approveShared(nonce: string): string;
   /** Replaces, or adds, the folder with the same name, as if its files changed on disk. The core keeps a copy. */
   replaceFolder(folder: GaugeFolder): void;
   /** The text of the audit file: one JSON line for each record, oldest first. A real core keeps this in a file on this computer. */
@@ -149,6 +159,8 @@ interface Approval {
   readonly digest: string;
   readonly at: number;
   readonly epoch: number;
+  /** `plan` is the approval of a plan. `shared` is the second approval of a start in a folder that another engine uses. A token of one kind never stands for the other. */
+  readonly purpose: 'plan' | 'shared';
 }
 
 /** The last millisecond of the year 9999, so that a time is always written as four digits of year. */
@@ -194,7 +206,7 @@ function describe(manifest: GaugeManifest): readonly string[] {
 const digestOfGrant = (plan: GrantContent): string => sha256(JSON.stringify(['grant', plan.id, plan.version, plan.permissions, plan.steps, plan.manifestHash, plan.folderHash]));
 const sealedGrant = (plan: GrantContent): SealedGrant => ({ ...plan, permissions: [...plan.permissions], steps: [...plan.steps], digest: digestOfGrant(plan) });
 
-type PlainCode = Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED'>;
+type PlainCode = Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | 'ENGINE_REQUEST_INVALID'>;
 const refuse = (code: PlainCode, reason?: ManifestReason): Refusal => (reason === undefined ? { ok: false, code } : { ok: false, code, reason });
 /** A refusal because a Gauge is protected: the lifecycle gives no reason. */
 const protectedRefusal = (): Refusal => ({ ok: false, code: 'GAUGE_PROTECTED' });
@@ -204,6 +216,8 @@ const refusalOf = (result: LayoutRefusal | UnknownGaugeRefusal): Refusal => (res
 const auditRefusal = (reason: AuditReason): Refusal => ({ ok: false, code: 'GAUGE_AUDIT_FAILED', reason });
 /** A refusal because of a grant: the code `GAUGE_GRANT_MISSING` with a reason of the closed set, or with none when the permission is plainly not granted. */
 const deny = (reason?: GrantReason): Refusal => (reason === undefined ? { ok: false, code: 'GAUGE_GRANT_MISSING' } : { ok: false, code: 'GAUGE_GRANT_MISSING', reason });
+/** A refusal of the Engine Host, as the core gives it. `ENGINE_REQUEST_INVALID` keeps its reason, and every other engine code has none. */
+const engineRefusal = (refusal: HostRefusal): Refusal => (refusal.code === 'ENGINE_REQUEST_INVALID' ? { ok: false, code: refusal.code, reason: refusal.reason } : { ok: false, code: refusal.code });
 const reply = (refusal: Refusal): CoreReply => (refusal.reason === undefined ? { ok: false, code: refusal.code } : { ok: false, code: refusal.code, reason: refusal.reason });
 /** True when the value is a list of text with no hole. A hole is not a line of text. */
 const isDenseTexts = (value: unknown): value is string[] => Array.isArray(value) && Array.from(value as unknown[]).every((item): item is string => typeof item === 'string');
@@ -244,7 +258,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   /** Ids that a user Gauge may never use. A stock id stays reserved after its Gauge is removed. */
   const stockIds = new Set<string>(started.filter(({ summary }) => summary.origin === 'stock').map(({ summary }) => summary.id));
   /** The nonce of each plan the core issued, with the digest of the plan and the count of applied steps at that time. A nonce is retired when the state changes. */
-  const issued = new Map<string, { digest: string; epoch: number; gauge: string | null }>();
+  const issued = new Map<string, { digest: string; epoch: number; gauge: string | null; shared: boolean }>();
   const approvals = new Map<string, Approval>();
   /** Counts the steps applied. An approval from an earlier count is stale. */
   let epoch = 0;
@@ -490,10 +504,11 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   }
 
   /** Finds the approval a caller sent. An unknown, old, or expired approval reads as `undefined`, and an expired or stale one is forgotten. */
-  function liveApproval(params: Readonly<Record<string, unknown>>): { readonly token: string; readonly approval: Approval } | undefined {
-    const token = params['approval'];
+  function liveApproval(params: Readonly<Record<string, unknown>>, key = 'approval', purpose: Approval['purpose'] = 'plan'): { readonly token: string; readonly approval: Approval } | undefined {
+    const token = params[key];
     const approval = typeof token === 'string' ? approvals.get(token) : undefined;
-    if (typeof token !== 'string' || !approval) return undefined;
+    // A token of the other kind is not an approval of this kind, and it is kept, since it may be good for its own use.
+    if (typeof token !== 'string' || !approval || approval.purpose !== purpose) return undefined;
     if (now() - approval.at >= APPROVAL_TTL_MS || approval.epoch !== epoch) {
       approvals.delete(token);
       return undefined;
@@ -837,13 +852,143 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     return { ok: true, result: { kind: fresh.kind, revision: saved.revision, changed } };
   }
 
+  // Sessions
+
+  /** The Engine Host. It holds the sessions and the rules of the cap, the pairs, and the shared folder. The core holds the plans and the approvals, and asks the host to do what was approved. */
+  const host = options.engineHost ?? createEngineHost({ engines: [], launcher: { launch: () => { throw new Error('this fake core holds no engine'); } } });
+
+  /** What a session plan says before the core seals it. */
+  interface SessionContent {
+    readonly action: SessionAction;
+    readonly gauge: string;
+    readonly engine: string;
+    readonly folder: string;
+    readonly session: string | null;
+    readonly program: string | null;
+    readonly model: SessionModel | null;
+    readonly billing: Billing;
+    readonly variables: readonly string[];
+    readonly sharedWith: readonly string[];
+    readonly force: boolean;
+    readonly steps: readonly string[];
+  }
+  type SessionPlanned = (SessionContent & { readonly ok: true; readonly digest: string; readonly start: StartPlanContent | null }) | Refusal;
+  const sessionDigest = (plan: SessionContent): string => sha256(JSON.stringify([
+    'session', plan.action, plan.gauge, plan.engine, plan.folder, plan.session, plan.program, plan.model === null ? null : [plan.model.provider, plan.model.model], plan.billing, plan.variables, plan.sharedWith, plan.force, plan.steps,
+  ]));
+  const isSessionAction = (value: unknown): value is SessionAction => typeof value === 'string' && (SESSION_ACTIONS as readonly string[]).includes(value);
+  const isBilling = (value: unknown): value is Billing => typeof value === 'string' && (BILLING_SOURCES as readonly string[]).includes(value);
+  /** A session as it goes over the seam: a new object each time, with no output of the engine. */
+  const sessionObject = (info: SessionInfo) => ({
+    id: info.id, engine: info.engine, folder: info.folder, state: info.state, billing: info.billing, model: info.model === null ? null : { provider: info.model.provider, model: info.model.model }, failure: info.failure,
+  });
+
+  /**
+   * Plans a start or a stop of a session. Nothing changes. Every check runs here, so the plan the person sees is one that can be applied: the permission (the one enforcement point), the shape of the request,
+   * the engine and its program, the model choice, the pair, the cap, and the folder that another engine uses. A stop for a session that is not there names the session as unknown, so a Gauge that holds no
+   * grant for it learns only what the id already says.
+   */
+  function planSession(params: Readonly<Record<string, unknown>>): SessionPlanned {
+    const action = params['action'], gauge = params['gauge'];
+    if (action === 'start') {
+      const allowed = enforce(gauge, 'sessions.start', params['engine']);
+      if (!allowed.ok) return allowed;
+      const planned = host.planStart({ engine: params['engine'], folder: params['folder'], model: params['model'], variables: params['variables'] });
+      if (!planned.ok) return engineRefusal(planned);
+      const c = planned.plan;
+      const content: SessionContent = {
+        action: 'start', gauge: allowed.gauge, engine: c.engine, folder: c.folder, session: null, program: c.program, model: c.model, billing: c.billing, variables: [...c.variables], sharedWith: [...c.sharedWith], force: false,
+        steps: startSteps({ gauge: allowed.gauge, engine: c.engine, title: c.title, program: c.program, folder: c.folder, model: c.model, billing: c.billing, variables: c.variables, sharedWith: c.sharedWith }),
+      };
+      return { ok: true, ...content, digest: sessionDigest(content), start: c };
+    }
+    if (typeof gauge !== 'string' || !installed.has(gauge)) return refuse('UNKNOWN_GAUGE');
+    const id = checkSessionId(params['session']);
+    if (!id.ok) return engineRefusal({ ok: false, code: 'ENGINE_REQUEST_INVALID', reason: id.reason });
+    const found = host.get(id.value);
+    if (!found) return engineRefusal({ ok: false, code: 'ENGINE_SESSION_UNKNOWN' });
+    const allowed = enforce(gauge, 'sessions.stop', found.engine);
+    if (!allowed.ok) return allowed;
+    const planned = host.planStop(id.value);
+    if (!planned.ok) return engineRefusal(planned);
+    const c = planned.plan;
+    const content: SessionContent = {
+      action: 'stop', gauge: allowed.gauge, engine: c.engine, folder: c.folder, session: c.session, program: null, model: null, billing: found.billing, variables: [], sharedWith: [], force: c.force,
+      steps: stopSteps({ gauge: allowed.gauge, session: c.session, engine: c.engine, folder: c.folder, force: c.force, timeoutMs: host.stopTimeoutMs }),
+    };
+    return { ok: true, ...content, digest: sessionDigest(content), start: null };
+  }
+
+  /** Reads the session plan a caller sends back. Anything that is not a whole plan reads as `undefined`. The digest is computed here, and the one the caller sent is ignored. */
+  function readSessionPlan(value: unknown): (SessionContent & { readonly digest: string; readonly nonce: string }) | undefined {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+    const field = (key: string): unknown => ownField(value, key);
+    const action = field('action'), gauge = field('gauge'), engine = field('engine'), folder = field('folder'), session = field('session'), program = field('program');
+    const rawModel = field('model'), billing = field('billing'), variables = field('variables'), sharedWith = field('sharedWith'), force = field('force'), steps = field('steps'), nonce = field('nonce');
+    if (!isSessionAction(action) || typeof gauge !== 'string' || typeof engine !== 'string' || typeof folder !== 'string' || typeof nonce !== 'string' || typeof force !== 'boolean' || !isBilling(billing)) return undefined;
+    const nullable = (item: unknown): item is string | null => item === null || typeof item === 'string';
+    if (!nullable(session) || !nullable(program) || rawModel === undefined || !isDenseTexts(variables) || !isDenseTexts(sharedWith) || !isDenseTexts(steps)) return undefined;
+    const model = checkModel(rawModel);
+    if (!model.ok) return undefined;
+    const content: SessionContent = { action, gauge, engine, folder, session, program, model: model.value, billing, variables: [...variables], sharedWith: [...sharedWith], force, steps: [...steps] };
+    return { ...content, digest: sessionDigest(content), nonce };
+  }
+
+  /**
+   * Applies a session plan. The first approval, the plan, and a plan made again from the state now are checked as for every plan, and then a start in a shared folder needs the second approval.
+   * Everything is checked before the host is asked, and the host is asked before the approval is used up. The wait for the program (to spawn, or to go) comes after the approval is used up and
+   * every older plan is retired, so a second call in the same tick finds the approval gone.
+   */
+  async function applySession(params: Readonly<Record<string, unknown>>): Promise<CoreReply> {
+    const live = liveApproval(params);
+    if (!live) return reply(refuse('GAUGE_PLAN_NOT_APPROVED'));
+    const { token, approval } = live;
+    const plan = readSessionPlan(params['plan']);
+    if (!plan || plan.nonce !== approval.nonce || plan.digest !== approval.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    // Plan again from the state now: a session plan that is no longer the one the person approved, or that no longer applies, is refused.
+    const fresh = planSession(plan.action === 'start'
+      ? { action: 'start', gauge: plan.gauge, engine: plan.engine, folder: plan.folder, model: plan.model, variables: plan.variables }
+      : { action: 'stop', gauge: plan.gauge, session: plan.session });
+    if (!fresh.ok) return reply(fresh);
+    if (fresh.digest !== plan.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    if (fresh.action === 'start') {
+      if (fresh.start === null) throw new Error('a start plan holds the plan of the host');
+      let second: { readonly token: string; readonly approval: Approval } | undefined;
+      if (fresh.sharedWith.length > 0) {
+        second = liveApproval(params, 'sharedApproval', 'shared');
+        if (!second || second.approval.nonce !== plan.nonce || second.approval.digest !== plan.digest) return reply(engineRefusal({ ok: false, code: 'ENGINE_FOLDER_SHARED' }));
+      }
+      const begun = host.beginStart(fresh.start, { sharedApproved: second !== undefined });
+      if (!begun.ok) return reply(engineRefusal(begun));
+      retire(plan.nonce, token);
+      const settled = await begun.settled;
+      if (!settled.ok) return reply(engineRefusal(settled));
+      return { ok: true, result: { action: 'start', session: begun.session, engine: plan.engine, state: settled.info.state } };
+    }
+    if (fresh.session === null) throw new Error('a stop plan holds a session');
+    const begun = host.beginStop(fresh.session);
+    if (!begun.ok) return reply(engineRefusal(begun));
+    retire(plan.nonce, token);
+    const settled = await begun.settled;
+    if (!settled.ok) return reply(engineRefusal(settled));
+    return { ok: true, result: { action: 'stop', session: fresh.session, engine: plan.engine, state: settled.info.state } };
+  }
+
   return {
     approve(nonce) {
       const plan = typeof nonce === 'string' ? issued.get(nonce) : undefined;
       // A plan made before the state changed is retired, so a nonce of an old plan is no longer one that the core issued.
       if (plan === undefined || plan.epoch !== epoch) throw new TypeError('an approval is for a nonce that the core issued, for a plan that is still current');
       const token = randomBytes(32).toString('hex');
-      approvals.set(token, { nonce, digest: plan.digest, at: now(), epoch });
+      approvals.set(token, { nonce, digest: plan.digest, at: now(), epoch, purpose: 'plan' });
+      return token;
+    },
+    approveShared(nonce) {
+      const plan = typeof nonce === 'string' ? issued.get(nonce) : undefined;
+      if (plan === undefined || plan.epoch !== epoch) throw new TypeError('an approval is for a nonce that the core issued, for a plan that is still current');
+      if (!plan.shared) throw new TypeError('a second approval is for a start in a folder that another engine uses');
+      const token = randomBytes(32).toString('hex');
+      approvals.set(token, { nonce, digest: plan.digest, at: now(), epoch, purpose: 'shared' });
       return token;
     },
     replaceFolder(folder) {
@@ -873,7 +1018,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const planned = planFor(action as PlanAction, params);
           if (!planned.ok) return reply(planned);
           const nonce = randomBytes(32).toString('hex');
-          issued.set(nonce, { digest: planned.plan.digest, epoch, gauge: null });
+          issued.set(nonce, { digest: planned.plan.digest, epoch, gauge: null, shared: false });
           return { ok: true, result: { ...planned.plan, steps: [...planned.plan.steps], nonce } };
         }
         case 'bowerloom.gauges.apply':
@@ -882,7 +1027,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const planned = planGrant(params);
           if (!planned.ok) return reply(planned);
           const nonce = randomBytes(32).toString('hex');
-          issued.set(nonce, { digest: planned.plan.digest, epoch, gauge: planned.plan.id });
+          issued.set(nonce, { digest: planned.plan.digest, epoch, gauge: planned.plan.id, shared: false });
           return { ok: true, result: { action: 'grant', ...planned.plan, permissions: [...planned.plan.permissions], steps: [...planned.plan.steps], nonce } };
         }
         case 'bowerloom.grants.apply':
@@ -916,12 +1061,42 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const planned = planLayout(params);
           if (!planned.ok) return reply(planned);
           const nonce = randomBytes(32).toString('hex');
-          issued.set(nonce, { digest: planned.digest, epoch, gauge: planned.owner });
+          issued.set(nonce, { digest: planned.digest, epoch, gauge: planned.owner, shared: false });
           const { kind, place, gauge, revision, text, steps, digest, baseHash, nextHash } = planned;
           return { ok: true, result: { action: 'layout', kind, place, gauge, revision, text, steps: [...steps], digest, baseHash, nextHash, nonce } };
         }
         case 'bowerloom.layout.apply':
           return applyLayout(params);
+        case 'bowerloom.sessions.plan': {
+          if (!isSessionAction(params['action'])) throw new Error(`unknown session action: ${String(params['action'])}`);
+          const planned = planSession(params);
+          if (!planned.ok) return reply(planned);
+          const nonce = randomBytes(32).toString('hex');
+          issued.set(nonce, { digest: planned.digest, epoch, gauge: planned.gauge, shared: planned.sharedWith.length > 0 });
+          const { action, gauge, engine, folder, session, program, model, billing, variables, sharedWith, force, steps, digest } = planned;
+          return {
+            ok: true,
+            result: { action, gauge, engine, folder, session, program, model: model === null ? null : { provider: model.provider, model: model.model }, billing, variables: [...variables], sharedWith: [...sharedWith], force, steps: [...steps], digest, nonce },
+          };
+        }
+        case 'bowerloom.sessions.apply':
+          return applySession(params);
+        case 'bowerloom.sessions.list': {
+          const allowed = enforce(params['gauge'], 'sessions.read', params['engine']);
+          if (!allowed.ok) return reply(allowed);
+          return { ok: true, result: host.list(allowed.engine ?? undefined).map(sessionObject) };
+        }
+        case 'bowerloom.sessions.get': {
+          const gauge = params['gauge'];
+          if (typeof gauge !== 'string' || !installed.has(gauge)) return reply(refuse('UNKNOWN_GAUGE'));
+          const id = checkSessionId(params['session']);
+          if (!id.ok) return reply(engineRefusal({ ok: false, code: 'ENGINE_REQUEST_INVALID', reason: id.reason }));
+          const found = host.get(id.value);
+          if (!found) return reply(engineRefusal({ ok: false, code: 'ENGINE_SESSION_UNKNOWN' }));
+          const allowed = enforce(gauge, 'sessions.read', found.engine);
+          if (!allowed.ok) return reply(allowed);
+          return { ok: true, result: sessionObject(found) };
+        }
         case 'bowerloom.gauges.routes':
           return { ok: true, result: [...installed.values()].filter(gauge => gauge.enabled).map(({ summary }) => `/gauges/${summary.id}`) };
         default:

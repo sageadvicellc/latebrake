@@ -130,6 +130,8 @@ export interface EngineHost {
   killAll(): Promise<void>;
   /** The number of processes the host has asked the launcher to start since it was made. */
   readonly launched: number;
+  /** How long a stop waits for the engine to go, in milliseconds. A stop plan tells the person. */
+  readonly stopTimeoutMs: number;
 }
 
 interface Tracked {
@@ -143,6 +145,8 @@ interface Tracked {
 }
 
 const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** A control, format, line separator, or paragraph separator character. A text that holds one is never shown in a plan as it is. */
+const UNSAFE_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 const LOADER_NAME = /^(?:LD_|DYLD_)|^NODE_OPTIONS$/;
 
 const sorted = (names: Iterable<string>): string[] => [...new Set(names)].sort();
@@ -183,7 +187,7 @@ function canonicalFolder(folder: string): string | undefined {
 function checkSpec(spec: EngineSpec): EngineSpec {
   const id = checkEngineId(spec.id);
   if (!id.ok) throw new RangeError('an engine id is lower-case words joined by single hyphens, at most 64 characters');
-  if (typeof spec.title !== 'string' || spec.title === '' || spec.title.length > MAX_NAME_LENGTH) throw new RangeError(`the engine ${id.value} needs a title of 1 to 64 characters`);
+  if (typeof spec.title !== 'string' || spec.title === '' || spec.title.length > MAX_NAME_LENGTH || UNSAFE_TEXT.test(spec.title)) throw new RangeError(`the engine ${id.value} needs a title of 1 to 64 plain characters`);
   if (typeof spec.program !== 'string' || spec.program === '') throw new RangeError(`the engine ${id.value} needs a program`);
   if (!Array.isArray(spec.args) || !spec.args.every(arg => typeof arg === 'string')) throw new RangeError(`the arguments of the engine ${id.value} are a list of text`);
   if (!Array.isArray(spec.env) || !spec.env.every(name => typeof name === 'string' && VARIABLE_NAME.test(name) && !LOADER_NAME.test(name))) throw new RangeError(`the variables of the engine ${id.value} are a list of plain names`);
@@ -277,7 +281,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
     const spec = engines.get(id.value);
     if (!spec) return refusal('ENGINE_NOT_FOUND');
     const program = locate(spec.program);
-    if (program === undefined) return refusal('ENGINE_NOT_FOUND');
+    // A program whose path holds a control or separator character is not offered to the person: the plan shows the real path as it is.
+    if (program === undefined || UNSAFE_TEXT.test(program)) return refusal('ENGINE_NOT_FOUND');
     const real = canonical(folder.value);
     if (real === undefined || !checkFolder(real).ok) return invalid('folder');
     // The core never picks another model on its own: a choice for an engine that cannot take one is refused, and is never dropped.
@@ -388,5 +393,6 @@ export function createEngineHost(options: HostOptions): EngineHost {
       await Promise.all(running.map(record => waitForEnd(record, 5000)));
     },
     get launched() { return launched; },
+    get stopTimeoutMs() { return stopTimeoutMs; },
   };
 }

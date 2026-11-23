@@ -97,6 +97,13 @@ test('an engine that the host does not hold, or whose program is not on this com
   for (const id of ['nothing', 'constructor', 'proto', 'a'.repeat(64)]) assert.deepEqual(r.host.planStart(request(id, '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND' }, id);
 });
 
+test('a program whose real path holds a line break or another control character is not offered: it is ENGINE_NOT_FOUND', () => {
+  for (const program of ['/bin/evil\nprogram', '/bin/evil\u2028program', '/bin/evil\u202eprogram', '/bin/evil\u0000program']) {
+    const r = rig({ locate: () => program });
+    assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND' }, JSON.stringify(program));
+  }
+});
+
 test('a folder that the canonical function does not accept is a folder refusal, and a canonical path is the folder of the plan', () => {
   const none = rig({ canonical: () => undefined });
   assert.deepEqual(none.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_REQUEST_INVALID', reason: 'folder' });
@@ -493,6 +500,8 @@ test('the host refuses a bad engine list when it is made', () => {
   assert.throws(make([spec('alpha'), spec('alpha')]), /two engines have the id alpha/);
   assert.throws(make([spec('Alpha')]), RangeError);
   assert.throws(make([spec('alpha', { title: '' })]), RangeError);
+  assert.throws(make([spec('alpha', { title: 'two\nlines' })]), RangeError, 'a title with a line break would forge a line of a plan');
+  assert.throws(make([spec('alpha', { title: 'x'.repeat(65) })]), RangeError);
   assert.throws(make([spec('alpha', { program: '' })]), RangeError);
   assert.throws(make([spec('alpha', { args: [5 as unknown as string] })]), RangeError);
   assert.throws(make([spec('alpha', { env: ['1BAD'] })]), RangeError);
