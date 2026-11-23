@@ -294,3 +294,57 @@ test('a case that the rules cannot serve throws, and never gives back another la
   for (let index = 0; index < 101; index += 1) table.set(`guard-${index}`, { enabled: true, protected: true, tile: null });
   assert.throws(() => reconcileLayout(home, table), /not valid for the Gauges/);
 });
+
+test('an exchange that gives a protected Gauge its place ends, for any number of tiles: the tile that takes the displaced Gauge does not claim the protected one again', () => {
+  // Engines holds Projects. The protected Gauge, Engines and usage, fills the place of Jobs, whose own Gauge is gone. Before the exchange both places claim it.
+  const extra = [
+    { place: 'extra-1', gauge: 'library', default: 'library', col: 0, row: 2, size: 'small' },
+    { place: 'extra-2', gauge: 'tracing', default: 'tracing', col: 1, row: 2, size: 'small' },
+  ];
+  for (const count of [0, 1, 2]) {
+    const layout = layoutFrom(copy => ({
+      ...copy,
+      tiles: [...copy.tiles.map(tile => (tile.place === 'engines' ? { ...tile, gauge: 'projects', default: 'projects' } : tile.place === 'jobs' ? { ...tile, gauge: 'engines-usage', default: 'engines-usage' } : tile)), ...extra.slice(0, count)],
+      shelf: copy.shelf.filter(id => id !== 'projects' && id !== 'library' && id !== 'tracing' && id !== 'engines-usage'),
+    }));
+    const table = new Map(TABLE).set('jobs', { ...(TABLE.get('jobs') as GaugeInfo), enabled: false }).set('engines-usage', { ...(TABLE.get('engines-usage') as GaugeInfo), protected: true });
+    assert.equal(layout.tiles.length, 5 + count);
+    const next = reconcileLayout(layout, table);
+    assert.equal(key(tileOf(next, 'engines')), 'engines engines-usage engines-usage 0 0 large', String(layout.tiles.length));
+    assert.equal(key(tileOf(next, 'jobs')), 'jobs projects projects 2 0 large', String(layout.tiles.length));
+    valid(next, table);
+    // The Gauges that were on the layout and are not on a tile are on the shelf: nothing was lost.
+    assert.deepEqual(next.tiles.length, 5 + count);
+  }
+});
+
+test('several places that are claimed at once are all given back, one round for each', () => {
+  // Jobs and Local models both become protected while other Gauges fill their places. Each repair takes a round, so a bound of one round would leave the second place claimed.
+  const layout = layoutFrom(copy => ({
+    ...copy,
+    tiles: copy.tiles.map(tile => (tile.place === 'jobs' ? { ...tile, gauge: 'library', default: 'jobs' } : tile.place === 'models' ? { ...tile, gauge: 'projects', default: 'local-models' } : tile)),
+    shelf: [...copy.shelf.filter(id => id !== 'library' && id !== 'projects'), 'jobs', 'local-models'].sort(),
+  }));
+  const table = new Map(changed('jobs', { protected: true })).set('local-models', { ...(TABLE.get('local-models') as GaugeInfo), protected: true });
+  const next = reconcileLayout(layout, table);
+  assert.equal(tileOf(next, 'jobs')?.gauge, 'jobs');
+  assert.equal(tileOf(next, 'models')?.gauge, 'local-models');
+  assert.equal(next.shelf.includes('library'), true);
+  assert.equal(next.shelf.includes('projects'), true);
+  valid(next, table);
+});
+
+test('the shelf stays within its cap: a protected Gauge that must be added pushes out a plain Gauge, never a protected one or Settings', () => {
+  const table = new Map<string, GaugeInfo>(TABLE);
+  const plain = Array.from({ length: 120 }, (_, index) => `plain-${String(index).padStart(3, '0')}`);
+  for (const id of plain) table.set(id, { enabled: true, protected: false, tile: null });
+  table.set('newly-guarded', { enabled: true, protected: true, tile: null });
+  const full = layoutFrom(copy => ({ ...copy, tiles: [], shelf: ['gauge-manager', 'harnesses', 'settings', ...plain.slice(0, 97)], hidden: [] }));
+  assert.equal(full.shelf.length, 100);
+  const next = reconcileLayout(full, table);
+  assert.equal(next.shelf.length, 100);
+  assert.equal(next.shelf.includes('newly-guarded'), true);
+  assert.equal(next.shelf.includes('settings'), true);
+  assert.equal(next.shelf.includes('gauge-manager'), true);
+  assert.equal(next.shelf.includes('harnesses'), true);
+});

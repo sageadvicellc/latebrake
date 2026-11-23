@@ -86,7 +86,7 @@ The saved file has the format `bowerloom/layout-file/1`:
 { "format": "bowerloom/layout-file/1", "revision": 12, "current": <layout>, "revisions": [ { "revision": 11, "layout": <layout> }, ... ] }
 ```
 
-- `revision` is the number of the current layout, from 1. Each change that changes the layout adds 1. The number is never reused. The last number is 999,999,999: a file at that number takes no more changes (`bad_revision`).
+- `revision` is the number of the current layout, from 1. Each change that changes the layout adds 1. The number is never reused. The last number is 999,999,999: a file at that number takes no more changes. A layout plan that would write a revision is refused at plan time with `GAUGE_LAYOUT_INVALID` and `bad_revision`, and a lifecycle step is never refused for it: its plan says that the layout is replaced in place.
 - `revisions` are the earlier layouts, newest first, at most 10 (`MAX_REVISIONS`). Their numbers fall, and all are below the current number (`bad_revision`). A save pushes the current layout to the front, and the 11th drops the oldest. The current layout is never in the list, so dropping the oldest never loses it.
 - A layout that is the same as the current one writes no revision.
 - The text is at most 11 layouts of the largest size and 4,096 bytes more (`MAX_FILE_BYTES`, 364,544).
@@ -122,7 +122,7 @@ A step that changes the Gauges (disable, remove, update, enable) reconciles the 
 - A Gauge that a step just enabled (`options.enabled`) and that is on no tile, shelf, or hidden entry goes to the shelf. So a Gauge that is disabled and enabled again, or installed and enabled for the first time, is not lost. An enabled Gauge that the layout does not hold, in any other step, is left alone.
 - A hidden Gauge stays hidden. It does not come back on a tile when a place has it as its default.
 
-The result is valid for the Gauges. A case that these rules do not foresee throws a plain `Error`: there is no fallback to the default layout, so a bug fails loudly, and the step throws before it changes anything. A fuzz test of 3,000 random layouts and Gauge changes, including protect flips, holds this (a run of 60,000 found no case). The plan of the step says what changes, in lines that start with `layout: `, one for every difference, and none when the layout does not change.
+The result is valid for the Gauges. A case that these rules do not foresee throws a plain `Error`: there is no fallback to the default layout, so a bug fails loudly, and the step throws before it changes anything. Tests hold the rules to this: a fuzz test of 3,000 random layouts and Gauge changes with protect flips, a sequential fuzz on one core (in `packages/core-api`) with three fixed seeds, and the named cases. They show that those runs hit no unforeseen case. They do not prove that none exists. If one does, reconcile throws, and because the core works out the layout when it makes the plan of a step, the exception comes out of the plan call (`bowerloom.gauges.plan`) as a raw `Error`, and not as a refusal code. The plan of the step says what changes, in lines that start with `layout: `, one for every difference, and none when the layout does not change.
 
 ## Reasons
 
