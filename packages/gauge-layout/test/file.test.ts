@@ -157,7 +157,7 @@ test('a revision may name a Gauge that is gone now, because it is checked agains
 
 test('a file with a byte order mark, bad bytes, a duplicate key, or a comment is refused', () => {
   const good = text(doc(1));
-  assert.deepEqual(refusal(parseLayoutFile(`﻿${good}`, TABLE)), { code: 'GAUGE_LAYOUT_INVALID', reason: 'syntax' });
+  assert.deepEqual(refusal(parseLayoutFile(`\uFEFF${good}`, TABLE)), { code: 'GAUGE_LAYOUT_INVALID', reason: 'syntax' });
   assert.deepEqual(refusal(parseLayoutFile(Uint8Array.from([0xff, 0xfe]), TABLE)), { code: 'GAUGE_LAYOUT_INVALID', reason: 'not_utf8' });
   assert.deepEqual(refusal(parseLayoutFile(good.replace('{', '{"revision":1,'), TABLE)), { code: 'GAUGE_LAYOUT_INVALID', reason: 'duplicate_key' });
   assert.deepEqual(refusal(parseLayoutFile(`/* x */${good}`, TABLE)), { code: 'GAUGE_LAYOUT_INVALID', reason: 'comment' });

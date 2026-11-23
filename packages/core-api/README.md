@@ -12,6 +12,7 @@ A Gauge reaches the core only through the client (`createCoreClient`). The clien
 - `applyPlan(plan, approval?)` applies a plan that the person approved.
 - `listRoutes()` gives the routes of the enabled Gauges.
 - `planGrant(id, permissions)`, `applyGrant(plan, approval?)`, `revoke(id, permissions)`, `revokeTraces(id)`, `listGrants(id)`, `checkPermission(gauge, permission, engine?)`, and `readAudit()` are the grants calls. See "Permissions and grants".
+- `readLayout()`, `listLayoutRevisions()`, `exportLayout()`, `planLayoutSet(text)`, `planLayoutSwap(place, gauge)`, `planLayoutDefault(place)`, `planLayoutRestore(revision)`, `planLayoutPropose(gauge)`, and `applyLayout(plan, approval?)` are the layout calls. See "The layout".
 
 Each call gives `{ ok: true, value }` or `{ ok: false, code }`. Wire names keep the `bowerloom` prefix, such as `bowerloom.gauges.list`.
 
@@ -139,6 +140,24 @@ Every grant and every revoke of a permission appends one record to the audit fil
 
 Who calls revoke and the Gauge channel token (call identity); the webview restart after a traces revoke; calls that read engines, sessions, usage, models, or traces, which belong to the Engine Host and Traces API work and will call the same enforcement; a file on disk for the audit log, and how it survives a crash; two cores writing one file; and a grant that goes stale because a file changes on disk under an installed Gauge (the fake core installs a copy, and an update must raise the version).
 
+## The layout
+
+The grid, the layout file, its revisions, the way back, and safe mode are in `packages/gauge-layout`, and its README is the contract. This package carries them over the seam. The wire names are `bowerloom.layout.read`, `bowerloom.layout.revisions`, `bowerloom.layout.export`, `bowerloom.layout.plan`, and `bowerloom.layout.apply`.
+
+- `readLayout()` gives `{ layout, revision, safe }`. `layout` is the layout in use. `revision` is its number, from 1. In safe mode `revision` is 0, `safe` is `{ code, reason }` (the refusal that the saved file got), and `layout` is the default layout, which is not saved until the person makes a change. Otherwise `safe` is `null`.
+- `listLayoutRevisions()` gives the earlier layouts, newest first, at most 10, as `{ revision, layout }`.
+- `exportLayout()` gives the canonical text of the layout in use. Importing it gives the same layout, in the same bytes.
+- **Only the person changes the layout.** There is no call that changes it without a plan, so a Gauge can never change it. Every change is a plan that the person approves, with the same rules as every other plan: a random approval that works once, lasts 15 minutes, is bound to the digest and the nonce of the plan, ends when any applied step changes the state, and cannot apply a plan of another kind.
+- `planLayoutSet(text)` is a save and an import. The text is validated as the README of `gauge-layout` says. `planLayoutSwap(place, gauge)` swaps which Gauge fills a place. `planLayoutDefault(place)` puts the default Gauge of a place back, so the default is always one action away. `planLayoutRestore(revision)` restores an earlier layout, which becomes a new revision and keeps the one it replaced. `planLayoutPropose(gauge)` is how a Gauge asks to add itself. It needs the `layout.propose` grant (the one enforcement point), and the person approves the plan like any other. The fake core trusts the Gauge id, and a Gauge cannot name a place.
+- A layout plan has `action` (`layout`), `kind` (`set`, `swap`, `default`, `restore`, or `propose`), `place`, `gauge`, `revision`, `text` (each `null` when the kind does not use it), `steps`, `digest`, `baseHash`, `nextHash`, and `nonce`. `baseHash` is the SHA-256 of the canonical text of the layout in use, and `nextHash` that of the layout it would give. Both are in the digest, so an approval is for the change the person saw. Applying gives `{ kind, revision, changed }`. A change that gives the layout already in use writes no revision (`changed` is false).
+- **The text of a layout plan** is the text the person approves. It is a contract, in this order, and every value goes through `escapeForPlan`: the change; `after the change: <n> tile[s], <n> on the shelf, <n> hidden`; one `tile <place>: <gauge> <size> at column <col> row <row>` line for each tile; `shelf: ...`; `hidden: ...`; what happens to the file (`no change: the layout stays as it is`, or `keep the layout now in use as revision <n>, and keep at most 10 earlier revisions`, or in safe mode `leave safe mode and save the layout as revision 1`); and `bind the change to layout <hash> and result <hash>`. Tests pin the full text of a swap plan.
+- The core plans again from the state now when a plan is applied, and nothing is kept until every check has passed. A refused change leaves the layout, the revisions, and the file as they were. A revoke of `layout.propose` retires the pending proposal plans of that Gauge and their approvals at once.
+- The id `settings` is the Settings page. No Gauge can install under it, from any origin (`GAUGE_NAME_RESERVED`).
+- The refusals are the codes of the registry with a reason: `GAUGE_LAYOUT_INVALID` always has a layout reason, `GAUGE_PROTECTED` has `hidden`, `removed`, or `replaced` when the layout refused it, `UNKNOWN_GAUGE` is a Gauge that a change names and no Gauge has (an id that is not text is the same), and the proposal reuses `GAUGE_GRANT_MISSING` with its grant reasons. This package adds no code.
+- A defence that no test can reach: the core compares the digest of the plan again after it plans again from the state now. The epoch already retires every plan when any step changes the state, so the comparison is a second line.
+
+`FakeCoreOptions` has two options for this: `home` (the core holds the nine stock Gauges of the bento home after the fixture Gauges, off by default so that the older suites keep their list) and `layoutFile` (the saved layout file that the core finds when it starts, as text or bytes, kept as a copy). `FakeCore.layoutFile()` gives the text of the saved file, for a test. Without `home` the default layout has no tile, since none of the five default Gauges is there. A real core holds all nine.
+
 ## What the client checks in a reply
 
 The client does not trust the core. It throws `CoreProtocolError` when any of these is false:
@@ -153,7 +172,9 @@ Only the own properties of an object count. A field that an object inherits, fro
 
 The client checks the result of an apply against the plan: an install returns `enabled` false and the planned version, an update returns the planned version, an enable returns `enabled` true, a disable returns `enabled` false, and a remove returns `version` null. It checks that each route of `listRoutes` is exactly `/gauges/<id>` for a valid id.
 
-The grants calls are checked as strictly, from own properties, into fresh frozen objects. A grant plan must be for the Gauge and the permissions that were asked, with sorted permissions that are all in the list, and all traces or none. An applied grant must name the plan's Gauge and permissions. A revoke may name only permissions that were asked, and a traces revoke only traces permissions. A list of grants is sorted by permission with no repeat, and has no `current` field. A permission check must name the Gauge, the permission, and the engine that were asked, and `engine` is `null` when none was asked. An audit read has records that follow each other by one in `seq`, with a valid time, and an action that fits its way (`grant` by `plan`, `revoke` by `revoke`, `remove`, `disable`, or `update`), and its `firstSeq` and `droppedCount` must fit the first record. Every list that a reply holds is read with no hole, so a sparse list is a protocol error. A refusal reason is typed by its code: `GAUGE_GRANT_MISSING` has a grant reason or none, `GAUGE_AUDIT_FAILED` always has an audit reason, and every other code has a manifest reason or none.
+The grants calls are checked as strictly, from own properties, into fresh frozen objects. A grant plan must be for the Gauge and the permissions that were asked, with sorted permissions that are all in the list, and all traces or none. An applied grant must name the plan's Gauge and permissions. A revoke may name only permissions that were asked, and a traces revoke only traces permissions. A list of grants is sorted by permission with no repeat, and has no `current` field. A permission check must name the Gauge, the permission, and the engine that were asked, and `engine` is `null` when none was asked. An audit read has records that follow each other by one in `seq`, with a valid time, and an action that fits its way (`grant` by `plan`, `revoke` by `revoke`, `remove`, `disable`, or `update`), and its `firstSeq` and `droppedCount` must fit the first record. Every list that a reply holds is read with no hole, so a sparse list is a protocol error. A refusal reason is typed by its code: `GAUGE_GRANT_MISSING` has a grant reason or none, `GAUGE_AUDIT_FAILED` always has an audit reason, `GAUGE_LAYOUT_INVALID` always has a layout reason, `GAUGE_PROTECTED` has a protected reason or none, and every other code has a manifest reason or none.
+
+The layout calls are checked the same way. A layout is read from own properties, with the grid and the tiles checked and no unknown field, and it must be in canonical order. A state in safe mode has revision 0 and a cause, and a saved state has a revision of 1 or more. A list of revisions is newest first, with falling numbers, at most 10. An export must be the canonical text of a layout. A layout plan must answer the request: the same kind, place, Gauge, revision, and text. An applied change must name the plan's kind, and a plan that changes the layout cannot come back as unchanged.
 
 A Gauge summary has these six fields, all present: `id`, `title`, and `version` are strings, `kind` is `ui` or `data`, `origin` is `stock` or `third-party`, and `protected` is a boolean. The client reads each field once and checks the value it read. It hands back a new frozen object made from those six values. Any other field is dropped. A list is frozen too.
 
@@ -181,13 +202,17 @@ Codes come from the registry in `packages/gauge-errors`, which is the package `@
 
 `test/grants-suite.ts` exports `runGrantsSuite(name, makeHarness)`, the grants suite, built the same way. `makeHarness(folders, options)` gives a core that holds those folders, a way to approve a plan of either kind, and a way to move the clock. `options.auditMaxBytes` sets the audit cap for the cap test. The suite covers the plan, approval, bound hashes, a changed manifest, a missing grant, traces, revoke, engine scope, and the audit file. `test/fake-core-grants.test.ts` runs it on the fake core and adds the fake's own checks. `test/grants.test.ts` tests the pure helpers, and `test/client-grants.test.ts` tests the strict reply checks.
 
+## The layout suite
+
+`test/layout-suite.ts` exports `runLayoutSuite(name, makeHarness)`, built the same way. `makeHarness(folders, options)` gives a core that holds the nine stock Gauges of the bento home, the three fixture Gauges, and the given folders, with a way to approve a plan and a way to move the clock. `options.layoutFile` is the saved file the core finds when it starts. The suite covers the home, export and import (with the hostile texts), the way back, the sizes a Gauge allows, swap, the default action, plans and approvals, the 10 revisions, restore, safe mode, and a Gauge that proposes to add itself. Every expected value is written out in the suite. `test/fake-core-layout.test.ts` runs it on the fake core and adds the fake's own checks. `test/client-layout.test.ts` tests the strict reply checks.
+
 ## The client suite
 
 `test/client-suite.ts` exports `runClientSuite(name, makeCore, expected?)`. The core is its parameter. `expected` is the list of Gauges the core holds. It defaults to a list written out in the suite, so the fake core is checked against fixed values and not against itself. `test/fake-core.test.ts` runs the suite on the fake core. When the real core exists, another test file calls it with the real core and that core's own list.
 
 ## Adding a call
 
-Write its test in `test/client-suite.ts` first. Then add the method name to `CoreMethod`, the fake core case, and the client method.
+Write its test in the suite of its area first (`test/client-suite.ts` for a plain call). Then add the method name to `CoreMethod`, the fake core case, and the client method.
 
 ## Tests
 

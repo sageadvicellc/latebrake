@@ -4,10 +4,17 @@ import {
   PERMISSION_NAMES, compareVersions, isPermission, isTracesPermission, isUnsafeFolderName, parseVersion, permissionOf, unsafeNameReason, validateManifest,
   type AuditReason, type GaugeManifest, type GrantReason, type ManifestReason, type PermissionName,
 } from '../../gauge-manifest/src/index.js';
-import { FIXTURE_GAUGES } from './fixtures.js';
+import {
+  PAGE_IDS, canonicalText, checkLayout, defaultLayout, layoutObject, newFile, parseLayout, parseLayoutFile, proposeTile, saveRevision, serializeLayoutFile, swapPlace, defaultPlace, tileInfoOf, invalid as layoutInvalid,
+  type GaugeTable, type Layout, type LayoutFile, type LayoutRefusal, type TileInfo, type UnknownGaugeRefusal,
+} from '../../gauge-layout/src/index.js';
+import { FIXTURE_GAUGES, HOME_STOCK } from './fixtures.js';
+import { layoutSteps } from './layout-plan.js';
 import { DEFAULT_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES, appendAuditStep, auditLine, grantSteps } from './grants.js';
 import { escapeForPlan } from './plan-text.js';
-import { PLAN_ACTIONS, type AuditEntry, type AuditRead, type Core, type CoreRefusal, type CoreReply, type GaugeApplied, type GaugePlan, type GaugeSummary, type PlanAction } from './types.js';
+import {
+  LAYOUT_KINDS, PLAN_ACTIONS, type AuditEntry, type AuditRead, type Core, type CoreRefusal, type CoreReply, type GaugeApplied, type GaugePlan, type GaugeSummary, type LayoutKind, type LayoutSafe, type PlanAction,
+} from './types.js';
 
 export { escapeForPlan };
 
@@ -48,6 +55,13 @@ export interface FakeCoreOptions {
    * A real core writes the file here.
    */
   readonly onAuditWrite?: (text: string) => void;
+  /** When true, the core also holds the nine stock Gauges of the bento home, after the fixture Gauges. False by default, so the fixture list stays as the older suites expect it. */
+  readonly home?: boolean;
+  /**
+   * The saved layout file that the core finds when it starts, as text or UTF-8 bytes. The core keeps a copy. None means a first start, with the default layout. A file that is broken, or
+   * that no longer fits the Gauges the core holds, makes the core start in safe mode with the default layout. The core never refuses to start because of it.
+   */
+  readonly layoutFile?: string | Uint8Array;
 }
 
 /**
@@ -63,6 +77,8 @@ export interface FakeCore extends Core {
   replaceFolder(folder: GaugeFolder): void;
   /** The text of the audit file: one JSON line for each record, oldest first. A real core keeps this in a file on this computer. */
   auditFile(): string;
+  /** The text of the saved layout file. In safe mode it is the broken text that was found, until the first change replaces it. A real core keeps this in a file on this computer. */
+  layoutFile(): string;
 }
 
 interface Installed {
@@ -75,6 +91,8 @@ interface Installed {
   /** The permissions and the engines its manifest declares. A Gauge the core starts with declares none. */
   permissions: readonly string[];
   engines: readonly string[];
+  /** What its tile allows. `null` for a Gauge with no tile. */
+  tile: TileInfo | null;
 }
 interface Hashes {
   readonly manifestHash: string;
@@ -102,6 +120,7 @@ type Planned = Refusal
 interface Declared {
   readonly permissions: readonly string[];
   readonly engines: readonly string[];
+  readonly tile: TileInfo | null;
 }
 /** What a grant plan says before the core seals it. */
 interface GrantContent {
@@ -165,7 +184,12 @@ function describe(manifest: GaugeManifest): readonly string[] {
 const digestOfGrant = (plan: GrantContent): string => sha256(JSON.stringify(['grant', plan.id, plan.version, plan.permissions, plan.steps, plan.manifestHash, plan.folderHash]));
 const sealedGrant = (plan: GrantContent): SealedGrant => ({ ...plan, permissions: [...plan.permissions], steps: [...plan.steps], digest: digestOfGrant(plan) });
 
-const refuse = (code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED'>, reason?: ManifestReason): Refusal => (reason === undefined ? { ok: false, code } : { ok: false, code, reason });
+type PlainCode = Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED'>;
+const refuse = (code: PlainCode, reason?: ManifestReason): Refusal => (reason === undefined ? { ok: false, code } : { ok: false, code, reason });
+/** A refusal because a Gauge is protected: the lifecycle gives no reason. */
+const protectedRefusal = (): Refusal => ({ ok: false, code: 'GAUGE_PROTECTED' });
+/** A refusal of a layout, or of a change to it, or of a Gauge that a change names. */
+const refusalOf = (result: LayoutRefusal | UnknownGaugeRefusal): Refusal => (result.code === 'UNKNOWN_GAUGE' ? refuse('UNKNOWN_GAUGE') : result);
 /** A refusal because the audit file could not take the record of a grant. */
 const auditRefusal = (reason: AuditReason): Refusal => ({ ok: false, code: 'GAUGE_AUDIT_FAILED', reason });
 /** A refusal because of a grant: the code `GAUGE_GRANT_MISSING` with a reason of the closed set, or with none when the permission is plainly not granted. */
@@ -190,6 +214,9 @@ const isDenseTexts = (value: unknown): value is string[] => Array.isArray(value)
  * is written to an audit file with a size cap. A grant is written before it takes effect, and it is refused when its record cannot be written. A revoke, a removal, a disable, and an update take
  * effect first, and their records are written after, on a best effort.
  *
+ * The layout (`bowerloom.layout.*`, see `packages/gauge-layout`) follows the same plan and approval rules: no call changes it without a plan the person approves. The core starts from the saved layout
+ * file (`layoutFile`), or in safe mode with the default layout when that file is broken or invalid, and a refused change leaves the layout, the revisions, and the file as they were.
+ *
  * The fake does not check `dependencies` at install, and a removal is not blocked by a Gauge that depends on it. Both belong to a later ticket.
  */
 export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
@@ -198,9 +225,14 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   const auditMaxBytes = options.auditMaxBytes ?? DEFAULT_AUDIT_MAX_BYTES;
   if (!Number.isSafeInteger(auditMaxBytes) || auditMaxBytes < MIN_AUDIT_MAX_BYTES) throw new RangeError(`the audit size cap is a whole number of at least ${MIN_AUDIT_MAX_BYTES} bytes`);
   const folders = new Map<string, GaugeFolder>((options.folders ?? []).map(folder => [folder.name, copyFolder(folder)]));
-  const installed = new Map<string, Installed>(FIXTURE_GAUGES.map(gauge => [gauge.id, { summary: { ...gauge }, enabled: true, manifestHash: null, folderHash: null, details: [`permissions: none`, `kind: ${gauge.kind}`], permissions: [], engines: [] }]));
+  const started: readonly { readonly summary: GaugeSummary; readonly tile: TileInfo | null }[] = [
+    ...FIXTURE_GAUGES.map(summary => ({ summary, tile: null })), ...(options.home === true ? HOME_STOCK : []),
+  ];
+  const installed = new Map<string, Installed>(started.map(({ summary, tile }) => [summary.id, {
+    summary: { ...summary }, enabled: true, manifestHash: null, folderHash: null, details: [`permissions: none`, `kind: ${summary.kind}`], permissions: [], engines: [], tile,
+  }]));
   /** Ids that a user Gauge may never use. A stock id stays reserved after its Gauge is removed. */
-  const stockIds = new Set<string>(FIXTURE_GAUGES.filter(gauge => gauge.origin === 'stock').map(gauge => gauge.id));
+  const stockIds = new Set<string>(started.filter(({ summary }) => summary.origin === 'stock').map(({ summary }) => summary.id));
   /** The nonce of each plan the core issued, with the digest of the plan and the count of applied steps at that time. A nonce is retired when the state changes. */
   const issued = new Map<string, { digest: string; epoch: number; gauge: string | null }>();
   const approvals = new Map<string, Approval>();
@@ -214,6 +246,29 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   /** How many records were dropped to keep the file under its cap, and whether a record was ever lost for another reason. The reader sees both. */
   let auditDropped = 0;
   let auditFailed = false;
+
+  // The layout. The file on disk is `layoutDisk`. In safe mode `layoutSaved` is `null` and `layoutSafe` says why: the layout in use is then the default layout, which is not saved until the person makes a change.
+  /** The Gauges as the layout sees them: whether each is enabled and protected, and what its tile allows. */
+  const gaugeTable = (): GaugeTable => new Map([...installed].map(([id, entry]) => [id, { enabled: entry.enabled, protected: entry.summary.protected, tile: entry.tile }]));
+  let layoutSaved: LayoutFile | null = null;
+  let layoutSafe: LayoutSafe | null = null;
+  let layoutDisk = '';
+  {
+    const found = options.layoutFile;
+    if (found === undefined) {
+      layoutSaved = newFile(defaultLayout(gaugeTable()));
+      layoutDisk = serializeLayoutFile(layoutSaved);
+    } else {
+      // The core keeps a copy of what it was given.
+      const copy = typeof found === 'string' ? found : Uint8Array.from(found);
+      layoutDisk = typeof copy === 'string' ? copy : new TextDecoder().decode(copy);
+      const read = parseLayoutFile(copy, gaugeTable());
+      if (read.ok) layoutSaved = read.file;
+      else layoutSafe = { code: read.code, reason: read.reason } as LayoutSafe;
+    }
+  }
+  const layoutInUse = (): Layout => layoutSaved?.current ?? defaultLayout(gaugeTable());
+  const layoutNumber = (): number => layoutSaved?.revision ?? 0;
 
   /** The time of an audit record, in ISO form, or `undefined` when the clock gave no usable time (or threw). */
   const readClock = (): string | undefined => {
@@ -281,10 +336,12 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     const origin: 'stock' | 'third-party' = folder.location === 'bundled' ? 'stock' : 'third-party';
     // A manifest may ask to be protected, but only a stock Gauge may be, so a third-party Gauge can never be one the person cannot remove.
     const summary: GaugeSummary = { id: manifest.id, title: manifest.title, version: manifest.version, kind: manifest.kind, origin, protected: manifest.protected && origin === 'stock' };
+    // The id of a core page is reserved for ever, for every origin: a Gauge with the id `settings` could stand in for the Settings page in the layout.
+    if (PAGE_IDS.includes(summary.id)) return refuse('GAUGE_NAME_RESERVED');
     if (origin === 'third-party' && isReserved(summary.id)) return refuse('GAUGE_NAME_RESERVED');
     const current = installed.get(summary.id);
     const hashes = hashesOf(folder), details = describe(manifest);
-    const declared: Declared = { permissions: [...manifest.permissions], engines: [...manifest.engines] };
+    const declared: Declared = { permissions: [...manifest.permissions], engines: [...manifest.engines], tile: manifest.tile === null ? null : tileInfoOf(manifest.tile) };
     const content = { id: summary.id, folder: folder.name, origin, manifestHash: hashes.manifestHash, folderHash: hashes.folderHash };
     if (action === 'install') {
       if (current) return refuse('GAUGE_EXISTS');
@@ -297,7 +354,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     }
     if (!current) return refuse('UNKNOWN_GAUGE');
     if (current.summary.origin !== origin) return refuse('GAUGE_NAME_RESERVED');
-    if (current.summary.protected && !summary.protected) return refuse('GAUGE_PROTECTED');
+    if (current.summary.protected && !summary.protected) return protectedRefusal();
     if (compareVersions(parseVersion(summary.version) ?? [0, 0, 0], parseVersion(current.summary.version) ?? [0, 0, 0]) <= 0) return refuse('GAUGE_VERSION_NOT_NEWER');
     return {
       ok: true, kind: 'folder', summary, details, hashes, declared,
@@ -310,7 +367,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   function planOnInstalled(action: 'enable' | 'disable' | 'remove', id: unknown): Planned {
     const current = typeof id === 'string' ? installed.get(id) : undefined;
     if (!current) return refuse('UNKNOWN_GAUGE');
-    if (action !== 'enable' && current.summary.protected) return refuse('GAUGE_PROTECTED');
+    if (action !== 'enable' && current.summary.protected) return protectedRefusal();
     const { summary } = current, state = current.enabled ? 'enabled' : 'disabled';
     const id0 = escapeForPlan(summary.id), version = escapeForPlan(summary.version);
     const steps = {
@@ -386,7 +443,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (fresh.kind === 'folder') {
       const entry: Installed = {
         summary: fresh.summary, enabled: false, manifestHash: fresh.hashes.manifestHash, folderHash: fresh.hashes.folderHash, details: fresh.details,
-        permissions: fresh.declared.permissions, engines: fresh.declared.engines,
+        permissions: fresh.declared.permissions, engines: fresh.declared.engines, tile: fresh.declared.tile,
       };
       if (action === 'update') {
         if (!current) return reply(refuse('UNKNOWN_GAUGE'));
@@ -554,6 +611,120 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     return { ok: true, gauge: gaugeId, permission: entry.name, engine: engineName };
   }
 
+  // Layout plans
+
+  /** What a layout plan says before the core seals it. */
+  interface LayoutContent {
+    readonly kind: LayoutKind;
+    readonly place: string | null;
+    readonly gauge: string | null;
+    readonly revision: number | null;
+    readonly text: string | null;
+    readonly steps: readonly string[];
+    readonly baseHash: string;
+    readonly nextHash: string;
+  }
+  type LayoutPlanned = (LayoutContent & { readonly ok: true; readonly digest: string; readonly next: Layout; readonly owner: string | null }) | Refusal;
+  const layoutDigest = (plan: LayoutContent): string => sha256(JSON.stringify(['layout', plan.kind, plan.place, plan.gauge, plan.revision, plan.text, plan.steps, plan.baseHash, plan.nextHash]));
+  const isLayoutKind = (value: unknown): value is LayoutKind => typeof value === 'string' && (LAYOUT_KINDS as readonly string[]).includes(value);
+  const layoutRefusal = (reason: Parameters<typeof layoutInvalid>[0]): Refusal => layoutInvalid(reason);
+
+  /** Plans a change to the layout. Nothing changes. Every check runs here, so the plan the person sees is one that can be applied. */
+  function planLayout(params: Readonly<Record<string, unknown>>): LayoutPlanned {
+    const kind = params['kind'];
+    if (!isLayoutKind(kind)) return layoutRefusal('invalid_request');
+    const table = gaugeTable();
+    const base = layoutInUse();
+    const placeParam = params['place'], gaugeParam = params['gauge'];
+    let next: Layout;
+    let owner: string | null = null;
+    let text: string | null = null, revision: number | null = null;
+    switch (kind) {
+      case 'set': {
+        const given = params['text'];
+        if (typeof given !== 'string') return layoutRefusal('invalid_request');
+        const parsed = parseLayout(given, table);
+        if (!parsed.ok) return refusalOf(parsed);
+        next = parsed.layout;
+        text = given;
+        break;
+      }
+      case 'swap': {
+        const changed = swapPlace(base, table, placeParam, gaugeParam);
+        if (!changed.ok) return refusalOf(changed);
+        next = changed.layout;
+        break;
+      }
+      case 'default': {
+        const changed = defaultPlace(base, table, placeParam);
+        if (!changed.ok) return refusalOf(changed);
+        next = changed.layout;
+        break;
+      }
+      case 'restore': {
+        const wanted = params['revision'];
+        if (typeof wanted !== 'number' || !Number.isSafeInteger(wanted)) return layoutRefusal('invalid_request');
+        const entry = layoutSaved?.revisions.find(candidate => candidate.revision === wanted);
+        if (!entry) return layoutRefusal('unknown_revision');
+        // A revision is checked against the Gauges the core holds now: a Gauge may be gone since.
+        const refused = checkLayout(entry.layout, table);
+        if (refused) return refusalOf(refused);
+        next = entry.layout;
+        revision = wanted;
+        break;
+      }
+      case 'propose': {
+        // A Gauge may only ask to add itself, and only with the grant. The grant check is the one enforcement point.
+        const allowed = enforce(gaugeParam, 'layout.propose', undefined);
+        if (!allowed.ok) return allowed;
+        const changed = proposeTile(base, table, gaugeParam);
+        if (!changed.ok) return refusalOf(changed);
+        next = changed.layout;
+        owner = allowed.gauge;
+        break;
+      }
+    }
+    const baseHash = sha256(canonicalText(base)), nextHash = sha256(canonicalText(next));
+    const place = (kind === 'swap' || kind === 'default') && typeof placeParam === 'string' ? placeParam : null;
+    const gauge = (kind === 'swap' || kind === 'propose') && typeof gaugeParam === 'string' ? gaugeParam : null;
+    const steps = layoutSteps({ kind, place, gauge, revision, base, next, baseHash, nextHash, baseRevision: layoutNumber(), safe: layoutSafe !== null });
+    const content: LayoutContent = { kind, place, gauge, revision, text, steps, baseHash, nextHash };
+    return { ok: true, ...content, digest: layoutDigest(content), next, owner };
+  }
+
+  /** Reads the layout plan a caller sends back. Anything that is not a whole plan reads as `undefined`. The digest is computed here, and the one the caller sent is ignored. */
+  function readLayoutPlan(value: unknown): (LayoutContent & { readonly digest: string; readonly nonce: string }) | undefined {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+    const { action, kind, place, gauge, revision, text, steps, baseHash, nextHash, nonce } = value as Record<string, unknown>;
+    if (action !== 'layout' || !isLayoutKind(kind) || typeof nonce !== 'string' || typeof baseHash !== 'string' || typeof nextHash !== 'string') return undefined;
+    const nullable = (field: unknown): field is string | null => field === null || typeof field === 'string';
+    if (!nullable(place) || !nullable(gauge) || !nullable(text) || !(revision === null || typeof revision === 'number') || !isDenseTexts(steps)) return undefined;
+    const content: LayoutContent = { kind, place, gauge, revision, text, steps: [...steps], baseHash, nextHash };
+    return { ...content, digest: layoutDigest(content), nonce };
+  }
+
+  function applyLayout(params: Readonly<Record<string, unknown>>): CoreReply {
+    const live = liveApproval(params);
+    if (!live) return reply(refuse('GAUGE_PLAN_NOT_APPROVED'));
+    const { token, approval } = live;
+    const plan = readLayoutPlan(params['plan']);
+    if (!plan || plan.nonce !== approval.nonce || plan.digest !== approval.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    // Plan again from the state now: a change that is no longer the one the person approved, or that no longer applies, is refused. Nothing is kept until every check has passed.
+    const fresh = planLayout({ kind: plan.kind, place: plan.place, gauge: plan.gauge, revision: plan.revision, text: plan.text });
+    if (!fresh.ok) return reply(fresh);
+    // A second line: every applied step already retires every plan and approval of before (the epoch), so no test can reach this refusal.
+    if (fresh.digest !== plan.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    // In safe mode the layout in use was never saved, so the first change starts a new file. Otherwise the layout in use becomes the newest revision.
+    const saved = layoutSaved === null ? newFile(fresh.next) : saveRevision(layoutSaved, fresh.next);
+    if (!saved) return reply(layoutRefusal('bad_revision'));
+    const changed = layoutSaved === null || saved !== layoutSaved;
+    layoutSaved = saved;
+    layoutSafe = null;
+    layoutDisk = serializeLayoutFile(saved);
+    retire(plan.nonce, token);
+    return { ok: true, result: { kind: fresh.kind, revision: saved.revision, changed } };
+  }
+
   return {
     approve(nonce) {
       const plan = typeof nonce === 'string' ? issued.get(nonce) : undefined;
@@ -567,6 +738,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
       folders.set(folder.name, copyFolder(folder));
     },
     auditFile: () => auditLines.join(''),
+    layoutFile: () => layoutDisk,
     async call(method, params): Promise<CoreReply> {
       switch (method) {
         case 'bowerloom.gauges.list':
@@ -615,6 +787,22 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const result: AuditRead = { entries, firstSeq: entries[0]?.seq ?? null, droppedCount: auditDropped, auditFailed };
           return { ok: true, result };
         }
+        case 'bowerloom.layout.read':
+          return { ok: true, result: { layout: layoutObject(layoutInUse()), revision: layoutNumber(), safe: layoutSafe === null ? null : { ...layoutSafe } } };
+        case 'bowerloom.layout.revisions':
+          return { ok: true, result: (layoutSaved?.revisions ?? []).map(entry => ({ revision: entry.revision, layout: layoutObject(entry.layout) })) };
+        case 'bowerloom.layout.export':
+          return { ok: true, result: canonicalText(layoutInUse()) };
+        case 'bowerloom.layout.plan': {
+          const planned = planLayout(params);
+          if (!planned.ok) return reply(planned);
+          const nonce = randomBytes(32).toString('hex');
+          issued.set(nonce, { digest: planned.digest, epoch, gauge: planned.owner });
+          const { kind, place, gauge, revision, text, steps, digest, baseHash, nextHash } = planned;
+          return { ok: true, result: { action: 'layout', kind, place, gauge, revision, text, steps: [...steps], digest, baseHash, nextHash, nonce } };
+        }
+        case 'bowerloom.layout.apply':
+          return applyLayout(params);
         case 'bowerloom.gauges.routes':
           return { ok: true, result: [...installed.values()].filter(gauge => gauge.enabled).map(({ summary }) => `/gauges/${summary.id}`) };
         default:

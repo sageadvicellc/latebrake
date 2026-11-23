@@ -122,7 +122,7 @@ test('bytes that are not UTF-8 are refused with not_utf8', () => {
 });
 
 test('a text with a byte order mark is refused with syntax, as text and as bytes', () => {
-  assert.deepEqual(parse(`﻿${homeText()}`), { code: 'GAUGE_LAYOUT_INVALID', reason: 'syntax' });
+  assert.deepEqual(parse(`\uFEFF${homeText()}`), { code: 'GAUGE_LAYOUT_INVALID', reason: 'syntax' });
   assert.deepEqual(parse(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(homeText())])), { code: 'GAUGE_LAYOUT_INVALID', reason: 'syntax' });
 });
 
@@ -173,7 +173,7 @@ test('a grid that is not 6 columns, 200 px, and 12 px is refused with unsupporte
 test('every id and name that is not a plain lower-case name is refused with invalid_field, including ids that are not text', () => {
   const tile = (field: string, value: unknown) => homeText(home => ({ ...home, tiles: [{ ...home.tiles[0], [field]: value }] }));
   for (const field of ['place', 'gauge', 'default']) {
-    for (const value of [5, null, true, [], {}, '', 'A', 'a b', 'a_b', '-a', 'a-', 'a--b', '../a', 'a/b', 'a'.repeat(65), '\u0000', '__proto__', 'constructor\n']) {
+    for (const value of [5, null, true, [], {}, '', 'A', 'a b', 'a_b', '-a', 'a-', 'a--b', '../a', 'a/b', 'a'.repeat(65), '\u0000', '__proto__', 'constructor\n', '\u{1F4A5}', 'a\u200Bb', '\uFF41', 'caf\u00E9', 'a\u202Eb']) {
       assert.deepEqual(parse(tile(field, value)), { code: 'GAUGE_LAYOUT_INVALID', reason: 'invalid_field' }, `${field} ${JSON.stringify(value)}`);
     }
   }
