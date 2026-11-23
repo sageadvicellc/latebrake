@@ -17,7 +17,7 @@ export const MAX_TASK_LENGTH = 4096;
 
 /**
  * Why a definition, or a job id, was refused with `GAUGE_JOB_INVALID`. `request`: not a plain record, or a field that the definition does not have. `title`, `sessions`, `label`, `engine`, `harness`, `folder`, `model`, `task`:
- * that field is missing or wrong (a label that repeats is a wrong label). `secret`: the title, a label, a folder, a model, or a task looks like a secret. A job is stored and shown to every Gauge that may read jobs, so the scan refuses the shapes it knows
+ * that field is missing or wrong (a label that repeats is a wrong label). `secret`: the title, a label, an engine, a harness, a folder, a model, or a task looks like a secret. A job is stored and shown to every Gauge that may read jobs, so the scan refuses the shapes it knows
  * (the scan of `gauge-manifest`). It does not find every secret, and it also refuses a harmless word of 32 characters or more that mixes lower case, upper case, and digits. `job`: the id of a job is malformed.
  * A reason never holds a value that a caller sent.
  */
@@ -106,7 +106,8 @@ function interactiveRefusal(top: ReadonlyMap<string, unknown>): DefinitionRefusa
   const found = new Set<NotInteractiveReason>();
   if (top.has('schedule')) found.add('schedule');
   if (top.has('unattended')) found.add('unattended');
-  const items = readList(top.get('sessions'), MAX_JOB_SESSIONS);
+  // The list is read with the cap of the reader and not the cap of a job, so a flag in the ninth session, or the two hundredth, is still found.
+  const items = readList(top.get('sessions'));
   for (const item of items ?? []) {
     if (!isPlainRecord(item)) continue;
     const fields = ownFields(item);
@@ -142,7 +143,9 @@ function checkSession(value: unknown): { readonly ok: true; readonly value: JobS
   if (!isLabel(label)) return invalid('label');
   if (looksLikeSecret(label)) return invalid('secret');
   if (typeof engine !== 'string' || !checkEngineId(engine).ok) return invalid('engine');
+  if (looksLikeSecret(engine)) return invalid('secret');
   if (typeof harness !== 'string' || !checkEngineId(harness).ok) return invalid('harness');
+  if (looksLikeSecret(harness)) return invalid('secret');
   if (typeof folder !== 'string' || !checkFolder(folder).ok) return invalid('folder');
   if (looksLikeSecret(folder)) return invalid('secret');
   // A model choice is written out: `null` for the engine's own default, or a provider and a model. A field that is left out is not a choice.

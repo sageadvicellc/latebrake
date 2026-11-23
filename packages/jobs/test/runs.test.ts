@@ -528,3 +528,66 @@ test('the default run id is run- and sixteen hexadecimal characters', () => {
   assert.ok(run.ok);
   assert.match(run.run, /^run-[0-9a-f]{16}$/);
 });
+
+/** Counts the promises that were rejected and never handled, while the callback runs and for two turns after it. */
+async function unhandledWhile(work: () => void | Promise<void>): Promise<number> {
+  let count = 0;
+  const listener = (): void => { count += 1; };
+  process.on('unhandledRejection', listener);
+  try {
+    await work();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await new Promise<void>(resolve => setImmediate(resolve));
+  } finally {
+    process.off('unhandledRejection', listener);
+  }
+  return count;
+}
+
+/** A host over the manual launcher whose group start is changed by the test. */
+function changedGroup(change: (group: Extract<ReturnType<EngineHost['beginStartGroup']>, { ok: true }>, real: EngineHost) => ReturnType<EngineHost['beginStartGroup']>) {
+  const launcher = manualLauncher();
+  let counter = 0;
+  const real = createEngineHost({
+    engines: ['alpha', 'beta'].map(spec), launcher, locate: program => program, canonical: folder => ({ path: folder, key: folder }), log: () => undefined, newId: () => `s-${(counter += 1)}`, schedule: () => () => undefined,
+  });
+  const stopped: string[] = [];
+  const host: EngineHost = {
+    ...real,
+    beginStartGroup: (plans, approvals) => { const group = real.beginStartGroup(plans, approvals); return group.ok ? change(group, real) : group; },
+    stop: async session => { stopped.push(String(session)); return real.stop(session); },
+  };
+  return { host, launcher, stopped, lines: [] as string[] };
+}
+const TWO = jobOf([{ label: 'a', engine: 'alpha', folder: '/w/a' }, { label: 'b', engine: 'beta', folder: '/w/b' }]);
+
+test('a start whose spawn answer is rejected never becomes an unhandled rejection: the book handles it, and the run goes on', async () => {
+  const c = changedGroup((group, real) => ({
+    ok: true,
+    members: group.members.map(member => ({ ...member, settled: Promise.reject(new Error('the executor threw')), started: Promise.resolve({ ok: true as const, info: real.get(member.session) ?? (() => { throw new Error('no session'); })() }) })),
+  }));
+  const book = createRunBook({ host: c.host, newId: () => 'run-1', log: () => undefined });
+  const result = book.plan(TWO);
+  assert.ok(result.ok);
+  let outcome: unknown;
+  const count = await unhandledWhile(async () => {
+    const run = book.begin(result, { sharedApproved: false });
+    assert.ok(run.ok);
+    outcome = await run.settled;
+  });
+  assert.equal(count, 0);
+  assert.deepEqual(outcome, { ok: true, run: 'run-1' });
+});
+
+test('a host that begins fewer sessions than the plan holds is a bug: the sessions that began are stopped, nothing is recorded, and the book throws', async () => {
+  const c = changedGroup(group => ({ ok: true, members: group.members.slice(0, 1) }));
+  const lines: string[] = [];
+  const book = createRunBook({ host: c.host, newId: () => 'run-1', log: line => lines.push(line) });
+  const result = book.plan(TWO);
+  assert.ok(result.ok);
+  assert.throws(() => book.begin(result, { sharedApproved: false }), /fewer sessions/);
+  assert.deepEqual(c.stopped, ['s-1']);
+  assert.equal(book.size, 0);
+  await waitFor(() => c.launcher.programs[0]?.signals.includes('term') === true, 'the stop of the session that began');
+  c.launcher.programs[0]?.exit(null, 'SIGTERM');
+});

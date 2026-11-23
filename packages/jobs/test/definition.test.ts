@@ -221,3 +221,22 @@ test('a proxy whose trap throws is a request refusal and never a throw: its prot
   assert.doesNotThrow(() => checkDefinition(definition({ sessions: listProxy.proxy })));
   assert.deepEqual(checkDefinition(definition({ sessions: listProxy.proxy })), invalid('sessions'));
 });
+
+test('a secret is found in an engine id and a harness id too', () => {
+  const key = 'sk-aaaaaaaaaaaaaaaaaaaaaaaa';
+  assert.deepEqual(checkDefinition(definition({ sessions: [session({ engine: key })] })), invalid('secret'));
+  assert.deepEqual(checkDefinition(definition({ sessions: [session({ harness: key })] })), invalid('secret'));
+  assert.deepEqual(checkDefinition(definition({ sessions: [session({ engine: 'Engine' })] })), invalid('engine'), 'a field that is wrong is refused for that first');
+  assert.ok(checkDefinition(definition({ sessions: [session({ engine: 'sk-short', harness: 'secret-harness' })] })).ok);
+});
+
+test('a schedule or an unattended flag wins wherever it sits, also past the eighth session, and when the list is too long to be a job', () => {
+  const nine = Array.from({ length: 9 }, (_value, index) => session({ label: `s-${index}`, ...(index === 8 ? { schedule: 'daily' } : {}) }));
+  assert.deepEqual(checkDefinition(definition({ sessions: nine })), interactive('schedule'));
+  const many = Array.from({ length: 200 }, (_value, index) => session({ label: `s-${index}`, ...(index === 199 ? { unattended: true } : {}) }));
+  assert.deepEqual(checkDefinition(definition({ sessions: many })), interactive('unattended'));
+  const plain = Array.from({ length: 9 }, (_value, index) => session({ label: `s-${index}` }));
+  assert.deepEqual(checkDefinition(definition({ sessions: plain })), invalid('sessions'), 'nine plain sessions are still too many');
+  const huge = Array.from({ length: 5000 }, (_value, index) => session({ label: `s-${index}` }));
+  assert.deepEqual(checkDefinition(definition({ sessions: huge })), invalid('sessions'), 'a list over the reader cap is refused, with no scan');
+});

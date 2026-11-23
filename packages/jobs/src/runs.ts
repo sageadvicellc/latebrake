@@ -241,6 +241,21 @@ export function createRunBook(options: RunBookOptions): RunBook {
       if (!isRunId(id) || runs.has(id)) throw new Error('run book: newId gave a run id that is malformed or already used');
       const group = host.beginStartGroup(planned.start, approvals);
       if (!group.ok) return { ...group, label: labelAt(planned.plan, group.index) };
+      if (group.members.length < planned.plan.sessions.length) {
+        // The host began fewer sessions than the plan holds. That is a bug, and the sessions that did begin must not be left running with nothing to read them.
+        for (const begun of group.members) {
+          void (async (): Promise<void> => {
+            try {
+              await host.stop(begun.session);
+            } catch (error) {
+              say(`run book: the stop of session ${escapeText(begun.session)} for the run ${escapeText(id)} threw: ${escapeText(error instanceof Error ? error.message : String(error))}`);
+            }
+          })();
+        }
+        throw new Error('run book: the host began fewer sessions than the plan holds');
+      }
+      // The answer of a spawn is a promise that rejects if the start executor threw. The book reads `started`, and never `settled`, so a handler here keeps an unread rejection from crashing the process.
+      for (const begun of group.members) begun.settled.catch(() => undefined);
       runs.set(id, {
         job: planned.plan.job, title: planned.plan.title,
         members: planned.plan.sessions.map((session, index) => {

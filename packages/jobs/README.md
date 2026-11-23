@@ -18,9 +18,9 @@ A definition is `{ title, sessions }`. Each session is `{ label, engine, harness
 | `folder` | an absolute path that is already normal (the rule of the Engine Host) | `folder` |
 | `model` | `null` for the engine's own default, or exactly a provider and a model | `model` |
 | `task` | 1 to 4,096 characters, no control, format, or separator character except a line feed and a tab | `task` |
-| title, label, folder, model, task | looks like a secret (the scan of `gauge-manifest`), checked after the field is found good | `secret` |
+| title, label, engine, harness, folder, model, task | looks like a secret (the scan of `gauge-manifest`), checked after the field is found good | `secret` |
 
-The secret scan is the one of `gauge-manifest`: it knows a private key header, an access key id, tokens with a known prefix, a signed web token, and any run of 32 or more letters, digits, `_`, `+`, `=`, and `-` that mixes lower case, upper case, and a digit. It finds no secret that has none of these shapes, and it refuses a harmless word of that last shape (a 32-character mixed-case name in a title, a model, or a folder segment is a false alarm). A job is stored and shown to every Gauge that may read jobs, so the scan is a floor and not a guarantee.
+The secret scan is the one of `gauge-manifest`: it knows a private key header, an access key id, tokens with a known prefix, a signed web token, and any run of 32 or more letters, digits, `_`, `+`, `=`, and `-` that mixes lower case, upper case, and a digit. It finds no secret that has none of these shapes, and it refuses a harmless word of that last shape (a 32-character mixed-case name in a title, a model, an engine id, or a folder segment is a false alarm). A job is stored and shown to every Gauge that may read jobs, so the scan is a floor and not a guarantee.
 
 A field that is left out is refused with the reason of that field, and `model` must be written as `null`, never left out. The reasons are the closed set `JOB_REASONS`, with `job` for a malformed job id. A reason never holds a value that a caller sent.
 
