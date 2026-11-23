@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRelay } from '../src/bus.js';
-import { createFakeEngine } from '../src/fixtures.js';
+import { createFakeEngine } from './fixtures.js';
 import { build, route, tick } from './support.js';
 
 const GOOD_BODY = 'Please check the draft in the shared folder.';
@@ -10,11 +10,11 @@ const GOOD_BODY = 'Please check the draft in the shared folder.';
 test('a message on a new accepted-output route waits for the person, and nothing reaches the receiver', async () => {
   const { relay, engines, send, clock } = build();
   const reply = send('sess-a', 'route-1', 'key-1', GOOD_BODY);
-  assert.deepEqual(reply, { ok: true, id: 'msg-1', state: 'pending', duplicate: false });
+  assert.deepEqual(reply, { ok: true, id: 'msg-1', state: 'pending', reason: null, duplicate: false });
   await tick();
   assert.deepEqual(engines['sess-b']?.inputs, []);
   assert.deepEqual(relay.control.message('msg-1'), {
-    id: 'msg-1', state: 'pending', reason: null, fidelity: null,
+    id: 'msg-1', state: 'pending', reason: null, failedBefore: null, fidelity: null,
     envelope: { run: 'run-1', route: 'route-1', sender: 'sess-a', receiver: 'sess-b', body: GOOD_BODY, time: clock.now, key: 'key-1' },
   });
 });
@@ -75,10 +75,27 @@ test('a session that was never given a secret cannot write, whatever it sends', 
   assert.deepEqual(relay.write.send({ session: 'sess-a', secret: '', route: 'route-1', key: 'k', body: 'hello' }), { ok: false, code: 'GAUGE_RELAY_UNAUTHENTICATED' });
 });
 
-test('a refused write for a secret is logged once, with no value in it, and a flood makes one line', () => {
+test('a refused write for a secret is logged for each session at counts 1, 2, 4, 8, and so on, with no value in it, so a flood makes few lines and a new kind is not lost', () => {
   const { relay, lines } = build();
   for (let i = 0; i < 20; i += 1) relay.write.send({ session: 'sess-a', secret: `guess-${i}`, route: 'route-1', key: 'k', body: 'hello' });
-  assert.deepEqual(lines, ['relay run-1: a write came without the right session secret']);
+  assert.deepEqual(lines, [
+    'relay run-1: a write for sess-a came without the right session secret',
+    'relay run-1: a write for sess-a came without the right session secret (2 times so far)',
+    'relay run-1: a write for sess-a came without the right session secret (4 times so far)',
+    'relay run-1: a write for sess-a came without the right session secret (8 times so far)',
+    'relay run-1: a write for sess-a came without the right session secret (16 times so far)',
+  ]);
+  relay.write.send({ session: 'sess-b', secret: 'guess', route: 'route-2', key: 'k', body: 'hello' });
+  assert.equal(lines.length, 6);
+  assert.equal(lines[5], 'relay run-1: a write for sess-b came without the right session secret');
+});
+
+test('writes that name no member share one key, so a flood of made-up sessions makes few lines and holds no memory', () => {
+  const { relay, lines } = build();
+  for (let i = 0; i < 100; i += 1) relay.write.send({ session: `made-up-${i}`, secret: 'x', route: 'route-1', key: 'k', body: 'hello' });
+  assert.equal(lines.length, 7);
+  assert.equal(lines.every(line => line.startsWith('relay run-1: a write came without the right session secret')), true);
+  assert.equal(lines.some(line => line.includes('made-up')), false);
 });
 
 test('a request that is not a plain record of exactly the five fields is a malformed request, also with a good secret', () => {
@@ -117,7 +134,7 @@ test('a bad key is a malformed key, and a key that looks like a secret is a secr
   const { send, relay } = build();
   assert.deepEqual(send('sess-a', 'route-1', '', 'hello'), { ok: false, code: 'GAUGE_MESSAGE_INVALID', reason: 'key' });
   assert.deepEqual(send('sess-a', 'route-1', 'a b', 'hello'), { ok: false, code: 'GAUGE_MESSAGE_INVALID', reason: 'key' });
-  assert.deepEqual(send('sess-a', 'route-1', 'aB3'.repeat(12), 'hello'), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND' });
+  assert.deepEqual(send('sess-a', 'route-1', 'aB3'.repeat(12), 'hello'), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'pattern' });
   assert.deepEqual(relay.control.messages(), []);
 });
 
@@ -130,9 +147,9 @@ test('a body of exactly 16,384 bytes is taken and one more byte is refused as to
 
 test('a body with a secret is refused, and a body that holds the secret of another session is refused as a secret, also when it is all lower case', () => {
   const { send, secrets, relay } = build();
-  assert.deepEqual(send('sess-a', 'route-1', 'k1', `use ghp_${'a1B2'.repeat(6)} please`), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND' });
-  assert.deepEqual(send('sess-a', 'route-1', 'k2', `his secret is ${secrets['sess-b']}`), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND' });
-  assert.deepEqual(send('sess-a', 'route-1', 'k3', `my own secret is ${secrets['sess-a']}`), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND' });
+  assert.deepEqual(send('sess-a', 'route-1', 'k1', `use ghp_${'a1B2'.repeat(6)} please`), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'pattern' });
+  assert.deepEqual(send('sess-a', 'route-1', 'k2', `his secret is ${secrets['sess-b']}`), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'relay_value' });
+  assert.deepEqual(send('sess-a', 'route-1', 'k3', `my own secret is ${secrets['sess-a']}`), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'relay_value' });
   assert.deepEqual(send('sess-a', 'route-1', 'k4', 'text\u001b[2J'), { ok: false, code: 'GAUGE_MESSAGE_INVALID', reason: 'body' });
   assert.deepEqual(relay.control.messages(), []);
 });
@@ -142,8 +159,8 @@ test('a body that holds the receipt or the nonce of a message that is in flight 
   engines['sess-b']?.setState('running');
   send('sess-a', 'route-1', 'k1', 'first');
   await tick();
-  assert.deepEqual(send('sess-b', 'route-2', 'k2', 'my receipt is rcpt-fixed-0000000000000000'), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND' });
-  assert.deepEqual(send('sess-b', 'route-2', 'k3', 'the nonce is nonce-fixed-000000000000000'), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND' });
+  assert.deepEqual(send('sess-b', 'route-2', 'k2', 'my receipt is rcpt-fixed-0000000000000000'), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'relay_value' });
+  assert.deepEqual(send('sess-b', 'route-2', 'k3', 'the nonce is nonce-fixed-000000000000000'), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'relay_value' });
   assert.equal(relay.control.messages().length, 1);
 });
 
@@ -155,7 +172,7 @@ test('the checks run in order: closed, shape, secret, route, key, body size, bod
   assert.deepEqual(call({ key: '', body: '' }), { ok: false, code: 'GAUGE_MESSAGE_INVALID', reason: 'key' });
   assert.deepEqual(call({ body: 'a'.repeat(20_000) }), { ok: false, code: 'GAUGE_MESSAGE_TOO_LARGE' });
   assert.deepEqual(call({ body: '' }), { ok: false, code: 'GAUGE_MESSAGE_INVALID', reason: 'body' });
-  assert.deepEqual(call({ body: `ghp_${'a1B2'.repeat(6)}` }), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND' });
+  assert.deepEqual(call({ body: `ghp_${'a1B2'.repeat(6)}` }), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'pattern' });
 });
 
 test('a repeat of a message is dropped by its idempotency key: one record, one delivery, and the reply names the first message', async () => {
@@ -163,8 +180,8 @@ test('a repeat of a message is dropped by its idempotency key: one record, one d
   const first = send('sess-a', 'route-1', 'same-key', GOOD_BODY);
   await tick();
   const again = send('sess-a', 'route-1', 'same-key', GOOD_BODY);
-  assert.deepEqual(first, { ok: true, id: 'msg-1', state: 'sending', duplicate: false });
-  assert.deepEqual(again, { ok: true, id: 'msg-1', state: 'sent', duplicate: true });
+  assert.deepEqual(first, { ok: true, id: 'msg-1', state: 'sending', reason: null, duplicate: false });
+  assert.deepEqual(again, { ok: true, id: 'msg-1', state: 'sent', reason: null, duplicate: true });
   await tick();
   assert.equal(relay.control.messages().length, 1);
   assert.equal(engines['sess-b']?.inputs.length, 1);
@@ -174,9 +191,9 @@ test('a repeat of a message is dropped by its idempotency key: one record, one d
 test('a repeat is dropped while the first message is still pending, and after the person declined it, so a retry never asks again', () => {
   const { relay, send } = build();
   send('sess-a', 'route-1', 'same-key', GOOD_BODY);
-  assert.deepEqual(send('sess-a', 'route-1', 'same-key', GOOD_BODY), { ok: true, id: 'msg-1', state: 'pending', duplicate: true });
+  assert.deepEqual(send('sess-a', 'route-1', 'same-key', GOOD_BODY), { ok: true, id: 'msg-1', state: 'pending', reason: null, duplicate: true });
   relay.control.decline('msg-1');
-  assert.deepEqual(send('sess-a', 'route-1', 'same-key', GOOD_BODY), { ok: true, id: 'msg-1', state: 'declined', duplicate: true });
+  assert.deepEqual(send('sess-a', 'route-1', 'same-key', GOOD_BODY), { ok: true, id: 'msg-1', state: 'declined', reason: null, duplicate: true });
   assert.equal(relay.control.messages().length, 1);
 });
 
@@ -191,14 +208,14 @@ test('a key that is used again for another body is refused as key_reused, and it
 test('a key belongs to its route: the same key on another route is another message', () => {
   const { relay, send } = build({ sessions: ['sess-a', 'sess-b', 'sess-c'], routes: [route('route-1', 'sess-a', 'sess-b'), route('route-2', 'sess-a', 'sess-c')] });
   assert.equal(send('sess-a', 'route-1', 'k', 'one').ok, true);
-  assert.deepEqual(send('sess-a', 'route-2', 'k', 'one'), { ok: true, id: 'msg-2', state: 'pending', duplicate: false });
+  assert.deepEqual(send('sess-a', 'route-2', 'k', 'one'), { ok: true, id: 'msg-2', state: 'pending', reason: null, duplicate: false });
   assert.equal(relay.control.messages().length, 2);
 });
 
 test('a route holds at most 16 waiting messages, and the 17th is refused until one moves', () => {
   const { send, relay } = build();
   for (let i = 0; i < 16; i += 1) assert.equal(send('sess-a', 'route-1', `k${i}`, `message ${i}`).ok, true);
-  assert.deepEqual(send('sess-a', 'route-1', 'k16', 'one too many'), { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL' });
+  assert.deepEqual(send('sess-a', 'route-1', 'k16', 'one too many'), { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'pending_approval' });
   assert.equal(relay.control.routes()[0]?.waiting, 16);
   relay.control.decline('msg-1');
   assert.equal(send('sess-a', 'route-1', 'k16', 'one too many').ok, true);
@@ -230,7 +247,7 @@ test('a receiver that has ended is a refusal with its own code, and a sender tha
   engines['sess-b']?.setState('stopped');
   assert.deepEqual(send('sess-a', 'route-1', 'k', 'hello'), { ok: false, code: 'GAUGE_RELAY_RECEIVER_GONE' });
   engines['sess-a']?.setState('failed');
-  assert.deepEqual(send('sess-a', 'route-1', 'k', 'hello'), { ok: false, code: 'GAUGE_RELAY_UNAUTHENTICATED' });
+  assert.deepEqual(send('sess-a', 'route-1', 'k', 'hello'), { ok: false, code: 'GAUGE_RELAY_SESSION_ENDED' });
 });
 
 test('a closed relay refuses every write with its own code, with a good secret and with a bad one', () => {
@@ -299,7 +316,7 @@ test('a relay is not made from options that are wrong: each is a bug of the call
   assert.throws(make({ routes: [route('route-1', 'sess-a', 'sess-a')] }), TypeError);
   assert.throws(make({ routes: [route('route-1', 'sess-a', 'sess-b'), route('route-1', 'sess-b', 'sess-a')] }), TypeError);
   assert.throws(make({ routes: [route('route-1', 'sess-a', 'sess-b'), route('route-2', 'sess-a', 'sess-b')] }), TypeError);
-  assert.throws(make({ routes: [route('Route 1', 'sess-a', 'sess-b')] }), TypeError);
+  assert.throws(make({ routes: [{ ...route('route-1', 'sess-a', 'sess-b'), id: 'Route 1' }] }), TypeError);
   assert.throws(make({ routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 0, 3)] }), TypeError);
   assert.throws(make({ routes: [{ ...route('route-1', 'sess-a', 'sess-b'), rule: 'manual' }] }), TypeError);
   assert.throws(make({ routes: Array.from({ length: 33 }, (_v, i) => route(`route-${i}`, 'sess-a', 'sess-b')) }), TypeError);
@@ -309,6 +326,13 @@ test('a relay is not made from options that are wrong: each is a bug of the call
   assert.throws(make({ keepSettled: 1.5 }), RangeError);
   assert.throws(make({ deliverTimeoutMs: 0 }), RangeError);
   assert.throws(make({ deliverTimeoutMs: 600_001 }), RangeError);
+  for (const [name, low, high] of [['keepKeys', 16, 65_536], ['abandonMs', 1, 600_000], ['declineCap', 1, 100]] as const) {
+    assert.throws(make({ [name]: low - 1 }), RangeError, name);
+    assert.throws(make({ [name]: high + 1 }), RangeError, name);
+    assert.throws(make({ [name]: 2.5 }), RangeError, name);
+    assert.doesNotThrow(make({ [name]: low }), name);
+    assert.doesNotThrow(make({ [name]: high }), name);
+  }
   assert.doesNotThrow(make({ keepSettled: 1, deliverTimeoutMs: 1 }));
   assert.doesNotThrow(make({ keepSettled: 1024, deliverTimeoutMs: 600_000 }));
 });

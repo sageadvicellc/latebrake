@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as relay from '../src/index.js';
 import {
+  ADAPTER_FIDELITIES, DEFAULT_ABANDON_MS, DEFAULT_DECLINE_CAP, DEFAULT_KEEP_KEYS, DEFAULT_RUN_CAP, KEEP_DECLINED_BODIES, MAX_ABANDON_MS, MAX_DECLINE_CAP, MAX_KEEP_KEYS, MAX_RUN_CAP, MIN_KEEP_KEYS, QUEUE_REASONS, SECRET_REASONS, isAdapterFidelity,
   DEFAULT_DELIVER_TIMEOUT_MS, DEFAULT_KEEP_SETTLED, DEFAULT_LOOP_CAP, DEFAULT_MESSAGE_CAP, FAILURE_REASONS, FIDELITIES, MAX_BODY_BYTES, MAX_DELIVER_TIMEOUT_MS, MAX_KEEP_SETTLED, MAX_KEY_LENGTH, MAX_LOOP_CAP,
   MAX_MESSAGE_CAP, MAX_ROUTES, MAX_WAITING_PER_ROUTE, MESSAGE_INVALID_REASONS, MESSAGE_STATES, ROUTE_REASONS, ROUTE_RULES, STOP_CAUSES, isEnded, isFailureReason, isFidelity, isMessageInvalidReason,
   isMessageState, isRouteReason, isRouteRule,
@@ -22,6 +23,9 @@ test('the limits are the numbers of the spec and of this ticket', () => {
   assert.equal(MAX_KEEP_SETTLED, 1024);
   assert.equal(DEFAULT_DELIVER_TIMEOUT_MS, 10_000);
   assert.equal(MAX_DELIVER_TIMEOUT_MS, 600_000);
+  assert.deepEqual([DEFAULT_RUN_CAP, MAX_RUN_CAP, DEFAULT_DECLINE_CAP, MAX_DECLINE_CAP], [200, 10_000, 8, 100]);
+  assert.deepEqual([DEFAULT_KEEP_KEYS, MIN_KEEP_KEYS, MAX_KEEP_KEYS, KEEP_DECLINED_BODIES], [4096, 16, 65_536, 256]);
+  assert.deepEqual([DEFAULT_ABANDON_MS, MAX_ABANDON_MS], [30_000, 600_000]);
 });
 
 test('each closed set lists its words in a fixed order, and is frozen', () => {
@@ -29,15 +33,18 @@ test('each closed set lists its words in a fixed order, and is frozen', () => {
   assert.deepEqual([...ROUTE_REASONS], ['request', 'session', 'self', 'repeat', 'rule', 'cap', 'limit']);
   assert.deepEqual([...MESSAGE_INVALID_REASONS], ['request', 'run', 'route', 'session', 'time', 'key', 'body', 'key_reused']);
   assert.deepEqual([...MESSAGE_STATES], ['pending', 'queued', 'sending', 'sent', 'delivered', 'declined', 'failed']);
-  assert.deepEqual([...FAILURE_REASONS], ['receiver_gone', 'closed', 'delivery_failed', 'delivery_timeout', 'no_delivery_path', 'not_prepared']);
-  assert.deepEqual([...FIDELITIES], ['exact', 'translated', 'weakened', 'absent']);
-  assert.deepEqual([...STOP_CAUSES], ['loop_cap', 'message_cap']);
-  for (const set of [ROUTE_RULES, ROUTE_REASONS, MESSAGE_INVALID_REASONS, MESSAGE_STATES, FAILURE_REASONS, FIDELITIES, STOP_CAUSES]) assert.equal(Object.isFrozen(set), true);
+  assert.deepEqual([...FAILURE_REASONS], ['receiver_gone', 'closed', 'delivery_failed', 'delivery_timeout', 'no_delivery_path', 'not_prepared', 'receiver_stuck']);
+  assert.deepEqual([...FIDELITIES], ['exact', 'translated', 'weakened', 'absent', 'unknown']);
+  assert.deepEqual([...ADAPTER_FIDELITIES], ['exact', 'translated', 'weakened', 'absent']);
+  assert.deepEqual([...STOP_CAUSES], ['loop_cap', 'message_cap', 'declines']);
+  assert.deepEqual([...SECRET_REASONS], ['pattern', 'relay_value']);
+  assert.deepEqual([...QUEUE_REASONS], ['pending_approval', 'receiver_not_running', 'receiver_busy']);
+  for (const set of [ROUTE_RULES, ROUTE_REASONS, MESSAGE_INVALID_REASONS, MESSAGE_STATES, FAILURE_REASONS, FIDELITIES, ADAPTER_FIDELITIES, STOP_CAUSES, SECRET_REASONS, QUEUE_REASONS]) assert.equal(Object.isFrozen(set), true);
 });
 
 test('each guard takes the words of its set and nothing else, not a word of Object.prototype and not a value that is no text', () => {
   const guards: [(value: unknown) => boolean, readonly string[]][] = [
-    [isRouteRule, ROUTE_RULES], [isRouteReason, ROUTE_REASONS], [isMessageInvalidReason, MESSAGE_INVALID_REASONS], [isMessageState, MESSAGE_STATES], [isFailureReason, FAILURE_REASONS], [isFidelity, FIDELITIES],
+    [isRouteRule, ROUTE_RULES], [isRouteReason, ROUTE_REASONS], [isMessageInvalidReason, MESSAGE_INVALID_REASONS], [isMessageState, MESSAGE_STATES], [isFailureReason, FAILURE_REASONS], [isFidelity, FIDELITIES], [isAdapterFidelity, ADAPTER_FIDELITIES],
   ];
   for (const [guard, words] of guards) {
     for (const word of words) assert.equal(guard(word), true, word);
@@ -51,15 +58,16 @@ test('a session has ended when it stopped or failed, and in no other state', () 
 
 test('every refusal code of the relay is in the registry of Gauge codes, so a code that the relay gives is one that a Gauge author can look up', () => {
   const given = ['GAUGE_ROUTE_INVALID', 'GAUGE_ROUTE_UNKNOWN', 'GAUGE_MESSAGE_INVALID', 'GAUGE_MESSAGE_TOO_LARGE', 'GAUGE_MESSAGE_SECRET_FOUND', 'GAUGE_MESSAGE_UNKNOWN', 'GAUGE_MESSAGE_NOT_ACCEPTED',
-    'GAUGE_RELAY_UNAUTHENTICATED', 'GAUGE_RELAY_RECEIPT_INVALID', 'GAUGE_RELAY_LOOP_CAP', 'GAUGE_RELAY_MESSAGE_CAP', 'GAUGE_RELAY_QUEUE_FULL', 'GAUGE_RELAY_RECEIVER_GONE', 'GAUGE_RELAY_CLOSED'];
+    'GAUGE_RELAY_UNAUTHENTICATED', 'GAUGE_RELAY_RECEIPT_INVALID', 'GAUGE_RELAY_LOOP_CAP', 'GAUGE_RELAY_MESSAGE_CAP', 'GAUGE_RELAY_QUEUE_FULL', 'GAUGE_RELAY_RECEIVER_GONE', 'GAUGE_RELAY_CLOSED', 'GAUGE_RELAY_ROUTE_PAUSED', 'GAUGE_RELAY_SESSION_ENDED'];
   for (const code of given) assert.equal((GAUGE_CODES as readonly string[]).includes(code), true, code);
 });
 
 test('the package exports the relay, the envelope, the routes, the log, and the words, and the fake engines stay out', () => {
   assert.deepEqual(Object.keys(relay).sort(), [
-    'DEFAULT_DELIVER_TIMEOUT_MS', 'DEFAULT_KEEP_SETTLED', 'DEFAULT_LOOP_CAP', 'DEFAULT_MESSAGE_CAP', 'FAILURE_REASONS', 'FIDELITIES', 'MAX_BODY_BYTES', 'MAX_KEEP_SETTLED', 'MAX_KEY_LENGTH', 'MAX_LOOP_CAP',
-    'MAX_MESSAGE_CAP', 'MAX_ROUTES', 'MAX_WAITING_PER_ROUTE', 'MESSAGE_INVALID_REASONS', 'MESSAGE_STATES', 'ROUTE_REASONS', 'ROUTE_RULES', 'STOP_CAUSES', 'checkBody', 'checkEnvelope', 'checkKey',
-    'checkRouteDefinitions', 'createLog', 'createRelay', 'fenceText', 'frameOf', 'isFailureReason', 'isFidelity', 'isMessageInvalidReason', 'isMessageState', 'isRouteId', 'isRouteReason', 'isRouteRule',
-    'redactText', 'resolveRoutes',
+    'ADAPTER_FIDELITIES', 'DEFAULT_ABANDON_MS', 'DEFAULT_DECLINE_CAP', 'DEFAULT_DELIVER_TIMEOUT_MS', 'DEFAULT_KEEP_KEYS', 'DEFAULT_KEEP_SETTLED', 'DEFAULT_LOOP_CAP', 'DEFAULT_MESSAGE_CAP', 'DEFAULT_RUN_CAP',
+    'FAILURE_REASONS', 'FIDELITIES', 'KEEP_DECLINED_BODIES', 'MAX_BODY_BYTES', 'MAX_KEEP_KEYS', 'MAX_KEEP_SETTLED', 'MAX_KEY_LENGTH', 'MAX_LOOP_CAP', 'MAX_MESSAGE_CAP', 'MAX_ROUTES', 'MAX_WAITING_PER_ROUTE',
+    'MESSAGE_INVALID_REASONS', 'MESSAGE_STATES', 'QUEUE_REASONS', 'ROUTE_REASONS', 'ROUTE_RULES', 'SECRET_REASONS', 'STOP_CAUSES', 'checkBody', 'checkEnvelope', 'checkKey', 'checkRouteDefinitions',
+    'createLog', 'createRelay', 'fenceText', 'frameOf', 'idempotencyKey', 'isAdapterFidelity', 'isFailureReason', 'isFidelity', 'isIdempotencyKey', 'isMessageId', 'isMessageInvalidReason', 'isMessageState',
+    'isNonce', 'isReceipt', 'isRouteId', 'isRouteReason', 'isRouteRule', 'isSessionSecret', 'messageId', 'nonce', 'receipt', 'redactText', 'resolveRoutes', 'routeId', 'sessionSecret',
   ].sort());
 });

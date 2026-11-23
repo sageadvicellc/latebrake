@@ -16,6 +16,21 @@ export const MAX_MESSAGE_CAP = 1000;
 /** The loop cap of a route that does not name one, and the highest cap a person may set. */
 export const DEFAULT_LOOP_CAP = 6;
 export const MAX_LOOP_CAP = 100;
+/** The most accepted `auto` messages in one run since the last act of the person (an approval or a resume), and the range of the option. It stops a ring of three sessions or more, which no pair count sees. */
+export const DEFAULT_RUN_CAP = 200;
+export const MAX_RUN_CAP = 10_000;
+/** The most messages of a route that the person declines before the core pauses the route until the person resumes it, and the range of the option. */
+export const DEFAULT_DECLINE_CAP = 8;
+export const MAX_DECLINE_CAP = 100;
+/** How many keys the idempotency ledger keeps, oldest first, and the range of the option. The ledger is apart from the history of messages: dropping a message does not free its key. */
+export const DEFAULT_KEEP_KEYS = 4096;
+export const MIN_KEEP_KEYS = 16;
+export const MAX_KEEP_KEYS = 65_536;
+/** How many declined bodies the relay remembers for a run, oldest first. */
+export const KEEP_DECLINED_BODIES = 256;
+/** How long the core waits, after a delivery timed out, for the adapter to settle its promise, in milliseconds, and the range of the option. After it the receiver reads as stuck. */
+export const DEFAULT_ABANDON_MS = 30_000;
+export const MAX_ABANDON_MS = 600_000;
 /** The most messages of one route that wait for the person, for a receiver that is not ready, or for the engine. A message past it is refused. */
 export const MAX_WAITING_PER_ROUTE = 16;
 /** How many settled messages the relay keeps (those that ended, and those that were sent and wait for a receipt). The one that ended first is dropped first. */
@@ -65,21 +80,36 @@ export const isMessageState = (value: unknown): value is MessageState => typeof 
  * Why a message failed. `receiver_gone`: the session of the receiver ended. `closed`: the relay of the run closed before the message moved, or while the engine took it
  * (the text may have reached the engine). `delivery_failed`: the engine of the receiver said it could not take the message, or answered with something that is no answer. `delivery_timeout`: the engine did not answer in time (the text may
  * still reach it). `no_delivery_path`: the adapter has no way to give the engine a message while it runs, so nothing was given. `not_prepared`: the core could not make the text for the engine (the body held every nonce or receipt that it drew, or a maker
- * or the schedule failed), so nothing was given to the engine.
+ * or the schedule failed), so nothing was given to the engine. `receiver_stuck`: an earlier delivery to the same engine timed out and its adapter never settled, so the core gave this message to no one rather than
+ * run two deliveries into one engine at once.
  */
-export const FAILURE_REASONS = Object.freeze(['receiver_gone', 'closed', 'delivery_failed', 'delivery_timeout', 'no_delivery_path', 'not_prepared'] as const);
+export const FAILURE_REASONS = Object.freeze(['receiver_gone', 'closed', 'delivery_failed', 'delivery_timeout', 'no_delivery_path', 'not_prepared', 'receiver_stuck'] as const);
 export type FailureReason = (typeof FAILURE_REASONS)[number];
 const FAILURE_SET: ReadonlySet<string> = new Set(FAILURE_REASONS);
 export const isFailureReason = (value: unknown): value is FailureReason => typeof value === 'string' && FAILURE_SET.has(value);
 
 /** How faithfully an engine took a message: the fixed words of the spec. `absent` means that the engine has no way to take it. */
-export const FIDELITIES = Object.freeze(['exact', 'translated', 'weakened', 'absent'] as const);
+export const ADAPTER_FIDELITIES = Object.freeze(['exact', 'translated', 'weakened', 'absent'] as const);
+/** The four words of an adapter, and `unknown`, which the core gives to a message that a receipt proved delivered before the adapter answered. An adapter never gives `unknown`. */
+export const FIDELITIES = Object.freeze([...ADAPTER_FIDELITIES, 'unknown'] as const);
 export type Fidelity = (typeof FIDELITIES)[number];
+export type AdapterFidelity = (typeof ADAPTER_FIDELITIES)[number];
 const FIDELITY_SET: ReadonlySet<string> = new Set(FIDELITIES);
+const ADAPTER_SET: ReadonlySet<string> = new Set(ADAPTER_FIDELITIES);
 export const isFidelity = (value: unknown): value is Fidelity => typeof value === 'string' && FIDELITY_SET.has(value);
+/** True for a word that an adapter may answer with. */
+export const isAdapterFidelity = (value: unknown): value is AdapterFidelity => typeof value === 'string' && ADAPTER_SET.has(value);
 
-/** What stopped a route. `loop_cap`: two sessions passed messages back and forth up to the loop cap. `message_cap`: the route reached its cap on messages. */
-export const STOP_CAUSES = Object.freeze(['loop_cap', 'message_cap'] as const);
+/** Why a body or a key was refused with `GAUGE_MESSAGE_SECRET_FOUND`. `pattern`: it has the shape of a secret (the scan of `gauge-manifest`, which also refuses a harmless identifier of 32 characters or more that mixes cases and digits). `relay_value`: it holds a value that the relay keeps hidden, such as a session secret or the receipt of a message that is in flight. */
+export const SECRET_REASONS = Object.freeze(['pattern', 'relay_value'] as const);
+export type SecretReason = (typeof SECRET_REASONS)[number];
+
+/** What the messages of a full route wait for, with `GAUGE_RELAY_QUEUE_FULL`. `pending_approval`: the person. `receiver_not_running`: the receiver does not run, or its state cannot be read. `receiver_busy`: the receiver runs, and its engine is taking an earlier message. */
+export const QUEUE_REASONS = Object.freeze(['pending_approval', 'receiver_not_running', 'receiver_busy'] as const);
+export type QueueReason = (typeof QUEUE_REASONS)[number];
+
+/** What stopped a route. `loop_cap`: the messages between two sessions, or of the whole run, reached a cap that no act of the person broke. `message_cap`: the route reached its cap on messages. `declines`: the person declined too many of its messages. */
+export const STOP_CAUSES = Object.freeze(['loop_cap', 'message_cap', 'declines'] as const);
 export type StopCause = (typeof STOP_CAUSES)[number];
 
 /** The session states in which a session has ended. */

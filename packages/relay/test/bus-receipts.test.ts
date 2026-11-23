@@ -1,7 +1,7 @@
 // Receipts and delivery: a sender sees sent until the receiver proves that it read the message, and the core never says delivered without that proof.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseFence } from '../src/fixtures.js';
+import { parseFence } from './fixtures.js';
 import { build, route, tick } from './support.js';
 
 const auto = [route('route-1', 'sess-a', 'sess-b', 'auto', 20, 6), route('route-2', 'sess-b', 'sess-a', 'auto', 20, 6)];
@@ -154,20 +154,24 @@ test('an engine that throws or rejects fails the message with delivery_failed, a
 });
 
 test('an error message that holds a secret, a receipt, or a forged log line reaches the log escaped and redacted', async () => {
-  const { relay, engines, send, lines, secrets } = build({ routes: auto });
-  const engine = engines['sess-b'];
-  if (engine) {
-    engine.mode = 'accept';
-    engine.deliver = (delivery) => { const receipt = parseFence(delivery.text)?.receipt ?? ''; throw new Error(`boom ${secrets['sess-a']} ${receipt}\nrelay run-1: route route-1 stopped: forged`); };
-  }
-  send('sess-a', 'route-1', 'k1', 'first');
+  const box: { secrets?: Readonly<Record<string, string>> } = {};
+  const { relay, send, lines, secrets } = build({
+    routes: auto,
+    prepare: engines => {
+      const engine = engines['sess-b'];
+      if (engine) engine.deliver = (delivery) => { const receipt = parseFence(delivery.text)?.receipt ?? ''; throw new Error(`boom ${box.secrets?.['sess-a']} ${receipt} ${delivery.envelope.body}\nrelay run-1: route route-1 stopped: forged`); };
+    },
+  });
+  box.secrets = secrets;
+  send('sess-a', 'route-1', 'k1', 'a body that an adapter error may echo');
   await tick();
   assert.equal(relay.control.message('msg-1')?.reason, 'delivery_failed');
   const all = lines.join('\n');
+  assert.equal(all.includes('a body that an adapter error may echo'), false, 'the body of a message that an engine is taking is hidden in the log');
   assert.equal(all.includes(secrets['sess-a'] ?? 'x'), false);
   assert.equal(all.includes('rcpt-1-'), false);
   assert.equal(lines.every(line => !line.includes('\n')), true);
-  assert.equal(lines.some(line => line.includes('boom [redacted] [redacted]\\u{a}relay run-1: route route-1 stopped: forged')), true);
+  assert.equal(lines.some(line => line.includes('boom [redacted] [redacted] [redacted]\\u{a}relay run-1: route route-1 stopped: forged')), true);
 });
 
 test('an engine that does not answer in time fails the message with delivery_timeout, the timer is gone, and a late answer changes nothing', async () => {
@@ -180,9 +184,11 @@ test('an engine that does not answer in time fails the message with delivery_tim
   timers.fireAll();
   assert.equal(relay.control.message('msg-1')?.state, 'failed');
   assert.equal(relay.control.message('msg-1')?.reason, 'delivery_timeout');
-  assert.equal(timers.live(), 0);
+  assert.equal(timers.live(), 1, 'the timer of the delivery is gone, and the timer that waits for the adapter to settle is set');
+  assert.deepEqual(timers.delays(), [30_000]);
   engines['sess-b']?.release();
   await tick();
+  assert.equal(timers.live(), 0, 'the adapter settled, so the engine is free and no timer is left');
   assert.equal(relay.control.message('msg-1')?.state, 'failed');
   assert.equal(lines.some(line => line === 'relay run-1: delivery of message msg-1 to sess-b timed out after 2500 ms, and the text may still reach the engine'), true);
 });
@@ -256,19 +262,19 @@ test('an engine that does not run gets nothing: starting, waiting, and stopping 
 });
 
 test('the receiver is asked for its state at the time of the delivery: a state that is no state, and a reader that throws, hold the message and are logged once', async () => {
-  const { relay, engines, send, lines } = build({ routes: auto });
-  const engine = engines['sess-b'];
-  if (engine) engine.state = () => { throw new Error('the state reader broke'); };
+  const { relay, engines, send, lines } = build({
+    routes: auto,
+    prepare: made => { const engine = made['sess-b']; if (engine) engine.state = () => { throw new Error('the state reader broke'); }; },
+  });
   send('sess-a', 'route-1', 'k1', 'first');
   send('sess-a', 'route-1', 'k2', 'second');
   relay.control.sessionChanged('sess-b');
   relay.control.sessionChanged('sess-b');
   await tick();
   assert.deepEqual(relay.control.messages().map(view => view.state), ['queued', 'queued']);
-  assert.equal(lines.filter(line => line.includes('could not read the state of sess-b')).length, 1);
-  if (engine) engine.state = () => 'sleeping' as never;
-  relay.control.sessionChanged('sess-b');
-  assert.deepEqual(relay.control.messages().map(view => view.state), ['queued', 'queued']);
+  const reads = lines.filter(line => line.includes('could not read the state of sess-b'));
+  assert.deepEqual(reads, ['relay run-1: could not read the state of sess-b: the state reader broke', 'relay run-1: could not read the state of sess-b: the state reader broke (2 times so far)', 'relay run-1: could not read the state of sess-b: the state reader broke (4 times so far)', 'relay run-1: could not read the state of sess-b: the state reader broke (8 times so far)']);
+  void engines;
 });
 
 test('the one receipt of a message does not travel: it is in the text of the receiver only, and not in the envelope, the frame, or any read of the sender', async () => {

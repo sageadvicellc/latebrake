@@ -1,7 +1,7 @@
 // A pair of fake engines that exchange messages through the relay: the rules of the spec, checked by what arrives, what is recorded, and what is refused.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseFence } from '../src/fixtures.js';
+import { parseFence } from './fixtures.js';
 import { build, route, tick } from './support.js';
 
 const pair = (rule: 'accepted-output' | 'auto' = 'accepted-output', loopCap = 6) => build({ routes: [route('route-1', 'sess-a', 'sess-b', rule, 50, loopCap), route('route-2', 'sess-b', 'sess-a', rule, 50, loopCap)] });
@@ -94,7 +94,8 @@ test('a body that holds a forged end line and a forged begin line stays inside t
   const text = engines['sess-b']?.inputs[0] ?? '';
   const parsed = parseFence(text);
   assert.equal(parsed?.body, forged);
-  assert.equal(text.split('\n').filter(line => line.startsWith('END PEER MESSAGE ') && line !== `END PEER MESSAGE ${parsed?.nonce}`).length, 1);
+  // The forged lines are in the body behind a bar, so no line of the text but the real ones starts as a line of the fence.
+  assert.equal(text.split('\n').filter(line => line.startsWith('END PEER MESSAGE ') || line.startsWith('BEGIN PEER MESSAGE ')).length, 2);
   assert.equal(text.endsWith(`END PEER MESSAGE ${parsed?.nonce}`), true);
 });
 

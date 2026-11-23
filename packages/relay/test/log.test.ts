@@ -74,11 +74,39 @@ test('a log that throws is reported on standard error with the same safe line, a
   assert.equal(all.includes('hidden-value-1234'), false);
 });
 
-test('a hidden-values reader that throws never stops a line: the line is written with every unsafe character escaped', () => {
+test('a hidden-values reader that throws never stops a line, and never lets one through: a fixed line is written and the text is withheld', () => {
   const lines: string[] = [];
   const log = createLog({ run: 'run-1', hidden: () => { throw new Error('no'); }, log: line => { lines.push(line); } });
-  assert.doesNotThrow(() => log.write('x\ny'));
-  assert.deepEqual(lines, ['relay run-1: x\\u{a}y']);
+  assert.doesNotThrow(() => log.write('x\ny secret-looking text'));
+  assert.deepEqual(lines, ['relay run-1: a line was withheld, because the values to hide could not be read']);
+});
+
+test('a standard error that throws too is a double fault that is lost, and the writer never sees it', () => {
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (() => { throw new Error('standard error is closed'); }) as typeof process.stderr.write;
+  try {
+    const { log } = make([], { log: () => { throw new Error('the sink broke'); } });
+    assert.doesNotThrow(() => log.write('a line'));
+    assert.doesNotThrow(() => log.counted('k', 'a counted line'));
+  } finally {
+    process.stderr.write = original;
+  }
+});
+
+test('counted writes the line at counts 1, 2, 4, 8, and so on, with the count after the first, for each key', () => {
+  const { log, lines } = make();
+  for (let i = 0; i < 9; i += 1) log.counted('refused', 'a refusal');
+  log.counted('other', 'another kind');
+  assert.deepEqual(lines, ['relay run-1: a refusal', 'relay run-1: a refusal (2 times so far)', 'relay run-1: a refusal (4 times so far)', 'relay run-1: a refusal (8 times so far)', 'relay run-1: another kind']);
+});
+
+test('the keys of counted are bounded: after 64 kinds a new kind is dropped, and a kind that is known goes on counting', () => {
+  const { log, lines } = make();
+  for (let i = 0; i < 100; i += 1) log.counted(`kind-${i}`, `line ${i}`);
+  assert.equal(lines.length, 64);
+  log.counted('kind-0', 'line 0');
+  assert.equal(lines.length, 65);
+  assert.equal(lines[64], 'relay run-1: line 0 (2 times so far)');
 });
 
 test('once writes a line the first time for its key, and never again, so a flood of one kind makes one line', () => {

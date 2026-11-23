@@ -1,5 +1,6 @@
 // Helpers for the tests of the relay: a schedule that a test moves by hand, a clock, counters for ids and secrets, and a relay built over fake engines.
-import { createFakeEngine, type FakeEngine } from '../src/fixtures.js';
+import { routeId } from '../src/brand.js';
+import { createFakeEngine, type FakeEngine } from './fixtures.js';
 import { createRelay, type Relay, type RelayOptions } from '../src/bus.js';
 import type { Route } from '../src/routes.js';
 import type { RouteRule } from '../src/vocab.js';
@@ -37,7 +38,7 @@ export function manualSchedule(): ManualSchedule {
 /** Lets every promise that is ready run, and the ones that those start, so a delivery that resolved at once has been seen by the relay. It waits for the next turn of the loop of events and sets no timer. */
 export const tick = (): Promise<void> => new Promise(resolve => { setImmediate(resolve); });
 
-export const route = (id: string, from: string, to: string, rule: RouteRule = 'accepted-output', messageCap = 50, loopCap = 6): Route => ({ id, from, to, rule, messageCap, loopCap });
+export const route = (id: string, from: string, to: string, rule: RouteRule = 'accepted-output', messageCap = 50, loopCap = 6): Route => ({ id: routeId(id), from, to, rule, messageCap, loopCap });
 
 export interface Built {
   readonly relay: Relay;
@@ -58,12 +59,15 @@ export interface BuildOptions {
   readonly options?: Partial<RelayOptions>;
   /** When true, the secrets are not issued. */
   readonly noSecrets?: boolean;
+  /** Runs on the engines before the relay is made. The relay reads `state` and `deliver` of each port once, so a test that replaces one does it here. */
+  readonly prepare?: (engines: Readonly<Record<string, FakeEngine>>) => void;
 }
 
 export function build(config: BuildOptions = {}): Built {
   const names = config.sessions ?? ['sess-a', 'sess-b'];
   const engines: Record<string, FakeEngine> = {};
   for (const name of names) engines[name] = createFakeEngine(name, config.states?.[name] === undefined ? {} : { state: config.states[name] });
+  config.prepare?.(engines);
   const timers = manualSchedule();
   const clock = { now: 1_700_000_000_000 };
   const lines: string[] = [];

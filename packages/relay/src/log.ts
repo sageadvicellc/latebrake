@@ -40,7 +40,7 @@ export function redactText(hidden: readonly string[], text: string): string {
 
 export interface LogOptions {
   readonly run: string;
-  /** The values to cut out of every line. Read at each write. */
+  /** The values to cut out of every line. Read at each write. A reader that throws withholds the line: nothing is printed that could not be checked. */
   readonly hidden: () => readonly string[];
   readonly log?: ((line: string) => void) | undefined;
 }
@@ -50,23 +50,33 @@ export interface RelayLog {
   write(message: string): void;
   /** Writes the line the first time for the key, and never again. At most 64 keys are kept. */
   once(key: string, message: string): void;
+  /** Counts the call for the key, and writes the line when the count is 1, 2, 4, 8, and so on, with the count after the first. At most 64 keys are kept. */
+  counted(key: string, message: string): void;
 }
 
 const toStandardError = (line: string): void => { process.stderr.write(`${line}\n`); };
+/** Writes to standard error and never throws: a double fault (the log and standard error) is lost, and nothing else is. */
+const lastResort = (line: string): void => {
+  try {
+    toStandardError(line);
+  } catch {
+    // Nothing is left to try.
+  }
+};
 
 export function createLog(options: LogOptions): RelayLog {
   const seen = new Set<string>();
-  const hiddenNow = (): readonly string[] => {
-    try {
-      return options.hidden();
-    } catch {
-      // A reader that throws hides nothing, and the line is still escaped below.
-      return [];
-    }
-  };
-  /** Redacts the raw text first, so a value that holds a character that the escape would change is still found. Then every unsafe character is escaped, and then the line is cut. */
+  const counts = new Map<string, number>();
+  const withheld = `relay ${options.run}: a line was withheld, because the values to hide could not be read`;
+  /** Redacts the raw text first, so a value that holds a character that the escape would change is still found. Then every unsafe character is shown as an escape, and then the line is cut. */
   const safe = (message: string): string => {
-    const escaped = escapeText(redactText(hiddenNow(), `relay ${options.run}: ${message}`));
+    let hidden: readonly string[];
+    try {
+      hidden = options.hidden();
+    } catch {
+      return withheld;
+    }
+    const escaped = escapeText(redactText(hidden, `relay ${options.run}: ${message}`));
     return escaped.length > MAX_LOG_LINE ? `${escaped.slice(0, MAX_LOG_LINE - 3)}...` : escaped;
   };
   const write = (message: string): void => {
@@ -74,8 +84,8 @@ export function createLog(options: LogOptions): RelayLog {
     try {
       (options.log ?? toStandardError)(line);
     } catch (error) {
-      process.stderr.write(`${line}\n`);
-      process.stderr.write(`${safe(`the log sink threw: ${error instanceof Error ? error.message : String(error)}`)}\n`);
+      lastResort(line);
+      lastResort(safe(`the log sink threw: ${error instanceof Error ? error.message : String(error)}`));
     }
   };
   return {
@@ -84,6 +94,14 @@ export function createLog(options: LogOptions): RelayLog {
       if (seen.has(key) || seen.size >= MAX_ONCE_KEYS) return;
       seen.add(key);
       write(message);
+    },
+    counted(key, message) {
+      const known = counts.get(key);
+      if (known === undefined && counts.size >= MAX_ONCE_KEYS) return;
+      const count = (known ?? 0) + 1;
+      counts.set(key, count);
+      // A power of two has one bit set.
+      if ((count & (count - 1)) === 0) write(count === 1 ? message : `${message} (${count} times so far)`);
     },
   };
 }

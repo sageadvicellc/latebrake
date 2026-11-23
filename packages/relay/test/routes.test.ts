@@ -15,8 +15,10 @@ test('a job with no routes is good, and a plain list of routes gives new frozen 
   assert.equal(Object.isFrozen(checked.value[0]), true);
 });
 
-test('a new route that names no rule is not allowed: the rule is written out, and accepted-output is the one a person is shown first', () => {
-  assert.deepEqual(checkRouteDefinitions([{ from: 'writer', to: 'checker' }], labels), refused('rule'));
+test('a route that names no rule is an accepted-output route, the safe default, and an auto route must be written out', () => {
+  assert.deepEqual(checkRouteDefinitions([{ from: 'writer', to: 'checker' }], labels), { ok: true, value: [{ from: 'writer', to: 'checker', rule: 'accepted-output', messageCap: 50, loopCap: 6 }] });
+  assert.deepEqual(checkRouteDefinitions([{ from: 'writer', to: 'checker', messageCap: 10, loopCap: 3 }], labels), { ok: true, value: [{ from: 'writer', to: 'checker', rule: 'accepted-output', messageCap: 10, loopCap: 3 }] });
+  assert.deepEqual(checkRouteDefinitions([{ from: 'writer', to: 'checker', rule: undefined }], labels), refused('rule'));
 });
 
 test('an auto route needs a message cap and a loop cap, each a whole number in range', () => {

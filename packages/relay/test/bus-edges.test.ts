@@ -2,14 +2,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRelay } from '../src/bus.js';
-import { createFakeEngine, parseFence } from '../src/fixtures.js';
+import { createFakeEngine, parseFence } from './fixtures.js';
 import { build, route, tick } from './support.js';
 
 const auto = [route('route-1', 'sess-a', 'sess-b', 'auto', 1000, 100), route('route-2', 'sess-b', 'sess-a', 'auto', 1000, 100)];
 
 test('a key that is a value the relay hides (the secret of a session) is refused as a secret', () => {
   const { send, secrets, relay } = build();
-  assert.deepEqual(send('sess-a', 'route-1', secrets['sess-b'] ?? '', 'hello'), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND' });
+  assert.deepEqual(send('sess-a', 'route-1', secrets['sess-b'] ?? '', 'hello'), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'relay_value' });
   assert.equal(relay.control.messages().length, 0);
 });
 
@@ -31,7 +31,7 @@ test('a decline of a message that waits for the person does not take a place fro
   assert.equal(relay.control.routes()[0]?.accepted, 1);
   relay.control.decline('msg-2');
   assert.equal(relay.control.routes()[0]?.accepted, 1);
-  assert.equal(relay.control.routes()[0]?.turns, 1);
+  assert.equal(relay.control.routes()[0]?.exchanged, 1);
 });
 
 test('a receipt that arrives while the engine takes a message frees the engine, and the next message goes at once', async () => {
@@ -46,13 +46,13 @@ test('a receipt that arrives while the engine takes a message frees the engine, 
   assert.equal(relay.control.message('msg-2')?.state, 'sending');
 });
 
-test('a confirm from a session that has ended is refused as unauthenticated, even before the core was told that it ended', async () => {
+test('a confirm from a session that has ended is refused as ended, even before the core was told that it ended', async () => {
   const { engines, send, confirm, relay } = build({ routes: auto });
   send('sess-a', 'route-1', 'k1', 'first');
   await tick();
   const receipt = engines['sess-b']?.lastReceipt()?.receipt ?? '';
   engines['sess-b']?.setState('stopped');
-  assert.deepEqual(confirm('sess-b', 'msg-1', receipt), { ok: false, code: 'GAUGE_RELAY_UNAUTHENTICATED' });
+  assert.deepEqual(confirm('sess-b', 'msg-1', receipt), { ok: false, code: 'GAUGE_RELAY_SESSION_ENDED' });
   assert.equal(relay.control.message('msg-1')?.state, 'sent');
 });
 
@@ -132,7 +132,7 @@ test('a message that could not be fenced gives its count back, and the next mess
   assert.equal(relay.control.message('msg-1')?.reason, 'not_prepared');
   assert.equal(relay.control.message('msg-2')?.state, 'sent');
   assert.equal(relay.control.routes()[0]?.accepted, 1);
-  assert.equal(relay.control.routes()[0]?.turns, 1);
+  assert.equal(relay.control.routes()[0]?.exchanged, 1);
   assert.equal(relay.control.routes()[0]?.waiting, 0);
 });
 
@@ -190,8 +190,8 @@ test('a failed delivery frees the engine, and the next message goes at once', as
   assert.equal(relay.control.message('msg-2')?.state, 'sent');
 });
 
-test('a timeout frees the engine, and the next message goes at once', async () => {
-  const { relay, engines, send, timers } = build({ routes: auto });
+test('a timeout does not free the engine: the next message waits until the adapter settles its promise, and then it goes', async () => {
+  const { relay, engines, send, timers } = build({ routes: auto, options: { abandonMs: 5000 } });
   if (engines['sess-b']) engines['sess-b'].mode = 'hang';
   send('sess-a', 'route-1', 'k1', 'first');
   send('sess-a', 'route-1', 'k2', 'second');
@@ -200,7 +200,14 @@ test('a timeout frees the engine, and the next message goes at once', async () =
   timers.fireAll();
   await tick();
   assert.equal(relay.control.message('msg-1')?.reason, 'delivery_timeout');
+  assert.equal(relay.control.message('msg-2')?.state, 'queued');
+  assert.equal(engines['sess-b']?.inputs.length, 1);
+  assert.equal(relay.control.sizes().inflight, 1);
+  engines['sess-b']?.release();
+  await tick();
   assert.equal(relay.control.message('msg-2')?.state, 'sent');
+  assert.equal(engines['sess-b']?.maxActive, 1);
+  assert.equal(timers.live(), 0);
 });
 
 test('a timer that fires after its message left the sending state does nothing, even from a schedule that cannot cancel', async () => {
@@ -236,19 +243,19 @@ test('a session that ended is logged once, stays ended for good, and is never re
   assert.equal(lines.filter(line => line === 'relay run-1: session sess-b ended, so what waited for it has failed').length, 1);
 });
 
-test('the sizes of the relay stay bounded and fall to nothing: keys follow the messages that are kept, the secret of an ended session is forgotten, and no engine is held', async () => {
+test('the sizes of the relay stay bounded and fall to nothing: the messages are bounded by the room that is kept, the keys by the ledger, the secret of an ended session is forgotten, and no engine is held', async () => {
   const { relay, engines, send } = build({ routes: auto, options: { keepSettled: 4 } });
-  assert.deepEqual(relay.control.sizes(), { messages: 0, keys: 0, secrets: 2, inflight: 0 });
+  assert.deepEqual(relay.control.sizes(), { messages: 0, keys: 0, secrets: 2, inflight: 0, declined: 0 });
   for (let i = 0; i < 40; i += 1) {
     send('sess-a', 'route-1', `k${i}`, `body ${i}`);
     await tick();
   }
-  assert.deepEqual(relay.control.sizes(), { messages: 4, keys: 4, secrets: 2, inflight: 0 });
+  assert.deepEqual(relay.control.sizes(), { messages: 4, keys: 40, secrets: 2, inflight: 0, declined: 0 });
   engines['sess-b']?.setState('stopped');
   relay.control.sessionChanged('sess-b');
   assert.equal(relay.control.sizes().secrets, 1);
   relay.control.close();
-  assert.deepEqual(relay.control.sizes(), { messages: 4, keys: 4, secrets: 0, inflight: 0 });
+  assert.deepEqual(relay.control.sizes(), { messages: 4, keys: 40, secrets: 0, inflight: 0, declined: 0 });
 });
 
 test('a close forgets the secrets and the engines that were taking a message, and closing twice changes nothing', async () => {
@@ -260,17 +267,16 @@ test('a close forgets the secrets and the engines that were taking a message, an
   relay.control.close();
   const after = [relay.control.sizes(), relay.control.messages(), lines.length];
   relay.control.close();
-  assert.deepEqual(after[0], { messages: 1, keys: 1, secrets: 0, inflight: 0 });
+  assert.deepEqual(after[0], { messages: 1, keys: 1, secrets: 0, inflight: 0, declined: 0 });
   assert.deepEqual([relay.control.sizes(), relay.control.messages(), lines.length], after);
 });
 
 test('a state that is no state holds a message back and is logged, and an engine that has no state reader or no deliver is not a member', async () => {
-  const { relay, engines, send, lines } = build({ routes: auto });
-  if (engines['sess-b']) engines['sess-b'].state = () => 'sleeping' as never;
+  const { relay, send, lines } = build({ routes: auto, prepare: made => { const engine = made['sess-b']; if (engine) engine.state = () => 'sleeping' as never; } });
   send('sess-a', 'route-1', 'k1', 'first');
   await tick();
   assert.equal(relay.control.message('msg-1')?.state, 'queued');
-  assert.deepEqual(lines.filter(line => line.includes('could not read the state')), ['relay run-1: could not read the state of sess-b: it gave no known state']);
+  assert.deepEqual(lines.filter(line => line.includes('could not read the state')), ['relay run-1: could not read the state of sess-b: it gave no known state', 'relay run-1: could not read the state of sess-b: it gave no known state (2 times so far)']);
   const a = createFakeEngine('sess-a'), b = createFakeEngine('sess-b');
   const routes = [route('route-1', 'sess-a', 'sess-b')];
   assert.throws(() => createRelay({ run: 'run-1', routes, members: [{ session: 'sess-a', port: a }, { session: 'sess-b', port: { state: () => 'running' } as never }] }), TypeError);
@@ -292,6 +298,7 @@ test('the history keeps 256 settled messages by default, and a relay takes 8 ses
   for (let i = 0; i < 270; i += 1) {
     send('sess-a', 'route-1', `k${i}`, `body ${i}`);
     await tick();
+    if (i % 50 === 49) relay.control.resume('route-1');
   }
   assert.equal(relay.control.messages().length, 256);
   const names = Array.from({ length: 8 }, (_v, index) => `sess-${index}`);

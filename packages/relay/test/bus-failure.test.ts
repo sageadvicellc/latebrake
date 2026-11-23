@@ -74,8 +74,11 @@ test('a session that has ended can no longer write or confirm, and its secret is
   const receipt = engines['sess-b']?.lastReceipt()?.receipt ?? '';
   engines['sess-b']?.setState('stopped');
   relay.control.sessionChanged('sess-b');
-  assert.deepEqual(confirm('sess-b', 'msg-1', receipt), { ok: false, code: 'GAUGE_RELAY_UNAUTHENTICATED' });
-  assert.deepEqual(send('sess-b', 'route-2', 'k2', 'late'), { ok: false, code: 'GAUGE_RELAY_UNAUTHENTICATED' });
+  assert.deepEqual(confirm('sess-b', 'msg-1', receipt), { ok: false, code: 'GAUGE_RELAY_SESSION_ENDED' });
+  assert.deepEqual(send('sess-b', 'route-2', 'k2', 'late'), { ok: false, code: 'GAUGE_RELAY_SESSION_ENDED' });
+  // The old secret is the only one that names the cause: a wrong secret for an ended session is a wrong secret.
+  assert.deepEqual(relay.write.send({ session: 'sess-b', secret: 'wrong', route: 'route-2', key: 'k3', body: 'late' }), { ok: false, code: 'GAUGE_RELAY_UNAUTHENTICATED' });
+  assert.equal(relay.control.sizes().secrets, 1);
   assert.equal(relay.control.message('msg-1')?.state, 'sent');
 });
 
@@ -116,16 +119,21 @@ test('the history is bounded: with room for 3 settled messages, the one that end
   assert.equal(relay.control.message('msg-2'), undefined);
 });
 
-test('a message that is dropped from the history takes its key and its receipt with it: a confirm for it is a refusal of an unknown message, and the key is free', async () => {
-  const { relay, send, engines, confirm } = build({ routes: auto, options: { keepSettled: 1 } });
+test('a message that is dropped from the history takes its receipt with it, and says so: a confirm for it to its receiver is MESSAGE_UNKNOWN with the reason evicted, and its key stays held', async () => {
+  const { relay, send, engines, confirm, lines } = build({ routes: auto, options: { keepSettled: 1 } });
   send('sess-a', 'route-1', 'k1', 'body 1');
   await tick();
   const receipt = engines['sess-b']?.lastReceipt()?.receipt ?? '';
   send('sess-a', 'route-1', 'k2', 'body 2');
   await tick();
   assert.equal(relay.control.message('msg-1'), undefined);
-  assert.deepEqual(confirm('sess-b', 'msg-1', receipt), { ok: false, code: 'GAUGE_MESSAGE_UNKNOWN' });
-  assert.deepEqual(send('sess-a', 'route-1', 'k1', 'body 1'), { ok: true, id: 'msg-3', state: 'sending', duplicate: false });
+  assert.equal(lines.includes('relay run-1: message msg-1 was sent and was dropped from the history before a receipt came'), true);
+  assert.deepEqual(confirm('sess-b', 'msg-1', receipt), { ok: false, code: 'GAUGE_MESSAGE_UNKNOWN', reason: 'evicted' });
+  // The sender is not the receiver, so for it the dropped message is a message that never was.
+  assert.deepEqual(confirm('sess-a', 'msg-1', receipt), confirm('sess-a', 'msg-99', receipt));
+  assert.deepEqual(confirm('sess-b', 'msg-99', receipt), { ok: false, code: 'GAUGE_MESSAGE_UNKNOWN' });
+  assert.deepEqual(send('sess-a', 'route-1', 'k1', 'body 1'), { ok: true, id: 'msg-1', state: 'evicted', reason: null, duplicate: true });
+  assert.equal(relay.control.messages().length, 1);
 });
 
 test('a message that is sent and waits for a receipt is dropped after the ones that ended, and a message that is live is never dropped', async () => {
@@ -152,14 +160,17 @@ test('a long run keeps the history, the keys, and the counts inside their bounds
     if (engines['sess-b']) engines['sess-b'].mode = i % 4 === 0 ? 'reject' : 'accept';
     send('sess-a', 'route-1', `k${i}`, `body ${i}`);
     await tick();
+    // The caps of a loop count every message of a pair until the person acts, so the person acts now and then.
+    if (i % 50 === 49) relay.control.resume('route-1');
   }
   assert.equal(relay.control.messages().length, 8);
   assert.equal(relay.control.routes()[0]?.accepted, 300);
   assert.equal(relay.control.routes()[0]?.waiting, 0);
   assert.equal(timers.live(), 0);
-  // The newest key is still held, and the oldest is free again.
+  assert.equal(relay.control.sizes().keys, 300);
+  // The ledger holds every key of the run, also those of the messages that the history dropped.
   assert.equal((send('sess-a', 'route-1', 'k299', 'body 299') as { duplicate?: boolean }).duplicate, true);
-  assert.equal((send('sess-a', 'route-1', 'k0', 'body 0') as { duplicate?: boolean }).duplicate, false);
+  assert.deepEqual(send('sess-a', 'route-1', 'k0', 'body 0'), { ok: true, id: 'msg-1', state: 'evicted', reason: null, duplicate: true });
 });
 
 test('every message that goes in leaves in one of the states that name an end: after a mix of failures, none is stuck pending, queued, or sending, with no person and no timer to act', async () => {

@@ -1,4 +1,5 @@
 import { checkSessionId, readList } from '../../engine-sessions/src/request.js';
+import { routeId, type RouteId } from './brand.js';
 import { DEFAULT_LOOP_CAP, DEFAULT_MESSAGE_CAP, MAX_LOOP_CAP, MAX_MESSAGE_CAP, MAX_ROUTES, isRouteRule, type RouteReason, type RouteRule } from './vocab.js';
 import { plainRecord } from './read.js';
 
@@ -23,7 +24,7 @@ export interface RouteDefinition {
 
 /** A route of a run: the same, with the ids of the sessions, and an id of its own. */
 export interface Route {
-  readonly id: string;
+  readonly id: RouteId;
   readonly from: string;
   readonly to: string;
   readonly rule: RouteRule;
@@ -38,16 +39,18 @@ const wholeIn = (value: unknown, max: number): value is number => typeof value =
 function checkRoute(value: unknown, labels: ReadonlySet<string>): { readonly ok: true; readonly value: RouteDefinition } | RouteRefusal {
   const fields = plainRecord(value);
   if (fields === undefined || [...fields.keys()].some(key => !FIELDS.has(key))) return refuse('request');
-  const from = fields.get('from'), to = fields.get('to'), rule = fields.get('rule');
+  const from = fields.get('from'), to = fields.get('to');
   if (typeof from !== 'string' || typeof to !== 'string' || !labels.has(from) || !labels.has(to)) return refuse('session');
   if (from === to) return refuse('self');
+  // A route that names no rule is an `accepted-output` route, the safe default: the person approves each message. An `auto` route is written out, with both caps.
+  const rule = fields.has('rule') ? fields.get('rule') : 'accepted-output';
   if (!isRouteRule(rule)) return refuse('rule');
-  const message = fields.get('messageCap'), loop = fields.get('loopCap');
+  const messageCap = fields.has('messageCap') ? fields.get('messageCap') : DEFAULT_MESSAGE_CAP;
+  const loopCap = fields.has('loopCap') ? fields.get('loopCap') : DEFAULT_LOOP_CAP;
   // A cap that is written must be good, on both rules. An auto route must write both.
-  if (fields.has('messageCap') && !wholeIn(message, MAX_MESSAGE_CAP)) return refuse('cap');
-  if (fields.has('loopCap') && !wholeIn(loop, MAX_LOOP_CAP)) return refuse('cap');
+  if (!wholeIn(messageCap, MAX_MESSAGE_CAP) || !wholeIn(loopCap, MAX_LOOP_CAP)) return refuse('cap');
   if (rule === 'auto' && (!fields.has('messageCap') || !fields.has('loopCap'))) return refuse('cap');
-  return { ok: true, value: Object.freeze({ from, to, rule, messageCap: fields.has('messageCap') ? message as number : DEFAULT_MESSAGE_CAP, loopCap: fields.has('loopCap') ? loop as number : DEFAULT_LOOP_CAP }) };
+  return { ok: true, value: Object.freeze({ from, to, rule, messageCap, loopCap }) };
 }
 
 /**
@@ -83,6 +86,6 @@ export function resolveRoutes(definitions: readonly RouteDefinition[], members: 
   return Object.freeze(definitions.map((definition, index): Route => {
     const from = byLabel.get(definition.from), to = byLabel.get(definition.to);
     if (from === undefined || to === undefined || !checkSessionId(from).ok || !checkSessionId(to).ok) throw new TypeError('a route names a label that no session of the run has');
-    return Object.freeze({ id: `route-${index + 1}`, from, to, rule: definition.rule, messageCap: definition.messageCap, loopCap: definition.loopCap });
+    return Object.freeze({ id: routeId(`route-${index + 1}`), from, to, rule: definition.rule, messageCap: definition.messageCap, loopCap: definition.loopCap });
   }));
 }
