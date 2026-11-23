@@ -10,7 +10,9 @@ const handle = createProcessLauncher().launch({
   cwd: process.cwd(),
   env: {},
 });
-handle.onSpawn(() => {
+// The engine says `child:<pid>` once its helper is running, so `ready` means that the engine and its helper are both alive. The parent leaves only then, so no engine is still starting when it goes.
+handle.onLine(line => {
+  if (!line.startsWith('child:')) return;
   process.stdout.write('ready\n', () => {
     if (mode === 'exit') process.exit(0);
   });

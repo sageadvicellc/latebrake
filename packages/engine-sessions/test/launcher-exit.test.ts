@@ -16,8 +16,8 @@ async function ends(mode: 'exit' | 'term' | 'int'): Promise<{ readonly code: num
   parent.stdout.on('data', (chunk: Buffer) => { if (chunk.toString().includes('ready')) ready = true; });
   try {
     await waitFor(() => ready, 'the parent to run its engine');
-    // In the mode `exit` the parent leaves at once, so there is nothing to wait for. A signal is sent only when the engine and its helper are both up.
-    if (mode !== 'exit') await waitFor(() => liveWithTag(tag).length === 2, 'the engine and its helper');
+    // `ready` means that the engine and its helper are both up. The tag is in the arguments of the parent too, so three processes hold it. In the mode `exit` the parent leaves at once, so the check below is of the state it left behind.
+    if (mode !== 'exit') await waitFor(() => liveWithTag(tag).length === 3, 'the parent, its engine, and the helper of the engine');
     if (mode === 'term') parent.kill('SIGTERM');
     if (mode === 'int') parent.kill('SIGINT');
     const ended = await result;
