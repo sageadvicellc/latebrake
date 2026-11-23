@@ -10,7 +10,7 @@ test('the reasons of ENGINE_NOT_FOUND are exactly these three, and each is recog
 });
 
 test('the reasons of ENGINE_START_FAILED are exactly these, and each is recognised', () => {
-  assert.deepEqual([...START_FAILED_REASONS], ['program_missing', 'not_executable', 'folder_unusable', 'resource_limit', 'adapter_error', 'shutting_down', 'timed_out', 'other']);
+  assert.deepEqual([...START_FAILED_REASONS], ['program_missing', 'not_executable', 'folder_unusable', 'resource_limit', 'adapter_error', 'shutting_down', 'timed_out', 'exited', 'stopped', 'illegal_claim', 'other']);
   for (const reason of START_FAILED_REASONS) assert.equal(isStartFailedReason(reason), true, reason);
   for (const value of ['program_not_executable', 'Other', '', '__proto__', undefined, null]) assert.equal(isStartFailedReason(value), false, String(value));
 });

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { MAX_START_GROUP, createEngineHost, type EngineHost, type EngineSpec, type HostOptions } from '../src/host.js';
 import { fakeSignal } from '../src/fixtures.js';
 import type { Launched, LaunchSpec, Launcher } from '../src/launcher.js';
-import { manualLauncher } from './support.js';
+import { manualLauncher, waitFor } from './support.js';
 
 const spec = (id: string): EngineSpec => ({ id, title: `Engine ${id}`, program: `/bin/${id}`, args: [], env: [], billing: 'engine-plan', signalOf: fakeSignal });
 
@@ -180,12 +180,85 @@ test('a host that is shutting down plans no group', async () => {
   assert.deepEqual(refusal(r.host.planStartGroup([asked('alpha', '/a')])), { ok: false, code: 'ENGINE_START_FAILED', reason: 'shutting_down', index: 0 });
 });
 
-test('a throw while a member begins (a bad session id) stops the members that began, and rethrows', () => {
+/** A launcher that records what it was asked and signals, over the manual launcher, and a log that collects its lines. */
+function cleanupRig(options: { readonly newId: () => string; readonly throwOnSignal?: boolean; readonly stopTimeoutMs?: number }) {
+  const launcher = manualLauncher();
+  const lines: string[] = [];
+  const throwing: Launcher = {
+    launch(launchSpec: LaunchSpec): Launched {
+      const handle = launcher.launch(launchSpec);
+      return options.throwOnSignal === true ? { ...handle, signal: () => { throw new Error('the signal failed'); } } : handle;
+    },
+  };
+  const host = createEngineHost({
+    engines: ['alpha', 'beta', 'gamma'].map(spec), launcher: throwing, locate: program => program, canonical: folder => ({ path: folder, key: folder }), log: entry => lines.push(entry.message),
+    newId: options.newId, schedule: () => () => undefined, stopTimeoutMs: options.stopTimeoutMs ?? 30, killWaitMs: 20, cap: 4,
+  });
+  return { host, launcher, lines };
+}
+
+test('a throw while a member begins stops the members that began, asks again with the kill signal when they ignore the stop, logs it, and the original error goes on', async () => {
+  const ids = ['s-1', 's-2', 'not a valid id'];
+  const r = cleanupRig({ newId: () => ids.shift() ?? 's-9' });
+  const plans = planned(r.host, [asked('alpha', '/a'), asked('beta', '/b'), asked('gamma', '/c')]);
+  assert.throws(() => r.host.beginStartGroup(plans, { sharedApproved: false }), /malformed or already used/);
+  assert.equal(r.launcher.programs.length, 2, 'the third member never launched');
+  assert.deepEqual(r.host.list().map(session => session.id), ['s-1', 's-2'], 'the third member made no session, so it holds no place');
+  assert.deepEqual(r.launcher.programs.map(program => program.signals), [['term'], ['term']]);
+  await waitFor(() => r.launcher.programs.every(program => program.signals.includes('kill')), 'the kill signal');
+  assert.deepEqual(r.launcher.programs.map(program => program.signals), [['term', 'kill'], ['term', 'kill']]);
+  r.launcher.programs[0]?.exit(null, 'SIGKILL');
+  r.launcher.programs[1]?.exit(null, 'SIGKILL');
+  await waitFor(() => r.host.list().every(session => session.state === 'stopped'), 'the stop');
+  assert.ok(r.lines.some(line => line.includes('engine session s-1: the start of its group failed')), r.lines.join('\n'));
+  assert.ok(r.lines.some(line => line.includes('engine session s-2: the start of its group failed')));
+  // The places are free again, so the same group plans and begins.
+  const again = r.host.planStartGroup([asked('alpha', '/a'), asked('beta', '/b'), asked('gamma', '/c')]);
+  assert.ok(again.ok);
+});
+
+test('a stop that fails while the members are cleaned up never replaces the original error, and it is logged', async () => {
   const ids = ['s-1', 'not a valid id'];
-  const r = rig({ newId: () => ids.shift() ?? 's-9' });
+  const r = cleanupRig({ newId: () => ids.shift() ?? 's-9', throwOnSignal: true });
   const plans = planned(r.host, [asked('alpha', '/a'), asked('beta', '/b')]);
   assert.throws(() => r.host.beginStartGroup(plans, { sharedApproved: false }), /malformed or already used/);
-  assert.equal(r.launcher.programs.length, 1);
-  assert.deepEqual(r.launcher.programs[0]?.signals, ['term'], 'the member that began was asked to stop');
+  await waitFor(() => r.lines.some(line => line.includes('failed to run')), 'the log line');
+  assert.ok(r.lines.some(line => line.includes('engine session s-1: the stop of its group failed to run: the signal failed')), r.lines.join('\n'));
+});
+
+test('a throw while the first member begins leaves nothing to stop, and still goes on', () => {
+  const r = cleanupRig({ newId: () => 'bad id' });
+  const plans = planned(r.host, [asked('alpha', '/a')]);
+  assert.throws(() => r.host.beginStartGroup(plans, { sharedApproved: false }), /malformed or already used/);
+  assert.deepEqual(r.host.list(), []);
+  assert.equal(r.launcher.programs.length, 0);
+});
+
+test('a member that cannot be stopped even with the kill signal is logged, and the place stays held until its program goes', async () => {
+  const ids = ['s-1', 'not a valid id'];
+  const r = cleanupRig({ newId: () => ids.shift() ?? 's-9', stopTimeoutMs: 15 });
+  const plans = planned(r.host, [asked('alpha', '/a'), asked('beta', '/b')]);
+  assert.throws(() => r.host.beginStartGroup(plans, { sharedApproved: false }), /malformed or already used/);
+  await waitFor(() => r.lines.some(line => line.includes('engine session s-1: it could not be stopped after the start of its group failed')), 'the log line');
+  assert.deepEqual(r.launcher.programs[0]?.signals, ['term', 'kill']);
   assert.equal(r.host.get('s-1')?.state, 'stopping');
+  r.launcher.programs[0]?.exit(null, 'SIGKILL');
+  assert.equal(r.host.get('s-1')?.state, 'stopped');
+});
+
+test('a member of a group that is not a start plan is a bug of the caller, and throws a TypeError before any member begins', () => {
+  const r = cleanupRig({ newId: () => 's-1' });
+  const [good] = planned(r.host, [asked('alpha', '/a')]);
+  assert.ok(good);
+  const accessor = { ...good };
+  Object.defineProperty(accessor, 'program', { get: () => '/bin/alpha', enumerable: true });
+  const { model: _model, ...noModel } = good;
+  const manyVariables = Array.from({ length: 33 }, (_value, index) => `V${index}`);
+  const bad: readonly unknown[] = [
+    null, 'x', 7, [good], {}, accessor, noModel, { ...good, billing: 'provider-key' }, { ...good, billing: 7 }, { ...good, engine: 7 }, { ...good, title: null }, { ...good, folder: 7 }, { ...good, program: undefined },
+    { ...good, variables: 'x' }, { ...good, variables: manyVariables }, { ...good, variables: [1] }, { ...good, sharedWith: undefined }, { ...good, model: { provider: 'p' } },
+  ];
+  for (const member of bad) assert.throws(() => r.host.beginStartGroup([member as never], { sharedApproved: false }), TypeError, JSON.stringify(member)?.slice(0, 60));
+  assert.equal(r.launcher.programs.length, 0);
+  assert.deepEqual(r.host.list(), []);
 });

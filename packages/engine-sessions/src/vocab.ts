@@ -15,9 +15,9 @@ export const isNotFoundReason = (value: unknown): value is NotFoundReason => typ
 /**
  * Why a start failed, as a closed set, with `ENGINE_START_FAILED`. The free text of the error stays in the log of the host, since it can name a path. `program_missing`, `not_executable`, `folder_unusable`: the operating system said
  * so. `resource_limit`: the system is out of a resource (arguments too long, too many open files, no memory, or a process limit). `adapter_error`: the adapter of the engine threw while it built the arguments.
- * `shutting_down`: the host has been told to kill everything, so no start is made. `timed_out`: the program did not say it runs in time. `other`: any other cause, and the log of the host says which.
+ * `shutting_down`: the host has been told to kill everything, so no start is made. `timed_out`: the program did not say it runs in time. `exited`: the program ended before it said it runs. `stopped`: the person's own stop, or the end of the host, cut the start short. `illegal_claim`: the engine claimed a state that no line may claim, or moved the session by a move that the table forbids. `other`: any other cause, and the log of the host says which.
  */
-export const START_FAILED_REASONS = Object.freeze(['program_missing', 'not_executable', 'folder_unusable', 'resource_limit', 'adapter_error', 'shutting_down', 'timed_out', 'other'] as const);
+export const START_FAILED_REASONS = Object.freeze(['program_missing', 'not_executable', 'folder_unusable', 'resource_limit', 'adapter_error', 'shutting_down', 'timed_out', 'exited', 'stopped', 'illegal_claim', 'other'] as const);
 export type StartFailedReason = (typeof START_FAILED_REASONS)[number];
 const START_FAILED_SET: ReadonlySet<string> = new Set(START_FAILED_REASONS);
 /** True when the value is one of the reasons of `ENGINE_START_FAILED`. */
