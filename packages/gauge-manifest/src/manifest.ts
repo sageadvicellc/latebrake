@@ -10,11 +10,17 @@ export const MAX_MANIFEST_BYTES = 16 * 1024;
 /** The only format of this version. New formats keep the `bowerloom/` prefix until the rename. */
 export const MANIFEST_FORMAT = 'bowerloom/gauge/1';
 
+/** The four tile sizes, in order: small 1x1, medium 2x1, large 2x2, and full (every column) x 2. The grid itself is in `packages/gauge-layout`. */
+export const TILE_SIZES = Object.freeze(['small', 'medium', 'large', 'full'] as const);
+export type TileSize = (typeof TILE_SIZES)[number];
+
 export interface GaugeTile {
   readonly expandable: boolean;
   readonly resizable: boolean;
   /** The file that draws the tile. `null` for a data Gauge, which holds no code. */
   readonly entry: string | null;
+  /** Size hints: the sizes the tile allows, the first one preferred. Present only when the manifest declares them. A tile that cannot be resized names one size at most. */
+  readonly sizes?: readonly TileSize[];
 }
 export interface GaugePage {
   readonly entry: string;
@@ -128,6 +134,15 @@ function entry(value: JsonValue | undefined): string {
   if (!/[^.]\.[A-Za-z0-9]+$/.test(path.slice(path.lastIndexOf('/') + 1))) return invalid();
   return path;
 }
+/** Size hints: one to four names of the closed set, once each. A tile that cannot be resized names one size at most, since it has no other to offer. */
+function sizeHints(value: JsonValue | undefined, resizable: boolean): readonly TileSize[] {
+  const names = unique(list(value, TILE_SIZES.length).map((item): TileSize => {
+    const found = TILE_SIZES.find(size => size === item);
+    return found ?? invalid();
+  }));
+  if (names.length === 0 || (!resizable && names.length > 1)) return invalid();
+  return Object.freeze([...names]);
+}
 function list(value: JsonValue | undefined, most: number): readonly JsonValue[] {
   return Array.isArray(value) && value.length <= most ? value : invalid();
 }
@@ -157,11 +172,13 @@ function build(value: JsonValue): GaugeManifest {
 
   let tile: GaugeTile | null = null;
   if (Object.hasOwn(fields, 'tile')) {
-    const t = shape(fields['tile'], ['expandable', 'resizable'], ['entry']);
+    const t = shape(fields['tile'], ['expandable', 'resizable'], ['entry', 'sizes']);
     const hasEntry = Object.hasOwn(t, 'entry');
     if (kind === 'ui' && !hasEntry) invalid('missing_field');
     if (kind === 'data' && hasEntry) invalid();
-    tile = Object.freeze({ expandable: flag(t['expandable']), resizable: flag(t['resizable']), entry: hasEntry ? entry(t['entry']) : null });
+    const expandable = flag(t['expandable']), resizable = flag(t['resizable']);
+    const sizes = Object.hasOwn(t, 'sizes') ? sizeHints(t['sizes'], resizable) : undefined;
+    tile = Object.freeze({ expandable, resizable, entry: hasEntry ? entry(t['entry']) : null, ...(sizes ? { sizes } : {}) });
   }
   let page: GaugePage | null = null;
   if (Object.hasOwn(fields, 'page')) {
