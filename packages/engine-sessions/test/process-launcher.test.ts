@@ -325,3 +325,60 @@ test('a kill that fails for a reason other than the group being gone goes to the
     await assertNoLeaks(tag);
   }
 });
+
+test('after the program has gone no signal is sent to its group at all, so a reused group id is never hit', async () => {
+  const tag = newTag();
+  const kill = process.kill;
+  try {
+    const { handle } = await run([{ say: 'x' }], tag);
+    const groupCalls: number[] = [];
+    process.kill = ((pid: number, signal?: string | number) => { if (pid < 0) groupCalls.push(pid); return kill(pid, signal); }) as typeof process.kill;
+    handle.signal('term');
+    handle.signal('kill');
+    assert.deepEqual(groupCalls, []);
+  } finally {
+    process.kill = kill;
+    await assertNoLeaks(tag);
+  }
+});
+
+test('the signal handlers are installed again at a later launch when something has removed them', async () => {
+  const tag = newTag();
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
+  const saved = signals.map(signal => [signal, process.listeners(signal)] as const);
+  try {
+    await run([{ say: 'x' }], tag);
+    for (const signal of signals) process.removeAllListeners(signal);
+    await run([{ say: 'y' }], newTag());
+    for (const signal of signals) assert.equal(process.listenerCount(signal), 1, signal);
+  } finally {
+    for (const [signal, listeners] of saved) {
+      process.removeAllListeners(signal);
+      for (const listener of listeners) process.on(signal, listener as () => void);
+    }
+    await assertNoLeaks(tag);
+  }
+});
+
+test('a failure of a pipe, and an error of the program after it started, go to the log channel and throw nothing', async () => {
+  const tag = newTag();
+  const messages: string[] = [];
+  let child: ReturnType<typeof spawn> | undefined;
+  const launcher = createProcessLauncher({ log: message => messages.push(message), spawn: ((...args: Parameters<typeof spawn>) => { child = spawn(...args); return child; }) as typeof spawn });
+  const handle = launcher.launch({ program: process.execPath, args: [FAKE_ENGINE_PROGRAM, '--tag', tag, '--script', JSON.stringify([{ hold: true }])], cwd: process.cwd(), env: {} });
+  let ended = false, spawned = false;
+  handle.onExit(() => { ended = true; });
+  handle.onSpawn(() => { spawned = true; });
+  try {
+    await waitFor(() => spawned && liveWithTag(tag).length === 1, 'the program');
+    assert.ok(child !== undefined);
+    child.stdout?.emit('error', new Error('out broke'));
+    child.stderr?.emit('error', new Error('err broke'));
+    child.emit('error', new Error('program broke'));
+    assert.deepEqual(messages, ['the output of the program failed: out broke', 'the standard error of the program failed: err broke', 'the program reported an error: program broke']);
+  } finally {
+    handle.signal('kill');
+    await waitFor(() => ended, 'the exit');
+    await assertNoLeaks(tag);
+  }
+});

@@ -98,6 +98,8 @@ const NAMES: Readonly<Record<StopSignal, NodeJS.Signals>> = { term: 'SIGTERM', k
 export interface ProcessLauncherOptions {
   /** Receives a line when a signal could not be sent for a reason other than that the group is gone, or when a pipe or a program reports an error. Standard error by default. */
   readonly log?: (message: string) => void;
+  /** Starts the program. `spawn` of Node by default. A test passes its own to reach the child and make its pipes fail. */
+  readonly spawn?: typeof spawn;
 }
 
 const toStandardError = (message: string): void => { process.stderr.write(`engine launcher: ${message}\n`); };
@@ -116,12 +118,13 @@ function endOf(text: string): string {
  */
 export function createProcessLauncher(options: ProcessLauncherOptions = {}): Launcher {
   const log = options.log ?? toStandardError;
+  const start = options.spawn ?? spawn;
   return {
     launch(spec: LaunchSpec): Launched {
       installHandlers();
       const spawnListeners: (() => void)[] = [], errorListeners: ((error: Error) => void)[] = [], lineListeners: ((line: string) => void)[] = [];
       const exitListeners: ((code: number | null, signal: string | null, stderrTail: string) => void)[] = [];
-      const child = spawn(spec.program, [...spec.args], { cwd: spec.cwd, env: { ...spec.env }, shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      const child = start(spec.program, [...spec.args], { cwd: spec.cwd, env: { ...spec.env }, shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       // The group exists from the moment the program is made, and not from the later spawn event, so a process that exits in the same tick still takes the engine with it.
       if (child.pid !== undefined) liveGroups.add(child.pid);
       let spawned = false, groupGone = false, finished = false;
