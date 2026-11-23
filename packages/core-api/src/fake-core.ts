@@ -1,22 +1,21 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { GaugeCode } from '../../gauge-errors/src/index.js';
-import { compareVersions, isUnsafeFolderName, parseVersion, unsafeNameReason, validateManifest, type GaugeManifest, type ManifestReason } from '../../gauge-manifest/src/index.js';
+import {
+  PERMISSION_NAMES, compareVersions, isPermission, isTracesPermission, isUnsafeFolderName, parseVersion, permissionOf, unsafeNameReason, validateManifest,
+  type AuditReason, type GaugeManifest, type GrantReason, type ManifestReason, type PermissionName,
+} from '../../gauge-manifest/src/index.js';
 import { FIXTURE_GAUGES } from './fixtures.js';
-import { PLAN_ACTIONS, type Core, type CoreReply, type GaugeApplied, type GaugePlan, type GaugeSummary, type PlanAction } from './types.js';
+import { DEFAULT_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES, appendAuditStep, auditLine, grantSteps } from './grants.js';
+import { escapeForPlan } from './plan-text.js';
+import { PLAN_ACTIONS, type AuditEntry, type AuditRead, type Core, type CoreRefusal, type CoreReply, type GaugeApplied, type GaugePlan, type GaugeSummary, type PlanAction } from './types.js';
+
+export { escapeForPlan };
 
 /**
  * The default clock of the fake core, in milliseconds. It is monotonic: it reads the performance clock, which never steps back, and never the system
  * clock, which a person or a network time service can move. So a system clock that steps back cannot make an approval last longer.
  */
 export const monotonicNow = (): number => performance.now();
-
-const UNSAFE_IN_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\\]/gu;
-
-/**
- * Makes a value safe to put in a line of a plan. A line break, a control, format, or separator character, and a backslash become a visible escape such as
- * `\u{a}`, so no value can end a line or start a new one, and a person reads what the value really holds.
- */
-export const escapeForPlan = (value: string): string => value.replace(UNSAFE_IN_TEXT, char => (char === '\\' ? '\\\\' : `\\u{${char.codePointAt(0)?.toString(16) ?? ''}}`));
 
 /** How long an approval lasts, in milliseconds. */
 export const APPROVAL_TTL_MS = 15 * 60 * 1000;
@@ -40,6 +39,15 @@ export interface FakeCoreOptions {
   readonly folders?: readonly GaugeFolder[];
   /** The clock, in milliseconds. A monotonic clock by default (`monotonicNow`). A test passes its own, to move time. */
   readonly now?: () => number;
+  /** The size cap of the audit file, in bytes: a whole number of at least 4,096. 64 KiB by default. A smaller or a non-integer cap is refused when the core is made. */
+  readonly auditMaxBytes?: number;
+  /** The wall clock for the time of an audit record, in milliseconds since 1970. The system clock by default. An audit record is a time, so it is not the monotonic clock. A test passes its own. */
+  readonly wall?: () => number;
+  /**
+   * Called with the whole text of the audit file each time the core writes a record, before the core keeps the new text. A test makes it throw, to stand for a file that cannot be written.
+   * A real core writes the file here.
+   */
+  readonly onAuditWrite?: (text: string) => void;
 }
 
 /**
@@ -53,6 +61,8 @@ export interface FakeCore extends Core {
   approve(nonce: string): string;
   /** Replaces, or adds, the folder with the same name, as if its files changed on disk. The core keeps a copy. */
   replaceFolder(folder: GaugeFolder): void;
+  /** The text of the audit file: one JSON line for each record, oldest first. A real core keeps this in a file on this computer. */
+  auditFile(): string;
 }
 
 interface Installed {
@@ -62,6 +72,9 @@ interface Installed {
   folderHash: string | null;
   /** The lines of the plan that say what the Gauge may do: permissions, kind, tile, page. */
   details: readonly string[];
+  /** The permissions and the engines its manifest declares. A Gauge the core starts with declares none. */
+  permissions: readonly string[];
+  engines: readonly string[];
 }
 interface Hashes {
   readonly manifestHash: string;
@@ -80,17 +93,42 @@ interface Content0 {
   readonly folderHash: string | null;
 }
 type Sealed = Content0 & { readonly digest: string };
-type Refusal = { readonly ok: false; readonly code: GaugeCode; readonly reason?: ManifestReason };
+type Refusal = CoreRefusal;
 /** A plan of install or update comes with the Gauge to add. A plan on an installed Gauge comes with nothing more. */
 type Planned = Refusal
-  | { readonly ok: true; readonly kind: 'folder'; readonly plan: Sealed; readonly summary: GaugeSummary; readonly details: readonly string[]; readonly hashes: Hashes }
+  | { readonly ok: true; readonly kind: 'folder'; readonly plan: Sealed; readonly summary: GaugeSummary; readonly details: readonly string[]; readonly hashes: Hashes; readonly declared: Declared }
   | { readonly ok: true; readonly kind: 'installed'; readonly plan: Sealed };
+/** What a manifest declares that a grant depends on. */
+interface Declared {
+  readonly permissions: readonly string[];
+  readonly engines: readonly string[];
+}
+/** What a grant plan says before the core seals it. */
+interface GrantContent {
+  readonly id: string;
+  readonly version: string;
+  readonly permissions: readonly string[];
+  readonly steps: readonly string[];
+  readonly manifestHash: string | null;
+  readonly folderHash: string | null;
+}
+type SealedGrant = GrantContent & { readonly digest: string };
+/** The two hashes a grant is bound to: those of the install plan, the manifest and the whole folder. */
+interface GrantHashes {
+  readonly manifestHash: string | null;
+  readonly folderHash: string | null;
+}
 interface Approval {
   readonly nonce: string;
   readonly digest: string;
   readonly at: number;
   readonly epoch: number;
 }
+
+/** The last millisecond of the year 9999, so that a time is always written as four digits of year. */
+const MAX_WALL_MS = 253_402_300_799_999;
+/** The time of a record when the clock gave none. */
+const FALLBACK_AT = '1970-01-01T00:00:00.000Z';
 
 const sha256 = (...parts: Content[]): string => { const hash = createHash('sha256'); for (const part of parts) hash.update(part); return hash.digest('hex'); };
 const bytesOf = (content: Content): Uint8Array => (typeof content === 'string' ? Buffer.from(content, 'utf8') : content);
@@ -124,8 +162,17 @@ function describe(manifest: GaugeManifest): readonly string[] {
   return [`permissions: ${manifest.permissions.length > 0 ? manifest.permissions.join(', ') : 'none'}`, `kind: ${manifest.kind}`, `tile: ${tile}`, `page: ${manifest.page === null ? 'no' : 'yes'}`];
 }
 
-const refuse = (code: GaugeCode, reason?: ManifestReason): Refusal => (reason === undefined ? { ok: false, code } : { ok: false, code, reason });
+const digestOfGrant = (plan: GrantContent): string => sha256(JSON.stringify(['grant', plan.id, plan.version, plan.permissions, plan.steps, plan.manifestHash, plan.folderHash]));
+const sealedGrant = (plan: GrantContent): SealedGrant => ({ ...plan, permissions: [...plan.permissions], steps: [...plan.steps], digest: digestOfGrant(plan) });
+
+const refuse = (code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED'>, reason?: ManifestReason): Refusal => (reason === undefined ? { ok: false, code } : { ok: false, code, reason });
+/** A refusal because the audit file could not take the record of a grant. */
+const auditRefusal = (reason: AuditReason): Refusal => ({ ok: false, code: 'GAUGE_AUDIT_FAILED', reason });
+/** A refusal because of a grant: the code `GAUGE_GRANT_MISSING` with a reason of the closed set, or with none when the permission is plainly not granted. */
+const deny = (reason?: GrantReason): Refusal => (reason === undefined ? { ok: false, code: 'GAUGE_GRANT_MISSING' } : { ok: false, code: 'GAUGE_GRANT_MISSING', reason });
 const reply = (refusal: Refusal): CoreReply => (refusal.reason === undefined ? { ok: false, code: refusal.code } : { ok: false, code: refusal.code, reason: refusal.reason });
+/** True when the value is a list of text with no hole. A hole is not a line of text. */
+const isDenseTexts = (value: unknown): value is string[] => Array.isArray(value) && Array.from(value as unknown[]).every((item): item is string => typeof item === 'string');
 
 /**
  * A core that answers from fixture data and gives stable refusal codes. A design or a Gauge builds against it before the real core exists.
@@ -138,19 +185,75 @@ const reply = (refusal: Refusal): CoreReply => (refusal.reason === undefined ? {
  * - An approval is a random token for one nonce. It works once, for 15 minutes, and only while the state of the core has not changed since: any applied step ends every approval given before it.
  * - Applying checks the approval, then that the plan is the approved one, then that the folder still has the approved hashes, and then that the plan would still be the same plan now.
  *
+ * Grants follow the same plan and approval rules (see `README.md`): `bowerloom.grants.plan` and `bowerloom.grants.apply`. A grant binds to the manifest hash and the folder hash
+ * of the installed Gauge, so an update makes it stale. A revoke is one call with no plan. `bowerloom.permissions.check` is the one enforcement point, and every grant and revoke
+ * is written to an audit file with a size cap before the change it describes.
+ *
  * The fake does not check `dependencies` at install, and a removal is not blocked by a Gauge that depends on it. Both belong to a later ticket.
  */
 export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   const now = options.now ?? monotonicNow;
+  const wall = options.wall ?? Date.now;
+  const auditMaxBytes = options.auditMaxBytes ?? DEFAULT_AUDIT_MAX_BYTES;
+  if (!Number.isSafeInteger(auditMaxBytes) || auditMaxBytes < MIN_AUDIT_MAX_BYTES) throw new RangeError(`the audit size cap is a whole number of at least ${MIN_AUDIT_MAX_BYTES} bytes`);
   const folders = new Map<string, GaugeFolder>((options.folders ?? []).map(folder => [folder.name, copyFolder(folder)]));
-  const installed = new Map<string, Installed>(FIXTURE_GAUGES.map(gauge => [gauge.id, { summary: { ...gauge }, enabled: true, manifestHash: null, folderHash: null, details: [`permissions: none`, `kind: ${gauge.kind}`] }]));
+  const installed = new Map<string, Installed>(FIXTURE_GAUGES.map(gauge => [gauge.id, { summary: { ...gauge }, enabled: true, manifestHash: null, folderHash: null, details: [`permissions: none`, `kind: ${gauge.kind}`], permissions: [], engines: [] }]));
   /** Ids that a user Gauge may never use. A stock id stays reserved after its Gauge is removed. */
   const stockIds = new Set<string>(FIXTURE_GAUGES.filter(gauge => gauge.origin === 'stock').map(gauge => gauge.id));
   /** The nonce of each plan the core issued, with the digest of the plan and the count of applied steps at that time. A nonce is retired when the state changes. */
-  const issued = new Map<string, { digest: string; epoch: number }>();
+  const issued = new Map<string, { digest: string; epoch: number; gauge: string | null }>();
   const approvals = new Map<string, Approval>();
   /** Counts the steps applied. An approval from an earlier count is stale. */
   let epoch = 0;
+  /** The grants of each Gauge, by permission. A grant holds the two hashes it is bound to. */
+  const grants = new Map<string, Map<PermissionName, GrantHashes>>();
+  /** The audit file, as its lines, oldest first, and the number of the last record ever written. */
+  let auditLines: readonly string[] = [];
+  let auditSeq = 0;
+  /** How many records were dropped to keep the file under its cap, and whether a record was ever lost for another reason. The reader sees both. */
+  let auditDropped = 0;
+  let auditFailed = false;
+
+  /** The time of an audit record, in ISO form, or `undefined` when the clock gave no usable time (or threw). */
+  const readClock = (): string | undefined => {
+    try {
+      const time: unknown = wall();
+      if (typeof time !== 'number' || !Number.isFinite(time) || time < 0 || time > MAX_WALL_MS) return undefined;
+      return new Date(time).toISOString();
+    } catch {
+      return undefined;
+    }
+  };
+  /** Builds the records of one step, numbered after the last one. Nothing is written yet. */
+  const auditEntries = (at: string, action: 'grant' | 'revoke', via: AuditEntry['via'], id: string, version: string, held: readonly (readonly [PermissionName, GrantHashes])[]): AuditEntry[] =>
+    held.map(([permission, hashes], index) => ({ seq: auditSeq + 1 + index, at, action, via, id, version, permission, manifestHash: hashes.manifestHash, folderHash: hashes.folderHash }));
+  /**
+   * Writes the records of one step to the audit file as one unit: the oldest records are dropped to make room, and a record of the step is never dropped. The sink sees the new file
+   * text first, and the core keeps it only when the sink did not throw. Gives `false` when the step could not be written, and then nothing changed.
+   */
+  const writeAudit = (entries: readonly AuditEntry[]): boolean => {
+    const next = appendAuditStep(auditLines, entries.map(auditLine), auditMaxBytes);
+    if (!next) return false;
+    try {
+      options.onAuditWrite?.(next.lines.join(''));
+    } catch {
+      return false;
+    }
+    auditLines = next.lines;
+    auditSeq += entries.length;
+    auditDropped += next.dropped;
+    return true;
+  };
+  /**
+   * Records a revoke that has already taken effect. This is a best effort and it never throws: access ended first, so a clock that gives no usable time (the record takes the time 0 and the
+   * file is marked) or a file that cannot be written (no record, and the file is marked) can never leave access in place or stop a revoke, a disable, an update, or a removal.
+   */
+  const recordRevoked = (via: AuditEntry['via'], id: string, version: string, held: readonly (readonly [PermissionName, GrantHashes])[]): void => {
+    if (held.length === 0) return;
+    const at = readClock();
+    if (at === undefined) auditFailed = true;
+    if (!writeAudit(auditEntries(at ?? FALLBACK_AT, 'revoke', via, id, version, held))) auditFailed = true;
+  };
 
   const isReserved = (id: string): boolean => {
     if (stockIds.has(id)) return true;
@@ -180,11 +283,12 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (origin === 'third-party' && isReserved(summary.id)) return refuse('GAUGE_NAME_RESERVED');
     const current = installed.get(summary.id);
     const hashes = hashesOf(folder), details = describe(manifest);
+    const declared: Declared = { permissions: [...manifest.permissions], engines: [...manifest.engines] };
     const content = { id: summary.id, folder: folder.name, origin, manifestHash: hashes.manifestHash, folderHash: hashes.folderHash };
     if (action === 'install') {
       if (current) return refuse('GAUGE_EXISTS');
       return {
-        ok: true, kind: 'folder', summary, details, hashes,
+        ok: true, kind: 'folder', summary, details, hashes, declared,
         plan: sealed({ ...content, action, from: null, to: summary.version, steps: [
           `check the manifest of ${escapeForPlan(summary.id)}`, ...details, `copy folder ${escapeForPlan(folder.name)} into the Gauge store`, `add ${escapeForPlan(summary.id)} ${escapeForPlan(summary.version)} as ${origin}, disabled`,
         ] }),
@@ -195,9 +299,9 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (current.summary.protected && !summary.protected) return refuse('GAUGE_PROTECTED');
     if (compareVersions(parseVersion(summary.version) ?? [0, 0, 0], parseVersion(current.summary.version) ?? [0, 0, 0]) <= 0) return refuse('GAUGE_VERSION_NOT_NEWER');
     return {
-      ok: true, kind: 'folder', summary, details, hashes,
+      ok: true, kind: 'folder', summary, details, hashes, declared,
       plan: sealed({ ...content, action, from: current.summary.version, to: summary.version, steps: [
-        `check the manifest of ${escapeForPlan(summary.id)}`, ...details, `replace ${escapeForPlan(summary.id)} ${escapeForPlan(current.summary.version)} with ${escapeForPlan(summary.version)} from folder ${escapeForPlan(folder.name)}`, `keep ${escapeForPlan(summary.id)} ${current.enabled ? 'enabled' : 'disabled'}`,
+        `check the manifest of ${escapeForPlan(summary.id)}`, ...details, `replace ${escapeForPlan(summary.id)} ${escapeForPlan(current.summary.version)} with ${escapeForPlan(summary.version)} from folder ${escapeForPlan(folder.name)}`, `drop every grant of ${escapeForPlan(summary.id)}, so each permission is granted again`, `keep ${escapeForPlan(summary.id)} ${current.enabled ? 'enabled' : 'disabled'}`,
       ] }),
     };
   }
@@ -210,8 +314,8 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     const id0 = escapeForPlan(summary.id), version = escapeForPlan(summary.version);
     const steps = {
       enable: [...current.details, `enable ${id0} ${version} (now ${state})`, `add the route of ${id0}`],
-      disable: [...current.details, `disable ${id0} ${version} (now ${state})`, `remove the route of ${id0}`],
-      remove: [...current.details, `remove ${id0} ${version} (now ${state})`, `remove the route of ${id0}`, `delete the files of ${id0}`],
+      disable: [...current.details, `disable ${id0} ${version} (now ${state})`, `clear the traces grants of ${id0}, and keep its other grants`, `remove the route of ${id0}`],
+      remove: [...current.details, `remove ${id0} ${version} (now ${state})`, `drop every grant of ${id0}`, `remove the route of ${id0}`, `delete the files of ${id0}`],
     }[action];
     return {
       ok: true, kind: 'installed',
@@ -231,18 +335,37 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (typeof action !== 'string' || !(PLAN_ACTIONS as readonly string[]).includes(action) || typeof id !== 'string' || typeof nonce !== 'string') return undefined;
     const nullable = (field: unknown): field is string | null => field === null || typeof field === 'string';
     if (!nullable(folder) || !nullable(from) || !nullable(to) || !nullable(manifestHash) || !nullable(folderHash) || (origin !== 'stock' && origin !== 'third-party')) return undefined;
-    if (!Array.isArray(steps) || !steps.every((step): step is string => typeof step === 'string')) return undefined;
+    if (!isDenseTexts(steps)) return undefined;
     return { ...sealed({ action: action as PlanAction, id, folder, from, to, origin, steps, manifestHash, folderHash }), nonce };
   }
 
-  function apply(params: Readonly<Record<string, unknown>>): CoreReply {
+  /** Finds the approval a caller sent. An unknown, old, or expired approval reads as `undefined`, and an expired or stale one is forgotten. */
+  function liveApproval(params: Readonly<Record<string, unknown>>): { readonly token: string; readonly approval: Approval } | undefined {
     const token = params['approval'];
     const approval = typeof token === 'string' ? approvals.get(token) : undefined;
-    if (typeof token !== 'string' || !approval) return reply(refuse('GAUGE_PLAN_NOT_APPROVED'));
+    if (typeof token !== 'string' || !approval) return undefined;
     if (now() - approval.at >= APPROVAL_TTL_MS || approval.epoch !== epoch) {
       approvals.delete(token);
-      return reply(refuse('GAUGE_PLAN_NOT_APPROVED'));
+      return undefined;
     }
+    return { token, approval };
+  }
+
+  /** A plan is applied: retire its nonce and its approvals, and end every approval and every plan of before. The state has changed. */
+  function retire(nonce: string, token: string): void {
+    for (const [other, record] of approvals) if (record.nonce === nonce) approvals.delete(other);
+    issued.delete(nonce);
+    approvals.delete(token);
+    epoch += 1;
+  }
+
+  const sortedHeld = (id: string): (readonly [PermissionName, GrantHashes])[] =>
+    [...(grants.get(id)?.entries() ?? [])].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+
+  function apply(params: Readonly<Record<string, unknown>>): CoreReply {
+    const live = liveApproval(params);
+    if (!live) return reply(refuse('GAUGE_PLAN_NOT_APPROVED'));
+    const { token, approval } = live;
     const plan = readPlan(params['plan']);
     if (!plan || plan.nonce !== approval.nonce || plan.digest !== approval.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
     // The plan is the approved one. Read the folder again: it must still have the approved hashes.
@@ -258,11 +381,18 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     const { id, action } = fresh.plan;
     const current = installed.get(id);
     let result: GaugeApplied;
+    let cleared: { readonly via: 'remove' | 'disable' | 'update'; readonly version: string; readonly held: readonly (readonly [PermissionName, GrantHashes])[] } | undefined;
     if (fresh.kind === 'folder') {
-      const entry: Installed = { summary: fresh.summary, enabled: false, manifestHash: fresh.hashes.manifestHash, folderHash: fresh.hashes.folderHash, details: fresh.details };
+      const entry: Installed = {
+        summary: fresh.summary, enabled: false, manifestHash: fresh.hashes.manifestHash, folderHash: fresh.hashes.folderHash, details: fresh.details,
+        permissions: fresh.declared.permissions, engines: fresh.declared.engines,
+      };
       if (action === 'update') {
         if (!current) return reply(refuse('UNKNOWN_GAUGE'));
         entry.enabled = current.enabled;
+        // An update drops every grant of the old version, so a changed manifest asks again and no grant of an earlier version lingers. The record names the version that was replaced.
+        cleared = { via: 'update', version: current.summary.version, held: sortedHeld(id) };
+        grants.delete(id);
       }
       installed.set(id, entry);
       if (fresh.summary.origin === 'stock') stockIds.add(id);
@@ -270,19 +400,157 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     } else {
       if (!current) return reply(refuse('UNKNOWN_GAUGE'));
       if (action === 'remove') {
+        // A removed Gauge keeps no grant.
+        cleared = { via: 'remove', version: current.summary.version, held: sortedHeld(id) };
+        grants.delete(id);
         installed.delete(id);
         result = { action, id, version: null, enabled: false };
       } else {
         current.enabled = action === 'enable';
+        // A disabled Gauge loses its traces grants and keeps the others. The traces grants must be made again, in their own step.
+        if (action === 'disable') {
+          const traces = sortedHeld(id).filter(([permission]) => isTracesPermission(permission));
+          for (const [permission] of traces) grants.get(id)?.delete(permission);
+          if (grants.get(id)?.size === 0) grants.delete(id);
+          cleared = { via: 'disable', version: current.summary.version, held: traces };
+        }
         result = { action, id, version: current.summary.version, enabled: current.enabled };
       }
     }
-    // The plan is applied: retire its nonce and its approvals, and end every approval and every plan of before. The state has changed.
-    for (const [other, record] of approvals) if (record.nonce === plan.nonce) approvals.delete(other);
-    issued.delete(plan.nonce);
-    approvals.delete(token);
-    epoch += 1;
+    retire(plan.nonce, token);
+    // The grants are gone. Their records come after, on a best effort, so a failure of the audit file never undoes the step.
+    if (cleared) recordRevoked(cleared.via, id, cleared.version, cleared.held);
     return { ok: true, result };
+  }
+
+  // Grants
+
+  /** Reads a list of permission names: a non-empty list of text with no repeat, sorted. Anything else reads as `undefined`. */
+  function readNames(value: unknown): readonly string[] | undefined {
+    try {
+      if (!Array.isArray(value) || value.length === 0 || value.length > PERMISSION_NAMES.length) return undefined;
+      const names: string[] = [];
+      for (const item of value as unknown[]) {
+        if (typeof item !== 'string') return undefined;
+        names.push(item);
+      }
+      if (new Set(names).size !== names.length) return undefined;
+      return names.sort();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plans a grant. Nothing changes. Every check runs here, so the plan the person sees is one that can be applied. */
+  function planGrant(params: Readonly<Record<string, unknown>>): { readonly ok: true; readonly plan: SealedGrant } | Refusal {
+    const id = params['id'];
+    const current = typeof id === 'string' ? installed.get(id) : undefined;
+    if (typeof id !== 'string' || !current) return refuse('UNKNOWN_GAUGE');
+    const names = readNames(params['permissions']);
+    if (!names) return deny('invalid_request');
+    if (!names.every(isPermission)) return deny('unknown_permission');
+    // Traces permissions are granted in their own step: a plan holds only traces permissions, or none.
+    const traces = names.filter(isTracesPermission).length;
+    if (traces > 0 && traces < names.length) return refuse('GAUGE_TRACES_OWN_STEP');
+    if (!names.every(name => current.permissions.includes(name))) return deny('not_declared');
+    const steps = grantSteps({ id, version: current.summary.version, permissions: names, engines: current.engines, manifestHash: current.manifestHash, folderHash: current.folderHash });
+    return { ok: true, plan: sealedGrant({ id, version: current.summary.version, permissions: names, steps, manifestHash: current.manifestHash, folderHash: current.folderHash }) };
+  }
+
+  /** Reads the grant plan a caller sends back. Anything that is not a whole plan reads as `undefined`. The digest is computed here, and the one the caller sent is ignored. */
+  function readGrantPlan(value: unknown): (SealedGrant & { readonly nonce: string }) | undefined {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+    const { action, id, version, permissions, steps, manifestHash, folderHash, nonce } = value as Record<string, unknown>;
+    if (action !== 'grant' || typeof id !== 'string' || typeof version !== 'string' || typeof nonce !== 'string') return undefined;
+    const nullable = (field: unknown): field is string | null => field === null || typeof field === 'string';
+    if (!nullable(manifestHash) || !nullable(folderHash)) return undefined;
+    if (!isDenseTexts(permissions) || !isDenseTexts(steps)) return undefined;
+    return { ...sealedGrant({ id, version, permissions, steps, manifestHash, folderHash }), nonce };
+  }
+
+  function applyGrant(params: Readonly<Record<string, unknown>>): CoreReply {
+    const live = liveApproval(params);
+    if (!live) return reply(refuse('GAUGE_PLAN_NOT_APPROVED'));
+    const { token, approval } = live;
+    const plan = readGrantPlan(params['plan']);
+    if (!plan || plan.nonce !== approval.nonce || plan.digest !== approval.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    // Plan again from the state now: a grant for a Gauge that has changed, or that is gone, is not the grant the person approved.
+    const fresh = planGrant({ id: plan.id, permissions: plan.permissions });
+    if (!fresh.ok) return reply(fresh);
+    if (fresh.plan.digest !== plan.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    const hashes: GrantHashes = { manifestHash: fresh.plan.manifestHash, folderHash: fresh.plan.folderHash };
+    const names = fresh.plan.permissions.filter(isPermission);
+    // A grant stays closed when it cannot be recorded: the record is written first, and a clock with no usable time or a file that cannot be written refuses the grant, with nothing changed.
+    const at = readClock();
+    if (at === undefined) return reply(auditRefusal('clock_unusable'));
+    if (!writeAudit(auditEntries(at, 'grant', 'plan', plan.id, fresh.plan.version, names.map((name): readonly [PermissionName, GrantHashes] => [name, hashes])))) return reply(auditRefusal('write_failed'));
+    const held = grants.get(plan.id) ?? new Map<PermissionName, GrantHashes>();
+    for (const name of names) held.set(name, hashes);
+    grants.set(plan.id, held);
+    retire(plan.nonce, token);
+    return { ok: true, result: { id: plan.id, permissions: [...names] } };
+  }
+
+  /** Ends the pending grant plans and the approvals of grant plans for one Gauge, so an approved regrant cannot apply after the person revoked. */
+  function retireGrantPlans(id: string): void {
+    for (const [nonce, record] of issued) {
+      if (record.gauge !== id) continue;
+      issued.delete(nonce);
+      for (const [token, approval] of approvals) if (approval.nonce === nonce) approvals.delete(token);
+    }
+  }
+
+  /**
+   * A revoke is one action with no plan: it only narrows what a Gauge may do, so the person never waits for it. Access ends first, and the record is written after, on a best effort,
+   * so a bad clock or a file that cannot be written never stops a revoke. It works on a disabled Gauge. A permission that the Gauge does not hold is a no-op: the end state is reached.
+   * Only an unknown Gauge, an unknown name, and a request of the wrong shape are refused.
+   */
+  function revoke(params: Readonly<Record<string, unknown>>): CoreReply {
+    const id = params['id'];
+    const current = typeof id === 'string' ? installed.get(id) : undefined;
+    if (typeof id !== 'string' || !current) return reply(refuse('UNKNOWN_GAUGE'));
+    const held = grants.get(id);
+    const group = params['group'], list = params['permissions'];
+    let names: readonly PermissionName[];
+    if (group !== undefined) {
+      if (list !== undefined || group !== 'traces') return reply(deny('invalid_request'));
+      names = [...(held?.keys() ?? [])].filter(isTracesPermission).sort();
+    } else {
+      const read = readNames(list);
+      if (!read) return reply(deny('invalid_request'));
+      if (!read.every(isPermission)) return reply(deny('unknown_permission'));
+      names = read.filter(name => held?.has(name) === true);
+    }
+    const records = names.map((name): readonly [PermissionName, GrantHashes] => [name, held?.get(name) ?? { manifestHash: null, folderHash: null }]);
+    for (const name of names) held?.delete(name);
+    if (held?.size === 0) grants.delete(id);
+    if (names.length > 0) retireGrantPlans(id);
+    recordRevoked('revoke', id, current.summary.version, records);
+    return { ok: true, result: { id, revoked: [...names] } };
+  }
+
+  /** The one place that decides whether a Gauge may use a permission now, for an engine. Every call that a permission guards goes through it. */
+  function enforce(gaugeId: unknown, permission: unknown, engine: unknown): { readonly ok: true; readonly gauge: string; readonly permission: string; readonly engine: string | null } | Refusal {
+    const current = typeof gaugeId === 'string' ? installed.get(gaugeId) : undefined;
+    if (typeof gaugeId !== 'string' || !current) return refuse('UNKNOWN_GAUGE');
+    const entry = permissionOf(permission);
+    if (!entry) return deny('unknown_permission');
+    if (!current.permissions.includes(entry.name)) return deny('not_declared');
+    if (!current.enabled) return deny('gauge_disabled');
+    let engineName: string | null = null;
+    if (entry.scope === 'engine') {
+      // A permission is scoped by the Gauge's own list of engines: a Gauge reads an engine it lists, and no other.
+      if (typeof engine !== 'string' || !current.engines.includes(engine)) return deny('engine_not_listed');
+      engineName = engine;
+    } else if (engine !== undefined) {
+      return deny('invalid_request');
+    }
+    const held = grants.get(gaugeId);
+    if (held?.has(entry.name) !== true) return deny();
+    // The text of a trace is readable only together with the facts. The Traces API (ticket 714) enforces the pairing at the reader. This one enforcement point
+    // must not allow a state that the spec forbids either, so the text is refused while the facts are not held.
+    if (entry.name === 'traces.text' && !held.has('traces.facts')) return deny('facts_required');
+    return { ok: true, gauge: gaugeId, permission: entry.name, engine: engineName };
   }
 
   return {
@@ -297,6 +565,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     replaceFolder(folder) {
       folders.set(folder.name, copyFolder(folder));
     },
+    auditFile: () => auditLines.join(''),
     async call(method, params): Promise<CoreReply> {
       switch (method) {
         case 'bowerloom.gauges.list':
@@ -312,11 +581,39 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const planned = planFor(action as PlanAction, params);
           if (!planned.ok) return reply(planned);
           const nonce = randomBytes(32).toString('hex');
-          issued.set(nonce, { digest: planned.plan.digest, epoch });
+          issued.set(nonce, { digest: planned.plan.digest, epoch, gauge: null });
           return { ok: true, result: { ...planned.plan, steps: [...planned.plan.steps], nonce } };
         }
         case 'bowerloom.gauges.apply':
           return apply(params);
+        case 'bowerloom.grants.plan': {
+          const planned = planGrant(params);
+          if (!planned.ok) return reply(planned);
+          const nonce = randomBytes(32).toString('hex');
+          issued.set(nonce, { digest: planned.plan.digest, epoch, gauge: planned.plan.id });
+          return { ok: true, result: { action: 'grant', ...planned.plan, permissions: [...planned.plan.permissions], steps: [...planned.plan.steps], nonce } };
+        }
+        case 'bowerloom.grants.apply':
+          return applyGrant(params);
+        case 'bowerloom.grants.revoke':
+          return revoke(params);
+        case 'bowerloom.grants.list': {
+          const id = params['id'];
+          const current = typeof id === 'string' ? installed.get(id) : undefined;
+          if (typeof id !== 'string' || !current) return { ok: false, code: 'UNKNOWN_GAUGE' };
+          return { ok: true, result: sortedHeld(id).map(([permission, hashes]) => ({ permission, manifestHash: hashes.manifestHash, folderHash: hashes.folderHash })) };
+        }
+        case 'bowerloom.permissions.check': {
+          const checked = enforce(params['gauge'], params['permission'], params['engine']);
+          if (!checked.ok) return reply(checked);
+          return { ok: true, result: { gauge: checked.gauge, permission: checked.permission, engine: checked.engine } };
+        }
+        case 'bowerloom.audit.read':
+        {
+          const entries = auditLines.map((line): AuditEntry => JSON.parse(line) as AuditEntry);
+          const result: AuditRead = { entries, firstSeq: entries[0]?.seq ?? null, droppedCount: auditDropped, auditFailed };
+          return { ok: true, result };
+        }
         case 'bowerloom.gauges.routes':
           return { ok: true, result: [...installed.values()].filter(gauge => gauge.enabled).map(({ summary }) => `/gauges/${summary.id}`) };
         default:

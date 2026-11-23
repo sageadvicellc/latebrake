@@ -229,7 +229,7 @@ test('an input that is not text or bytes, or that throws when read, is an intern
 
 test('the reasons are a closed set, and every reason this suite saw is in it', () => {
   assert.equal(new Set(MANIFEST_REASONS).size, MANIFEST_REASONS.length);
-  for (const reason of ['duplicate_key', 'comment', 'trailing_comma', 'syntax', 'not_utf8', 'too_large', 'secret', 'unknown_field', 'origin_set_by_core', 'missing_field', 'invalid_field', 'unsupported_format', 'unsupported_kind', 'api_unsupported', 'link', 'hidden_name', 'dotdot_name', 'absolute_path', 'device_name', 'internal']) {
+  for (const reason of ['duplicate_key', 'comment', 'trailing_comma', 'syntax', 'not_utf8', 'too_large', 'secret', 'unknown_field', 'origin_set_by_core', 'missing_field', 'invalid_field', 'unsupported_format', 'unsupported_kind', 'api_unsupported', 'link', 'hidden_name', 'dotdot_name', 'absolute_path', 'device_name', 'unknown_permission', 'internal']) {
     assert.equal(isManifestReason(reason), true, reason);
   }
   for (const value of ['', 'toString', '__proto__', 'SYNTAX', 5, null, undefined, {}]) assert.equal(isManifestReason(value), false, String(value));
