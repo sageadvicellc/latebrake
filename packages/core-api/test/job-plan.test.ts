@@ -81,7 +81,7 @@ test('a value cannot add a line or forge one: the title, the folder, and the gau
   assert.ok(steps.some(line => line.includes('folder /work/b\\u{301} c,')));
 });
 
-const SHARE = { sharedWith: [] as readonly string[] };
+const SHARE = { sharedWith: [] as readonly string[], requestedFolder: null };
 const RUN: RunStepsInput = {
   gauge: 'fixture-jobber', job: 'job-1', title: 'Morning review', shared: false,
   sessions: [

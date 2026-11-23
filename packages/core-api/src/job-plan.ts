@@ -93,8 +93,8 @@ export interface RunStepsSession {
   readonly harness: string;
   readonly program: string;
   readonly folder: string;
-  /** The folder as the job names it. When it is not the folder above, the plan for the person says so. A plan for a Gauge leaves it out, since its folder is the one the job names. */
-  readonly requestedFolder?: string;
+  /** The folder as the job names it, in the plan of the person: when it is not the folder above, the plan says so. `null` in the plan of a Gauge, whose folder is the one the job names. */
+  readonly requestedFolder: string | null;
   readonly model: ModelChoice | null;
   readonly billing: Billing;
   readonly variables: readonly string[];
@@ -138,7 +138,7 @@ export function runSteps(input: RunStepsInput): string[] {
       `session ${at} of ${total}, ${escapeForPlan(session.label)}: the engine ${escapeForPlan(session.engine)} (${escapeForPlan(session.engineTitle)}), harness ${escapeForPlan(session.harness)}`,
       `program: ${escapeForPlan(session.program)}`,
       `folder: ${escapeForPlan(session.folder)}`,
-      ...(session.requestedFolder !== undefined && session.requestedFolder !== session.folder ? [`the job names the folder of session ${at} as ${escapeForPlan(session.requestedFolder)}`] : []),
+      ...(session.requestedFolder !== null && session.requestedFolder !== session.folder ? [`the job names the folder of session ${at} as ${escapeForPlan(session.requestedFolder)}`] : []),
       session.model === null ? "model: the engine's own default, and the core picks none" : `model: ${escapeForPlan(session.model.provider)} ${escapeForPlan(session.model.model)}, as the job says`,
       BILLING_TEXT[session.billing],
       `variables passed: ${session.variables.length > 0 ? session.variables.map(escapeForPlan).join(', ') : 'none'}`,

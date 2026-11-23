@@ -7,13 +7,13 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { createFakeCore, type FakeCore, type GaugeFolder } from '../src/fake-core.js';
+import { MAX_LIVE_PLANS_PER_GAUGE, createFakeCore, type FakeCore, type GaugeFolder } from '../src/fake-core.js';
 import { createCoreClient, type CoreClient } from '../src/client.js';
 import { fakeSignal } from '../../engine-sessions/src/fixtures.js';
 import { createEngineHost, type EngineHost, type EngineSpec } from '../../engine-sessions/src/host.js';
 import { manualLauncher } from '../../engine-sessions/test/support.js';
 import { validManifest } from '../../gauge-manifest/src/fixtures.js';
-import type { Core, CoreMethod, CoreReply, RunPlan, SessionPlan } from '../src/types.js';
+import type { Core, CoreMethod, CoreReply, PersonRunPlan, PersonSessionPlan, RunPlan, SessionPlan } from '../src/types.js';
 
 const FILE = 'export default 1;';
 const base = JSON.parse(validManifest('tile-only')) as Record<string, unknown>;
@@ -41,17 +41,17 @@ const spec = (id: string, program = `/bin/${id}`): EngineSpec => ({ id, title: `
 const REAL = '/real/one', LINK = '/link/one', REAL_PROGRAM = '/real/bin/claude-1.2';
 
 /** A core over a host whose programs the test makes. The folder `/link/one` is a link to a real folder that the test can move, and the program `claude` is found at a real path behind a link. */
-async function world(options: { readonly cap?: number } = {}) {
+async function world(options: { readonly cap?: number; readonly entropy?: (size: number) => Uint8Array; readonly onCanonical?: (reads: number, links: Record<string, string>) => void; readonly wrapHost?: (host: EngineHost) => EngineHost } = {}) {
   const launcher = manualLauncher();
   const links: Record<string, string> = { [LINK]: REAL, '/link/two': '/real/two', '/link/three': '/real/three', '/link/four': '/real/four' };
-  let counter = 0, jobs = 0, runs = 0;
+  let counter = 0, jobs = 0, runs = 0, reads = 0;
   const host: EngineHost = createEngineHost({
     engines: [spec('fixture-engine', 'claude'), spec('fixture-other'), spec('fixture-third')], launcher, log: () => undefined, newId: () => `s-${(counter += 1)}`, schedule: () => () => undefined, stopTimeoutMs: 2000, killWaitMs: 20,
     locate: program => (program === 'claude' ? REAL_PROGRAM : program),
-    canonical: folder => { const real = links[folder] ?? folder; return { path: real, key: real }; },
+    canonical: folder => { reads += 1; options.onCanonical?.(reads, links); const real = links[folder] ?? folder; return { path: real, key: real }; },
     ...(options.cap === undefined ? {} : { cap: options.cap }),
   });
-  const fake = createFakeCore({ folders: FOLDERS, engineHost: host, jobIds: () => `job-${(jobs += 1)}`, runIds: () => `run-${(runs += 1)}` });
+  const fake = createFakeCore({ folders: FOLDERS, engineHost: options.wrapHost?.(host) ?? host, jobIds: () => `job-${(jobs += 1)}`, runIds: () => `run-${(runs += 1)}`, ...(options.entropy === undefined ? {} : { entropy: options.entropy }) });
   const client = createCoreClient(fake);
   for (const folder of FOLDERS) {
     const id = (JSON.parse(folder.manifest as string) as { id: string }).id;
@@ -82,8 +82,19 @@ const must = <T>(result: { ok: true; value: T } | { ok: false; code: string; rea
   assert.ok(result.ok, JSON.stringify(result));
   return result.value;
 };
-const sessionOf = (plan: SessionPlan | RunPlan): SessionPlan => { assert.ok(plan.action === 'start' || plan.action === 'stop'); return plan; };
-const runOf = (plan: SessionPlan | RunPlan): RunPlan => { assert.equal(plan.action, 'run'); return plan as RunPlan; };
+/** A plan of the person under the names of the plan of a Gauge, so that a test can tell which fields of the two differ. */
+const inGaugeNames = (person: PersonSessionPlan): SessionPlan => ({
+  action: person.action, gauge: person.gauge, engine: person.engine, folder: person.realFolder, session: person.session, program: person.realProgram, model: person.model, billing: person.billing,
+  variables: person.variables, sharedWith: person.allSharedWith, force: person.force, steps: person.steps, digest: person.digest, nonce: person.nonce,
+});
+const runInGaugeNames = (person: PersonRunPlan): RunPlan => ({
+  action: 'run', gauge: person.gauge, job: person.job, title: person.title, shared: person.shared,
+  sessions: person.sessions.map(session => ({
+    label: session.label, engine: session.engine, engineTitle: session.engineTitle, harness: session.harness, program: session.realProgram, folder: session.realFolder, model: session.model, billing: session.billing,
+    variables: session.variables, sharedWith: session.allSharedWith, task: session.task,
+  })),
+  steps: person.steps, digest: person.digest, nonce: person.nonce,
+});
 /** The names of the fields whose values differ between two plans. */
 const differing = (left: object, right: object): string[] => {
   const one = left as Record<string, unknown>, two = right as Record<string, unknown>;
@@ -107,6 +118,12 @@ function plainGuesses(label: string, nonce: string, fields: readonly unknown[]):
 const promptly = <T>(call: Promise<T>): Promise<T | 'still waiting'> => Promise.race([call, new Promise<'still waiting'>(resolve => setImmediate(() => resolve('still waiting')))]);
 const applyNow = (client: CoreClient, ...args: Parameters<CoreClient['applySession']>) => promptly(client.applySession(...args));
 const applyRunNow = (client: CoreClient, ...args: Parameters<CoreClient['applyRun']>) => promptly(client.applyRun(...args));
+/** What the person does in the app: reads the full plan, approves it, and gives the second approval when that plan names an engine in the folder. The Gauge plan is never read for this. */
+function approveAsPerson(w: World, nonce: string): { readonly approval: string; readonly shared: string | undefined } {
+  const view = w.fake.personView(nonce);
+  const names = view.action === 'run' ? view.sessions.flatMap(session => session.allSharedWith) : view.allSharedWith;
+  return { approval: w.fake.approve(nonce), shared: names.length > 0 ? w.fake.approveShared(nonce) : undefined };
+}
 const SHARED_NOTICE = "notice: fixture-other already runs in this folder, and two engines in one folder can overwrite each other's files";
 const START_COMMON = [
   "model: the engine's own default, and the core picks none",
@@ -136,10 +153,12 @@ test('the person reads the full plan: the real folder, the real program, every e
   const w = await world();
   w.occupy('fixture-other', REAL);
   const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
-  const person = sessionOf(w.fake.personPlan(plan.nonce));
-  assert.equal(person.folder, REAL);
-  assert.equal(person.program, REAL_PROGRAM);
-  assert.deepEqual(person.sharedWith, ['fixture-other']);
+  const person = w.fake.personSessionPlan(plan.nonce);
+  assert.equal(person.realFolder, REAL);
+  assert.equal(person.requestedFolder, LINK);
+  assert.equal(person.realProgram, REAL_PROGRAM);
+  assert.equal(person.configuredProgram, 'claude');
+  assert.deepEqual(person.allSharedWith, ['fixture-other']);
   assert.deepEqual(person.steps, [
     HEAD('fixture-starter'), `program: ${REAL_PROGRAM}`, `folder: ${REAL}`, `the Gauge named this folder as ${LINK}`, ...START_COMMON, SHARED_NOTICE, 'a second approval is needed, for the shared folder', LAST,
   ]);
@@ -149,11 +168,11 @@ test('the Gauge plan and the person plan are one plan: they differ in the folder
   const w = await world();
   w.occupy('fixture-other', REAL);
   const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK, variables: ['FIXTURE_ALLOWED'] }));
-  const person = sessionOf(w.fake.personPlan(plan.nonce));
-  assert.deepEqual(differing(plan, person), ['folder', 'program', 'sharedWith', 'steps']);
+  const person = w.fake.personSessionPlan(plan.nonce);
+  assert.deepEqual(differing(plan, inGaugeNames(person)), ['folder', 'program', 'sharedWith', 'steps']);
   assert.equal(person.digest, plan.digest);
   assert.equal(person.nonce, plan.nonce);
-  assert.deepEqual(Object.keys(plan).sort(), Object.keys(person).sort());
+  assert.deepEqual(Object.keys(plan).sort(), Object.keys(inGaugeNames(person)).sort());
   // The text differs in exactly the lines of those values.
   const kept = person.steps.filter(line => !line.startsWith('program:') && !line.startsWith('folder:') && !line.startsWith('the Gauge named') && !line.startsWith('notice:') && !line.startsWith('a second approval'));
   assert.deepEqual(plan.steps.filter(line => !line.startsWith('program:') && !line.startsWith('folder:')), kept);
@@ -162,8 +181,8 @@ test('the Gauge plan and the person plan are one plan: they differ in the folder
 test('a plan without a link or a hidden engine is the same plan for the Gauge and for the person, up to the program path that it names', async () => {
   const w = await world();
   const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/plain' }));
-  const person = sessionOf(w.fake.personPlan(plan.nonce));
-  assert.deepEqual(differing(plan, person), ['program', 'steps'], 'only the program differs: it is the configured name for a Gauge and the real path for the person');
+  const person = w.fake.personSessionPlan(plan.nonce);
+  assert.deepEqual(differing(plan, inGaugeNames(person)), ['program', 'steps'], 'only the program differs: it is the configured name for a Gauge and the real path for the person');
   assert.deepEqual(person.steps.filter(line => !line.startsWith('program:')), plan.steps.filter(line => !line.startsWith('program:')));
 });
 
@@ -177,9 +196,9 @@ test('a Gauge reads the engines that it may read in the folder, and the person r
     HEAD('fixture-viewer'), 'program: claude', `folder: ${LINK}`, ...START_COMMON, SHARED_NOTICE, 'a second approval is needed, for the shared folder', LAST,
   ]);
   assert.equal(plan.folder, LINK, 'it still reads the folder as it asked for it');
-  const person = sessionOf(w.fake.personPlan(plan.nonce));
-  assert.deepEqual(person.sharedWith, ['fixture-other', 'fixture-third']);
-  assert.deepEqual(differing(plan, person), ['folder', 'program', 'sharedWith', 'steps']);
+  const person = w.fake.personSessionPlan(plan.nonce);
+  assert.deepEqual(person.allSharedWith, ['fixture-other', 'fixture-third']);
+  assert.deepEqual(differing(plan, inGaugeNames(person)), ['folder', 'program', 'sharedWith', 'steps']);
   assert.ok(person.steps.includes("notice: fixture-other, fixture-third already run in this folder, and two engines in one folder can overwrite each other's files"));
 });
 
@@ -188,7 +207,7 @@ test('a Gauge that holds sessions.start for an engine, and not sessions.read, do
   w.occupy('fixture-other', REAL);
   const plan = must(await w.client.planSessionStart('fixture-blind', { engine: 'fixture-engine', folder: LINK }));
   assert.deepEqual(plan.sharedWith, [], 'the Gauge may start fixture-other, but a start grant is not a read of what it does');
-  assert.deepEqual(sessionOf(w.fake.personPlan(plan.nonce)).sharedWith, ['fixture-other']);
+  assert.deepEqual(w.fake.personSessionPlan(plan.nonce).allSharedWith, ['fixture-other']);
 });
 
 test('the digest is the same in both views, differs for each plan, and no plain SHA-256 of the plan gives it', async () => {
@@ -198,12 +217,12 @@ test('the digest is the same in both views, differs for each plan, and no plain 
   const one = must(await w.client.planSessionStart('fixture-starter', request)), two = must(await w.client.planSessionStart('fixture-starter', request));
   assert.notEqual(one.digest, two.digest, 'two plans of one request have two digests, so a Gauge cannot tell from a digest that two plans agree');
   assert.match(one.digest, /^[0-9a-f]{64}$/);
-  const person = sessionOf(w.fake.personPlan(one.nonce));
+  const person = w.fake.personSessionPlan(one.nonce);
   // A Gauge that guessed the real folder and the engine could test its guess against any digest that a plain hash gives. These are the plain hashes that it could make of the person plan: with the nonce
   // at the start, after the label, or at the end, with and without the label, as a list or as text.
-  const fields = [person.action, person.gauge, person.engine, person.folder, person.session, person.program, person.model, person.billing, person.variables, person.sharedWith, person.force, person.steps];
+  const fields = [person.action, person.gauge, person.engine, person.realFolder, person.session, person.realProgram, person.model, person.billing, person.variables, person.allSharedWith, person.force, person.steps];
   const plain = (text: string): string => createHash('sha256').update(text).digest('hex');
-  const guesses = plainGuesses('session', one.nonce, fields).concat(plainGuesses('session', one.nonce, [...fields, LINK, 'claude']), [plain(JSON.stringify(person))]);
+  const guesses = plainGuesses('session', one.nonce, fields).concat(plainGuesses('session', one.nonce, [...fields, LINK, 'claude']), [plain(JSON.stringify(person)), plain(JSON.stringify(inGaugeNames(person)))]);
   assert.ok(!guesses.includes(one.digest));
 });
 
@@ -212,7 +231,9 @@ test('the Gauge applies the plan it read: the person approves the full plan, and
   w.occupy('fixture-other', REAL);
   const before = w.launcher.programs.length;
   const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
-  const applying = w.client.applySession(plan, w.fake.approve(plan.nonce), w.fake.approveShared(plan.nonce));
+  const { approval, shared } = approveAsPerson(w, plan.nonce);
+  assert.notEqual(shared, undefined, 'the Gauge plan names no engine, and the person plan does: the second approval follows the person plan');
+  const applying = w.client.applySession(plan, approval, shared);
   w.launcher.programs[before]?.spawn();
   const applied = must(await applying);
   assert.equal(applied.engine, 'fixture-engine');
@@ -252,12 +273,12 @@ test('a plan is applied only as the core issued it: any change of the Gauge view
   w.occupy('fixture-other', REAL);
   const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
   const approval = w.fake.approve(plan.nonce), shared = w.fake.approveShared(plan.nonce);
-  const person = sessionOf(w.fake.personPlan(plan.nonce));
+  const person = w.fake.personSessionPlan(plan.nonce);
   const other = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/other' }));
   const changes: readonly SessionPlan[] = [
     { ...plan, folder: '/work/other' }, { ...plan, steps: [...plan.steps, 'one more line'] }, { ...plan, digest: 'f'.repeat(64) }, { ...plan, digest: other.digest },
     { ...plan, program: '/real/bin/claude-1.2' }, { ...plan, sharedWith: ['fixture-other'] }, { ...plan, variables: ['FIXTURE_ALLOWED'] }, { ...plan, model: { provider: 'p', model: 'm' } },
-    { ...plan, gauge: 'fixture-viewer' }, { ...plan, billing: 'local' }, { ...plan, engine: 'fixture-other' }, person,
+    { ...plan, gauge: 'fixture-viewer' }, { ...plan, billing: 'local' }, { ...plan, engine: 'fixture-other' }, inGaugeNames(person),
   ];
   for (const changed of changes) {
     assert.deepEqual(await applyNow(w.client, changed, approval, shared), { ok: false, code: 'GAUGE_PLAN_CHANGED' }, JSON.stringify(differing(plan, changed)));
@@ -327,14 +348,15 @@ test('a stop plan for a Gauge shows the folder as the session was asked for, and
     'if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT',
   ]);
   assert.equal(JSON.stringify(stop).includes(REAL), false);
-  const person = sessionOf(w.fake.personPlan(stop.nonce));
-  assert.equal(person.folder, REAL);
+  const person = w.fake.personSessionPlan(stop.nonce);
+  assert.equal(person.realFolder, REAL);
+  assert.equal(person.requestedFolder, LINK);
   assert.deepEqual(person.steps, [
     `Gauge fixture-stopper asks to stop session ${session} of the engine fixture-engine`, `folder: ${REAL}`, `the session was asked for in the folder ${LINK}`,
     'send the stop signal to the program and everything it started, and wait up to 2000 ms for them to go',
     'if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT',
   ]);
-  assert.deepEqual(differing(stop, person), ['folder', 'steps']);
+  assert.deepEqual(differing(stop, inGaugeNames(person)), ['folder', 'steps']);
   const stopping = w.client.applySession(stop, w.fake.approve(stop.nonce));
   w.launcher.programs[before]?.exit(null, 'SIGTERM');
   assert.equal(must(await stopping).state, 'stopped');
@@ -372,15 +394,16 @@ test('the person reads the full run plan, and the Gauge plan and the person plan
   const { w, job } = await runWorld();
   w.occupy('fixture-third', REAL);
   const plan = must(await w.client.planRun('fixture-blind', job));
-  const person = runOf(w.fake.personPlan(plan.nonce));
-  assert.deepEqual(person.sessions.map(session => [session.label, session.folder, session.program, session.sharedWith]), [['writer', REAL, REAL_PROGRAM, ['fixture-third']], ['checker', '/work/b', '/bin/fixture-other', []]]);
+  const person = w.fake.personRunPlan(plan.nonce);
+  assert.deepEqual(person.sessions.map(session => [session.label, session.realFolder, session.realProgram, session.allSharedWith]), [['writer', REAL, REAL_PROGRAM, ['fixture-third']], ['checker', '/work/b', '/bin/fixture-other', []]]);
   assert.equal(person.shared, true);
   assert.ok(person.steps.includes('the job names the folder of session 1 as /link/one'));
   assert.ok(person.steps.includes("notice for session 1: fixture-third also runs in this folder, and two engines in one folder can overwrite each other's files"));
   assert.ok(person.steps.includes('a second approval is needed, once for the whole run, for the shared folder'));
-  assert.deepEqual(differing(plan, person), ['shared', 'sessions', 'steps'].sort());
-  assert.deepEqual(differing(plan.sessions[0]!, person.sessions[0]!), ['folder', 'program', 'sharedWith']);
-  assert.deepEqual(differing(plan.sessions[1]!, person.sessions[1]!), []);
+  const named = runInGaugeNames(person);
+  assert.deepEqual(differing(plan, named), ['shared', 'sessions', 'steps'].sort());
+  assert.deepEqual(differing(plan.sessions[0]!, named.sessions[0]!), ['folder', 'program', 'sharedWith']);
+  assert.deepEqual(differing(plan.sessions[1]!, named.sessions[1]!), []);
   assert.equal(person.digest, plan.digest);
   assert.equal(person.nonce, plan.nonce);
 });
@@ -390,8 +413,8 @@ test('the digest of a run plan is a keyed hash that holds the nonce: two plans o
   w.occupy('fixture-third', REAL);
   const one = must(await w.client.planRun('fixture-blind', job)), two = must(await w.client.planRun('fixture-blind', job));
   assert.notEqual(one.digest, two.digest);
-  const person = runOf(w.fake.personPlan(one.nonce));
-  const fields = [person.gauge, person.job, person.title, person.shared, person.sessions.map(session => [session.label, session.engine, session.engineTitle, session.harness, session.program, session.folder, session.model, session.billing, session.variables, session.sharedWith, session.task]), person.steps];
+  const person = w.fake.personRunPlan(one.nonce);
+  const fields = [person.gauge, person.job, person.title, person.shared, person.sessions.map(session => [session.label, session.engine, session.engineTitle, session.harness, session.realProgram, session.realFolder, session.model, session.billing, session.variables, session.allSharedWith, session.task]), person.steps];
   assert.ok(!plainGuesses('run', one.nonce, fields).includes(one.digest));
 });
 
@@ -425,7 +448,7 @@ test('the engines of one run that share a folder are read by the person, and by 
   const blind = must(await w.client.planRun('fixture-blind', job));
   assert.deepEqual(blind.sessions.map(session => session.sharedWith), [[], []]);
   assert.equal(blind.shared, false);
-  assert.deepEqual(runOf(w.fake.personPlan(blind.nonce)).sessions.map(session => session.sharedWith), [['fixture-other'], ['fixture-engine']]);
+  assert.deepEqual(w.fake.personRunPlan(blind.nonce).sessions.map(session => session.allSharedWith), [['fixture-other'], ['fixture-engine']]);
   const seer = must(await w.client.planRun('fixture-seer', job));
   assert.deepEqual(seer.sessions.map(session => session.sharedWith), [['fixture-other'], ['fixture-engine']]);
   assert.equal(seer.shared, true);
@@ -435,11 +458,11 @@ test('a run plan is applied only as the core issued it, and a link that moved ma
   const { w, job } = await runWorld();
   const plan = must(await w.client.planRun('fixture-blind', job));
   const approval = w.fake.approve(plan.nonce);
-  const person = runOf(w.fake.personPlan(plan.nonce));
+  const person = w.fake.personRunPlan(plan.nonce);
   const first = plan.sessions[0]!;
   const changes: readonly RunPlan[] = [
     { ...plan, steps: [...plan.steps, 'one more line'] }, { ...plan, digest: 'f'.repeat(64) }, { ...plan, title: 'Other' }, { ...plan, sessions: [{ ...first, folder: '/work/c' }, plan.sessions[1]!] },
-    { ...plan, sessions: [{ ...first, sharedWith: ['fixture-third'] }, plan.sessions[1]!] }, { ...plan, sessions: [{ ...first, program: REAL_PROGRAM }, plan.sessions[1]!] }, { ...plan, shared: true }, person,
+    { ...plan, sessions: [{ ...first, sharedWith: ['fixture-third'] }, plan.sessions[1]!] }, { ...plan, sessions: [{ ...first, program: REAL_PROGRAM }, plan.sessions[1]!] }, { ...plan, shared: true }, runInGaugeNames(person),
   ];
   for (const changed of changes) assert.deepEqual(await applyRunNow(w.client, changed, approval), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
   w.links[LINK] = '/real/elsewhere';
@@ -459,34 +482,34 @@ test('the person plan is for a plan that is still current, and it is a copy', as
   const w = await world();
   w.occupy('fixture-other', REAL);
   const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
-  const first = sessionOf(w.fake.personPlan(plan.nonce));
+  const first = w.fake.personSessionPlan(plan.nonce);
   (first.steps as string[]).push('changed');
-  (first.sharedWith as string[]).push('changed');
-  assert.deepEqual(sessionOf(w.fake.personPlan(plan.nonce)).sharedWith, ['fixture-other'], 'a caller that changes it changes nothing for the next call');
+  (first.allSharedWith as string[]).push('changed');
+  assert.deepEqual(w.fake.personSessionPlan(plan.nonce).allSharedWith, ['fixture-other'], 'a caller that changes it changes nothing for the next call');
   const other = must(await w.client.planGrant('fixture-starter', ['sessions.start']));
-  for (const bad of ['0'.repeat(64), 'x', 7, null, other.nonce]) assert.throws(() => w.fake.personPlan(bad as string), TypeError, String(bad));
+  for (const bad of ['0'.repeat(64), 'x', 7, null, other.nonce]) assert.throws(() => w.fake.personView(bad as string), TypeError, String(bad));
   const approval = w.fake.approve(plan.nonce);
   w.fake.approveShared(plan.nonce);
   const before = w.launcher.programs.length;
   const applying = w.client.applySession(plan, approval, w.fake.approveShared(plan.nonce));
   w.launcher.programs[before]?.spawn();
   assert.ok((await applying).ok);
-  assert.throws(() => w.fake.personPlan(plan.nonce), TypeError, 'a plan that was applied is retired');
+  assert.throws(() => w.fake.personView(plan.nonce), TypeError, 'a plan that was applied is retired');
 });
 
 test('the person plan of a plan that was issued before another step was applied is retired too', async () => {
   const w = await world();
   const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
-  assert.ok(sessionOf(w.fake.personPlan(plan.nonce)));
+  assert.ok(w.fake.personSessionPlan(plan.nonce));
   const other = must(await w.client.planGrant('fixture-starter', ['sessions.start']));
   must(await w.client.applyGrant(other, w.fake.approve(other.nonce)));
-  assert.throws(() => w.fake.personPlan(plan.nonce), TypeError);
+  assert.throws(() => w.fake.personView(plan.nonce), TypeError);
 });
 
 test('the person plan is not on the seam: a Gauge cannot ask for it by any call', async () => {
   const w = await world();
   const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
-  assert.equal('personPlan' in w.client, false);
+  assert.equal('personView' in w.client, false);
   await assert.rejects(w.fake.call('bowerloom.sessions.person' as CoreMethod, { nonce: plan.nonce }), /unknown core method/);
 });
 
@@ -558,9 +581,117 @@ test('nothing a Gauge can read through the seam holds the real folder, the real 
   assert.ok(starter.seen.some(line => line.includes('ENGINE_LIMIT')) && starter.seen.some(line => line.includes('ENGINE_PAIR_BUSY')), 'the refusals of the pair and the limit were among what it read');
 });
 
+// The approval flow, the notices for the person, and the bounds
+
+test('the second approval follows the person plan: it is given when the full plan names an engine, and it is refused when it names none', async () => {
+  const w = await world();
+  w.occupy('fixture-other', REAL);
+  const hidden = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
+  assert.deepEqual(hidden.sharedWith, [], 'the Gauge plan names no engine');
+  assert.ok(w.fake.approveShared(hidden.nonce).length > 0, 'and the full plan does, so the person may give the second approval');
+  const free = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/free' }));
+  assert.deepEqual(w.fake.personSessionPlan(free.nonce).allSharedWith, []);
+  assert.throws(() => w.fake.approveShared(free.nonce), TypeError, 'a plan that names no engine takes no second approval');
+  const flow = approveAsPerson(w, free.nonce);
+  assert.equal(flow.shared, undefined);
+});
+
+test('the person is told the true cause when a Gauge gets a restricted refusal, and the notices are bounded copies', async () => {
+  const w = await world();
+  w.occupy('fixture-other', REAL);
+  w.occupy('fixture-third', REAL);
+  assert.deepEqual(w.fake.personNotices(), []);
+  const hidden = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
+  assert.deepEqual(await applyNow(w.client, hidden, w.fake.approve(hidden.nonce)), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
+  const visible = must(await w.client.planSessionStart('fixture-viewer', { engine: 'fixture-engine', folder: LINK }));
+  assert.deepEqual(await applyNow(w.client, visible, w.fake.approve(visible.nonce)), { ok: false, code: 'ENGINE_FOLDER_SHARED' });
+  const job = await makeJob(w, [entry('writer', 'fixture-engine', LINK), entry('checker', 'fixture-other', '/work/b')]);
+  const blind = must(await w.client.planRun('fixture-blind', job));
+  assert.deepEqual(await applyRunNow(w.client, blind, w.fake.approve(blind.nonce)), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
+  const seer = must(await w.client.planRun('fixture-seer', job));
+  assert.deepEqual(await applyRunNow(w.client, seer, w.fake.approve(seer.nonce)), { ok: false, code: 'ENGINE_FOLDER_SHARED', member: { index: 0, label: 'writer' } });
+  assert.deepEqual(w.fake.personNotices(), [
+    { action: 'start', gauge: 'fixture-starter', shown: 'GAUGE_PLAN_NOT_APPROVED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: null },
+    { action: 'start', gauge: 'fixture-viewer', shown: 'ENGINE_FOLDER_SHARED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: null },
+    { action: 'run', gauge: 'fixture-blind', shown: 'GAUGE_PLAN_NOT_APPROVED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: { index: 0, label: 'writer' } },
+    { action: 'run', gauge: 'fixture-seer', shown: 'ENGINE_FOLDER_SHARED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: { index: 0, label: 'writer' } },
+  ]);
+  const copy = w.fake.personNotices() as unknown as { engines: string[] }[];
+  copy[0]!.engines.push('changed');
+  copy.length = 0;
+  assert.equal(w.fake.personNotices().length, 4, 'a caller that changes the list changes nothing');
+  assert.equal(JSON.stringify(await w.client.listRuns('fixture-blind')).includes('second_approval_missing'), false, 'no Gauge reply holds a notice');
+  // The list is bounded: the oldest notices go first.
+  const again = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
+  for (let index = 0; index < 100; index += 1) await applyNow(w.client, again, w.fake.approve(again.nonce));
+  assert.equal(w.fake.personNotices().length, 64);
+});
+
+test('a flood of plans from one Gauge is bounded, the oldest plan of that Gauge goes first, and the plans of another Gauge stay', async () => {
+  const w = await world();
+  const other = must(await w.client.planSessionStart('fixture-viewer', { engine: 'fixture-engine', folder: '/work/viewer' }));
+  const first = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/flood' }));
+  const approval = w.fake.approve(first.nonce);
+  for (let index = 0; index < 2000; index += 1) must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/flood' }));
+  assert.equal(w.fake.livePlans(), MAX_LIVE_PLANS_PER_GAUGE + 1, 'the starter holds at most 64 plans, and the viewer holds its one');
+  assert.throws(() => w.fake.approve(first.nonce), TypeError, 'the person cannot approve a plan that the core no longer holds');
+  assert.deepEqual(await applyNow(w.client, first, approval), { ok: false, code: 'GAUGE_PLAN_CHANGED' }, 'an approval that was given before the plan went is for a plan that is gone');
+  assert.ok(w.fake.approve(other.nonce).length > 0, 'the plan of another Gauge is still there');
+  assert.equal(w.launcher.programs.length, 0);
+});
+
+test('every plan of before is dropped when a step is applied, so the plans that are held never outlast the state they were made for', async () => {
+  const w = await world();
+  for (let index = 0; index < 10; index += 1) must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/many' }));
+  assert.equal(w.fake.livePlans(), 10);
+  const grant = must(await w.client.planGrant('fixture-starter', ['sessions.start']));
+  must(await w.client.applyGrant(grant, w.fake.approve(grant.nonce)));
+  assert.equal(w.fake.livePlans(), 0);
+});
+
+test('the digest holds a key of the core: two cores that issue the same nonce for the same plan give two digests', async () => {
+  // The entropy of a core is a function of the test. The first draw is the key of the digest, and every draw after it is the same in both cores, so the nonces agree and only the keys differ.
+  const entropy = (key: number) => { let calls = 0; return (size: number): Uint8Array => { const bytes = Buffer.alloc(size, calls === 0 ? key : 0xab); if (calls > 0) bytes.writeUInt32BE(calls, 0); calls += 1; return bytes; }; };
+  const one = await world({ entropy: entropy(1) }), two = await world({ entropy: entropy(2) });
+  one.occupy('fixture-other', REAL);
+  two.occupy('fixture-other', REAL);
+  const request = { engine: 'fixture-engine', folder: LINK };
+  const first = must(await one.client.planSessionStart('fixture-starter', request)), second = must(await two.client.planSessionStart('fixture-starter', request));
+  assert.equal(first.nonce, second.nonce, 'the two cores issued the same nonce');
+  assert.notEqual(first.digest, second.digest, 'and the keys make the digests differ');
+  const job = await makeJob(one, [entry('writer', 'fixture-engine', LINK)]), same = await makeJob(two, [entry('writer', 'fixture-engine', LINK)]);
+  const runOne = must(await one.client.planRun('fixture-blind', job)), runTwo = must(await two.client.planRun('fixture-blind', same));
+  assert.equal(runOne.nonce, runTwo.nonce);
+  assert.notEqual(runOne.digest, runTwo.digest);
+});
+
+test('a link swapped between the two reads of the core and the host is a changed plan, and not an error that is thrown', async () => {
+  // The plan reads the folder once. The apply plans again (a second read) and the host plans once more when it begins (a third read): the link is swapped at the third.
+  const w = await world({ onCanonical: (reads, links) => { if (reads === 3) links[LINK] = '/real/swapped'; } });
+  const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
+  assert.deepEqual(await applyNow(w.client, plan, w.fake.approve(plan.nonce)), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+  assert.equal(w.launcher.programs.length, 0);
+  assert.equal(w.host.launched, 0);
+  const run = await world({ onCanonical: (reads, links) => { if (reads === 3) links[LINK] = '/real/swapped'; } });
+  const job = await makeJob(run, [entry('writer', 'fixture-engine', LINK)]);
+  const runPlan = must(await run.client.planRun('fixture-blind', job));
+  assert.deepEqual(await applyRunNow(run.client, runPlan, run.fake.approve(runPlan.nonce)), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+  assert.equal(run.host.launched, 0);
+});
+
+test('a failure of the host that is not a stale plan is not hidden as a changed plan', async () => {
+  const broken = (host: EngineHost): EngineHost => ({ ...host, beginStart: () => { throw new Error('the host broke'); }, beginStartGroup: () => { throw new Error('the host broke'); } });
+  const w = await world({ wrapHost: broken });
+  const plan = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
+  await assert.rejects(applyNow(w.client, plan, w.fake.approve(plan.nonce)), /the host broke/);
+  const job = await makeJob(w, [entry('writer', 'fixture-engine', LINK)]);
+  const run = must(await w.client.planRun('fixture-blind', job));
+  await assert.rejects(applyRunNow(w.client, run, w.fake.approve(run.nonce)), /the host broke/);
+});
+
 // A real link on disk
 
-test('with a real link on disk, a Gauge reads the link and the person reads the folder behind it', async (t: TestContext) => {
+test('with a real link on disk, a Gauge reads the link and the person reads the folder behind it, the start runs there, and a link that is repointed makes a plan stale', async (t: TestContext) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gauge-view-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const real = path.join(root, 'hidden-target', 'project'), link = path.join(root, 'shortcut');
@@ -569,7 +700,8 @@ test('with a real link on disk, a Gauge reads the link and the person reads the 
   const programReal = path.join(root, 'engine-1.2'), programLink = path.join(root, 'engine');
   fs.writeFileSync(programReal, '#!/bin/sh\n', { mode: 0o755 });
   fs.symlinkSync(programReal, programLink);
-  const host = createEngineHost({ engines: [spec('fixture-engine', programLink)], launcher: manualLauncher(), log: () => undefined, schedule: () => () => undefined });
+  const launcher = manualLauncher();
+  const host = createEngineHost({ engines: [spec('fixture-engine', programLink)], launcher, log: () => undefined, schedule: () => () => undefined });
   const fake: FakeCore = createFakeCore({ folders: FOLDERS, engineHost: host });
   const client = createCoreClient(fake);
   for (const step of [() => client.planInstall('starter-folder'), () => client.planEnable('fixture-starter')]) {
@@ -583,8 +715,25 @@ test('with a real link on disk, a Gauge reads the link and the person reads the 
   assert.equal(plan.program, programLink);
   assert.equal(JSON.stringify(plan).includes('hidden-target'), false);
   assert.equal(JSON.stringify(plan).includes('engine-1.2'), false);
-  const person = sessionOf(fake.personPlan(plan.nonce));
-  assert.equal(person.folder, real);
-  assert.equal(person.program, programReal);
+  const person = fake.personSessionPlan(plan.nonce);
+  assert.equal(person.realFolder, real);
+  assert.equal(person.realProgram, programReal);
   assert.ok(person.steps.includes(`the Gauge named this folder as ${link}`));
+  // The start runs where the person saw it.
+  const applying = client.applySession(plan, fake.approve(plan.nonce));
+  launcher.programs[0]?.spawn();
+  must(await applying);
+  assert.equal(launcher.programs[0]?.spec.cwd, real);
+  assert.equal(launcher.programs[0]?.spec.program, programReal);
+  // A link that is repointed after the plan was made, with a real file system, makes the plan stale and starts nothing.
+  const first = path.join(root, 'first-target'), second = path.join(root, 'second-target'), moving = path.join(root, 'moving');
+  fs.mkdirSync(first);
+  fs.mkdirSync(second);
+  fs.symlinkSync(first, moving);
+  const stale = must(await client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: moving }));
+  const approval = fake.approve(stale.nonce);
+  fs.unlinkSync(moving);
+  fs.symlinkSync(second, moving);
+  assert.deepEqual(await applyNow(client, stale, approval), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+  assert.equal(launcher.programs.length, 1);
 });

@@ -45,6 +45,8 @@ export function makeRig(folders: readonly GaugeFolder[], options: { readonly sto
     approveShared: plan => fake.approveShared(plan.nonce),
     advance: milliseconds => { now += milliseconds; },
     folder: name => { const full = path.join(root, name); fs.mkdirSync(full, { recursive: true }); return full; },
+    link: (name, target) => { const full = path.join(root, name); fs.symlinkSync(target, full); return full; },
+    person: plan => { const full = fake.personSessionPlan(plan.nonce); return { folder: full.realFolder, program: full.realProgram, sharedWith: full.allSharedWith }; },
     program: process.execPath,
     stopTimeoutMs,
     launches: () => host.launched,

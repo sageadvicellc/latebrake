@@ -12,8 +12,8 @@ export interface StartStepsInput {
   readonly title: string;
   readonly program: string;
   readonly folder: string;
-  /** The folder as the Gauge wrote it. When it is not the folder above, the plan for the person says so. A plan for a Gauge leaves it out, since its folder is the one the Gauge wrote. */
-  readonly requestedFolder?: string;
+  /** The folder as the Gauge wrote it, in the plan of the person: when it is not the folder above, the plan says so. `null` in the plan of a Gauge, whose folder is the one the Gauge wrote. */
+  readonly requestedFolder: string | null;
   readonly model: ModelChoice | null;
   readonly billing: Billing;
   readonly variables: readonly string[];
@@ -47,7 +47,7 @@ export function startSteps(input: StartStepsInput): string[] {
     `Gauge ${escapeForPlan(input.gauge)} asks for a new session of the engine ${escapeForPlan(input.engine)} (${escapeForPlan(input.title)})`,
     `program: ${escapeForPlan(input.program)}`,
     `folder: ${escapeForPlan(input.folder)}`,
-    ...(input.requestedFolder !== undefined && input.requestedFolder !== input.folder ? [`the Gauge named this folder as ${escapeForPlan(input.requestedFolder)}`] : []),
+    ...(input.requestedFolder !== null && input.requestedFolder !== input.folder ? [`the Gauge named this folder as ${escapeForPlan(input.requestedFolder)}`] : []),
     input.model === null ? "model: the engine's own default, and the core picks none" : `model: ${escapeForPlan(input.model.provider)} ${escapeForPlan(input.model.model)}, as the Gauge asks`,
     BILLING_TEXT[input.billing],
     `variables passed: ${input.variables.length > 0 ? input.variables.map(escapeForPlan).join(', ') : 'none'}`,
@@ -63,8 +63,8 @@ export interface StopStepsInput {
   readonly session: string;
   readonly engine: string;
   readonly folder: string;
-  /** The folder as the session was asked for. When it is not the folder above, the plan for the person says so. */
-  readonly requestedFolder?: string;
+  /** The folder as the session was asked for, in the plan of the person: when it is not the folder above, the plan says so. `null` in the plan of a Gauge. */
+  readonly requestedFolder: string | null;
   readonly force: boolean;
   /** True when the session has ended (stopped or failed) and the stop is the kill again, because its program has not gone. */
   readonly ended: boolean;
@@ -87,7 +87,7 @@ export function stopSteps(input: StopStepsInput): string[] {
   return [
     `Gauge ${escapeForPlan(input.gauge)} asks to stop session ${escapeForPlan(input.session)} of the engine ${escapeForPlan(input.engine)}`,
     `folder: ${escapeForPlan(input.folder)}`,
-    ...(input.requestedFolder !== undefined && input.requestedFolder !== input.folder ? [`the session was asked for in the folder ${escapeForPlan(input.requestedFolder)}`] : []),
+    ...(input.requestedFolder !== null && input.requestedFolder !== input.folder ? [`the session was asked for in the folder ${escapeForPlan(input.requestedFolder)}`] : []),
     input.force
       ? (input.ended
         ? 'the session has ended, but its program may still be running: send the kill signal again, which the program cannot ignore, to the program and everything it started'

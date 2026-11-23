@@ -22,6 +22,10 @@ export interface JobsHarness {
   advance(milliseconds: number): void | Promise<void>;
   /** A folder that exists, made for this test, for a session to run in. The same name gives the same folder. It is a real path, with no link in it. */
   folder(name: string): string;
+  /** Optional: makes a link on disk, named `name`, to a real folder that `folder` made, and gives the path of the link. A harness that has it, and `person`, runs the test of what a Gauge may read. */
+  link?(name: string, target: string): string;
+  /** Optional: what the person reads for a run plan that a Gauge read: for each session, the real folder, the real program, and every engine in the folder. */
+  person?(plan: { readonly nonce: string }): readonly { readonly label: string; readonly folder: string; readonly program: string; readonly sharedWith: readonly string[] }[];
   /** How many programs the core has started so far. */
   launches(): number;
   /** Kills every program that is left, and fails the test when one stays alive. */
@@ -535,7 +539,7 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     await bring(w, 'second-folder', 'fixture-second', FULL);
     const job = await jobWith(w, 'Review', [entry('writer', 'fixture-engine', w.harness.folder('alpha'))]);
     const one = await runPlan(w, job), two = await runPlan(w, job);
-    assert.notEqual(one.nonce, two.nonce);
+    assert.notEqual(one.digest, two.digest, 'two plans of one job have two digests');
     assert.deepEqual(outcome(await w.client.applyRun(one, await w.harness.approve(two))), refused('GAUGE_PLAN_CHANGED'));
     const mine = await runPlan(w, job);
     const approval = await w.harness.approve(mine);
@@ -762,5 +766,47 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     // Every place is free again.
     const again = await w.client.planRun(GAUGE, job);
     assert.ok(again.ok, JSON.stringify(again));
+  });
+
+  test(`${name}: a Gauge that may start the engines of a job reads no real folder and no engine that it may not read, in any reply, and the second approval is taken from the plan of the person`, async t => {
+    const w = await boot(t);
+    const { link, person } = w.harness;
+    if (link === undefined || person === undefined) { t.skip('the harness has no link and no view of the person'); return; }
+    await bring(w, 'jobber-folder', GAUGE, FULL);
+    await bring(w, 'blind-folder', 'fixture-blind', ['jobs.read', 'jobs.run', 'sessions.start']);
+    const real = w.harness.folder('leak-real'), linked = link('leak-link', real);
+    // Another Gauge starts an engine that the blind Gauge does not read, in the real folder. The job lists fixture-engine only, and fixture-asking is the engine that holds the folder.
+    const holder = await w.client.planSessionStart(GAUGE, { engine: 'fixture-asking', folder: real });
+    const held = must(holder);
+    must(await w.client.applySession(held, await w.harness.approve(held)));
+    const job = await jobWith(w, 'Review', [entry('writer', 'fixture-engine', linked)]);
+    const seen: string[] = [];
+    const watching: Core = {
+      call: async (method, params) => {
+        try {
+          const reply = await w.harness.core.call(method, params);
+          seen.push(JSON.stringify(reply));
+          return reply;
+        } catch (error) {
+          seen.push(String(error));
+          throw error;
+        }
+      },
+    };
+    const blind = createCoreClient(watching);
+    const planned = must(await blind.planRun('fixture-blind', job));
+    assert.deepEqual(planned.sessions.map(session => [session.folder, session.sharedWith]), [[linked, []]]);
+    assert.equal(planned.shared, false);
+    const full = person(planned);
+    assert.deepEqual(full.map(session => [session.label, session.folder, session.sharedWith]), [['writer', real, ['fixture-asking']]], 'the person reads the real folder and the engine that holds it');
+    const approval = await w.harness.approve(planned);
+    const shared = full.some(session => session.sharedWith.length > 0) ? await w.harness.approveShared(planned) : undefined;
+    assert.notEqual(shared, undefined);
+    assert.deepEqual(outcome(await blind.applyRun(planned, approval)), refused('GAUGE_PLAN_NOT_APPROVED'), 'without the second approval, the Gauge is told that an approval is missing, and not which engine shares');
+    const run = must(await blind.applyRun(planned, approval, shared));
+    assert.deepEqual(run.sessions.map(session => [session.label, session.engine]), [['writer', 'fixture-engine']]);
+    must(await blind.listRuns('fixture-blind'));
+    const text = seen.join('\n');
+    for (const secret of [real, 'fixture-asking']) assert.equal(text.includes(secret), false, secret);
   });
 }
