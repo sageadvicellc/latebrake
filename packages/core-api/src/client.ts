@@ -252,12 +252,18 @@ function layoutPlanOf(value: unknown): LayoutPlan | undefined {
   return Object.freeze({ action, kind: kind as LayoutKind, place, gauge, revision: revision, text, steps: Object.freeze(steps), digest, baseHash, nextHash, nonce });
 }
 
-/** A copy of a plan to send: its own properties, with each named list copied. A list that the plan only inherits is not sent, so the core refuses the plan as incomplete. */
+/**
+ * A copy of a plan to send: each own enumerable data property of the plan (`Object.keys`), read once through its descriptor, with each named list copied. A property that is an accessor, or that is not enumerable,
+ * or that the plan only inherits, is not sent and is not read, so the core refuses the plan as incomplete. A plan that is `null` or `undefined` throws, as it always did.
+ */
 function ownLists(plan: object, keys: readonly string[]): Record<string, unknown> {
-  const copy: Record<string, unknown> = { ...plan };
-  for (const key of keys) {
-    const list = Object.hasOwn(plan, key) ? (plan as Record<string, unknown>)[key] : undefined;
-    if (Array.isArray(list)) copy[key] = [...(list as unknown[])];
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(plan)) {
+    const descriptor = Object.getOwnPropertyDescriptor(plan, key);
+    // `Object.keys` lists the enumerable own string keys only, so a hidden property is never seen. An accessor has no `value`, and is skipped without being read.
+    if (!descriptor || !('value' in descriptor)) continue;
+    const value: unknown = descriptor.value;
+    copy[key] = keys.includes(key) && Array.isArray(value) ? [...(value as unknown[])] : value;
   }
   return copy;
 }

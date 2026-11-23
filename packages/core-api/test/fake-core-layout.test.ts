@@ -203,21 +203,34 @@ test('a plan with a hole in its steps is refused, and the sparse list is not rea
   assert.deepEqual(await core.call('bowerloom.layout.apply', { plan: { ...plan, steps: sparse }, approval }), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
 });
 
-test('a counter that is full refuses a change that would write a revision at plan time, with bad_revision, and still plans a change that writes none', async () => {
-  const full = FIRST_FILE.replace('"revision":1,"current"', '"revision":999999999,"current"');
+test('a counter that is full refuses a change that would write a revision at plan time, with bad_revision, for every kind, and still plans a change that writes none', async () => {
+  const swapped = { ...HOME_DOC, tiles: HOME_DOC.tiles.map(tile => (tile.place === 'models' ? { ...tile, gauge: 'tracing' } : tile)), shelf: [...HOME_DOC.shelf.filter(id => id !== 'tracing'), 'local-models'].sort() };
+  const full = JSON.stringify({ format: 'bowerloom/layout-file/1', revision: 999999999, current: HOME_DOC, revisions: [{ revision: 999999998, layout: swapped }] }) + '\n';
   const { core, client } = home({ layoutFile: full });
+  await lifecycleStep(core, client, must(await client.planInstall('proposer-folder')));
+  await lifecycleStep(core, client, must(await client.planEnable('fixture-proposer')));
+  const grant = must(await client.planGrant('fixture-proposer', ['layout.propose']));
+  must(await client.applyGrant(grant, core.approve(grant.nonce)));
+  const before = core.layoutFile();
+  const refused = { ok: false, code: 'GAUGE_LAYOUT_INVALID', reason: 'bad_revision' };
   assert.equal(must(await client.readLayout()).revision, 999_999_999);
-  for (const plan of [client.planLayoutSwap('models', 'tracing'), client.planLayoutDefault('models').then(() => client.planLayoutSwap('jobs', 'library')), client.planLayoutPropose('fixture-proposer')]) {
-    const result = await plan;
-    assert.equal(result.ok, false);
-  }
-  assert.deepEqual(await client.planLayoutSwap('models', 'tracing'), { ok: false, code: 'GAUGE_LAYOUT_INVALID', reason: 'bad_revision' });
-  assert.deepEqual(await client.planLayoutSet(JSON.stringify({ ...HOME_DOC, shelf: HOME_DOC.shelf.filter(id => id !== 'library') })), { ok: false, code: 'GAUGE_LAYOUT_INVALID', reason: 'bad_revision' });
+  assert.deepEqual(await client.planLayoutSwap('models', 'tracing'), refused);
+  assert.deepEqual(await client.planLayoutSwap('jobs', 'library'), refused);
+  assert.deepEqual(await client.planLayoutPropose('fixture-proposer'), refused);
+  assert.deepEqual(await client.planLayoutRestore(999999998), refused);
+  assert.deepEqual(await client.planLayoutSet(JSON.stringify({ ...HOME_DOC, shelf: HOME_DOC.shelf.filter(id => id !== 'library') })), refused);
   // A change that gives the layout already in use writes no revision, so it has a plan.
   const same = must(await client.planLayoutSwap('models', 'local-models'));
   assert.equal(same.steps.at(-2), 'no change: the layout stays as it is');
-  assert.equal(core.layoutFile(), full);
-  assert.equal(must(await client.readLayout()).layout.tiles.find(tile => tile.place === 'models')?.gauge, 'local-models');
+  assert.equal(core.layoutFile(), before);
+});
+
+test('one revision below the last number a change still plans and applies, and the next one is refused', async () => {
+  const file = JSON.stringify({ format: 'bowerloom/layout-file/1', revision: 999999998, current: HOME_DOC, revisions: [] }) + '\n';
+  const { core, client } = home({ layoutFile: file });
+  const plan = must(await client.planLayoutSwap('models', 'tracing'));
+  assert.equal(must(await client.applyLayout(plan, core.approve(plan.nonce))).revision, 999_999_999);
+  assert.deepEqual(await client.planLayoutSwap('models', 'library'), { ok: false, code: 'GAUGE_LAYOUT_INVALID', reason: 'bad_revision' });
 });
 
 test('no Gauge can take the id of the Settings page, from a user folder or a stock folder', async () => {
@@ -831,4 +844,55 @@ test('the same four steps end, with a sixth and a seventh tile on the layout, wh
     assert.equal(after.layout.tiles.find(tile => tile.place === 'jobs')?.gauge, 'projects', String(count));
     assert.equal(core.layoutStartCheck(), null);
   }
+});
+
+// Round four
+
+test('an exchange for a protected Gauge keeps the default of the other place when that default is not the protected Gauge, so the default action still puts it back', async () => {
+  const { core, client } = home();
+  for (const [place, gauge] of [['engines', 'projects'], ['jobs', 'engines-usage']] as const) {
+    const plan = must(await client.planLayoutSwap(place, gauge));
+    must(await client.applyLayout(plan, core.approve(plan.nonce)));
+  }
+  const before = must(await client.readLayout());
+  assert.equal(before.layout.tiles.find(tile => tile.place === 'jobs')?.default, 'jobs');
+  // Jobs stays enabled, on the shelf. Engines and usage becomes protected while Projects holds its place.
+  const update = must(await client.planUpdate('engines-protected'));
+  assert.deepEqual(update.steps.filter(line => line.startsWith('layout: ')), [
+    'layout: tile engines holds engines-usage large instead of projects',
+    'layout: tile jobs holds projects large instead of engines-usage',
+    `layout: keep the layout now in use as revision ${before.revision}, and keep at most 10 earlier revisions`,
+  ]);
+  await lifecycleStep(core, client, update);
+  const after = must(await client.readLayout());
+  assert.deepEqual(after.layout.tiles.find(tile => tile.place === 'jobs'), { place: 'jobs', gauge: 'projects', default: 'jobs', col: 2, row: 0, size: 'large' });
+  // The default action brings Jobs back in one action.
+  const back = must(await client.planLayoutDefault('jobs'));
+  assert.equal(back.steps[0], 'put the default Gauge jobs back in place jobs');
+  assert.notEqual(back.baseHash, back.nextHash);
+  must(await client.applyLayout(back, core.approve(back.nonce)));
+  assert.equal(must(await client.readLayout()).layout.tiles.find(tile => tile.place === 'jobs')?.gauge, 'jobs');
+});
+
+test('the client reads each own list of a plan once, through its data property: an accessor and a hidden property are not sent and not read', async () => {
+  const calls: Record<string, unknown>[] = [];
+  const spy = { call: async (_method: string, params: Record<string, unknown>) => { calls.push(params); return { ok: false as const, code: 'GAUGE_PLAN_CHANGED' }; } };
+  const client = createCoreClient(spy as never);
+  const A = 'a'.repeat(64);
+  const base = { action: 'install', id: 'x', folder: 'f', from: null, to: '1.0.0', origin: 'user', digest: A, manifestHash: A, folderHash: A, nonce: A };
+  let reads = 0;
+  const withGetter = Object.defineProperty({ ...base }, 'steps', { enumerable: true, get() { reads += 1; return ['one']; } });
+  await client.applyPlan(withGetter as never, 'a');
+  assert.equal(reads, 0);
+  assert.equal(Object.hasOwn(calls[0]?.['plan'] as object, 'steps'), false);
+  const hidden = Object.defineProperty({ ...base }, 'steps', { enumerable: false, value: ['one'] });
+  await client.applyPlan(hidden as never, 'a');
+  assert.equal(Object.hasOwn(calls[1]?.['plan'] as object, 'steps'), false);
+  const plain = { ...base, steps: ['one'] };
+  await client.applyPlan(plain as never, 'a');
+  const sent = calls[2]?.['plan'] as { steps: string[] };
+  assert.deepEqual(sent.steps, ['one']);
+  assert.notEqual(sent.steps, plain.steps);
+  assert.throws(() => client.applyPlan(null as never, 'a'), TypeError);
+  assert.throws(() => client.applyPlan(undefined as never, 'a'), TypeError);
 });
