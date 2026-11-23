@@ -39,7 +39,7 @@ export interface FakeCoreOptions {
   readonly folders?: readonly GaugeFolder[];
   /** The clock, in milliseconds. A monotonic clock by default (`monotonicNow`). A test passes its own, to move time. */
   readonly now?: () => number;
-  /** The size cap of the audit file, in bytes: a whole number of at least 4,096. 64 KiB by default. A smaller or a non-integer cap is refused when the core is made. */
+  /** The size cap of the audit file, in bytes: a whole number of at least `MIN_AUDIT_MAX_BYTES` (5,970). 64 KiB by default. A smaller or a non-integer cap is refused when the core is made. */
   readonly auditMaxBytes?: number;
   /** The wall clock for the time of an audit record, in milliseconds since 1970. The system clock by default. An audit record is a time, so it is not the monotonic clock. A test passes its own. */
   readonly wall?: () => number;
@@ -187,7 +187,8 @@ const isDenseTexts = (value: unknown): value is string[] => Array.isArray(value)
  *
  * Grants follow the same plan and approval rules (see `README.md`): `bowerloom.grants.plan` and `bowerloom.grants.apply`. A grant binds to the manifest hash and the folder hash
  * of the installed Gauge, so an update makes it stale. A revoke is one call with no plan. `bowerloom.permissions.check` is the one enforcement point, and every grant and revoke
- * is written to an audit file with a size cap before the change it describes.
+ * is written to an audit file with a size cap. A grant is written before it takes effect, and it is refused when its record cannot be written. A revoke, a removal, a disable, and an update take
+ * effect first, and their records are written after, on a best effort.
  *
  * The fake does not check `dependencies` at install, and a removal is not blocked by a Gauge that depends on it. Both belong to a later ticket.
  */
