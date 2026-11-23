@@ -353,3 +353,16 @@ test('a message that is counted after a resume of the run gives its place back t
   assert.equal(relay.control.decline('msg-5').ok, true);
   assert.equal(send('sess-a', 'route-1', 'k6', 'six').ok, true, 'the declined message gave its place back to the run');
 });
+
+test('a message that the person approves for a stuck engine fails at once with receiver_stuck, and the reply says so', async () => {
+  const { relay, engines, send, timers } = build({ sessions: ['sess-a', 'sess-b', 'sess-c'], routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 100, 50), route('route-2', 'sess-c', 'sess-b')] });
+  const proposal = send('sess-c', 'route-2', 'p1', 'a proposal that waits for the person');
+  assert.ok(proposal.ok);
+  if (engines['sess-b']) engines['sess-b'].mode = 'hang';
+  send('sess-a', 'route-1', 'k1', 'the message that hangs');
+  await tick();
+  timers.fireAll();
+  timers.fireAll();
+  assert.deepEqual(relay.control.approve(proposal.id), { ok: true, state: 'failed', reason: 'receiver_stuck' });
+  assert.equal(relay.control.routes()[1]?.accepted, 0, 'the count is given back');
+});

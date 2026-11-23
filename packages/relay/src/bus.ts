@@ -888,8 +888,8 @@ export function createRelay(options: RelayOptions): Relay {
     }
     rec.failedBefore = rec.state === 'failed' ? rec.reason : null;
     if (rec.fidelity === null) rec.fidelity = 'unknown';
+    // The engine is not freed by a receipt, so there is nothing to give it now: the settle of the adapter does that.
     settle(rec, 'delivered', null);
-    pump(rec.envelope.receiver);
     return { ok: true, state: 'delivered' };
   }
 
