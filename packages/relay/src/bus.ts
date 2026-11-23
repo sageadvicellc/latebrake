@@ -249,6 +249,14 @@ const defaultSchedule = (run: () => void, ms: number): (() => void) => {
   timer.unref();
   return () => clearTimeout(timer);
 };
+/** Drops the oldest entries of a Map or a Set until it holds at most `room`. Both keep the order of insertion. */
+const trim = (held: { readonly size: number; keys(): IterableIterator<string>; delete(key: string): boolean }, room: number): void => {
+  while (held.size > room) {
+    const oldest = held.keys().next();
+    if (oldest.done === true) return;
+    held.delete(oldest.value);
+  }
+};
 const inRange = (value: unknown, min: number, max: number): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max;
 const optionIn = (value: number | undefined, fallback: number, min: number, max: number, name: string): number => {
   const chosen = value ?? fallback;
@@ -317,7 +325,7 @@ export function createRelay(options: RelayOptions): Relay {
   const retired = new Map<string, Buffer>();
   const issued = new Set<string>();
   const ended = new Set<string>();
-  const records = new Map<MessageId, Rec>();
+  const records = new Map<string, Rec>();
   /** The ledger of idempotency keys: route and key to the hash of the body and the id of the message. Oldest first. Dropping a message does not touch it. */
   const ledger = new Map<string, { readonly hash: string; readonly id: MessageId }>();
   /** The ids of the messages that the history dropped, with their receivers, oldest first. */
@@ -424,7 +432,7 @@ export function createRelay(options: RelayOptions): Relay {
 
   const rememberGone = (id: MessageId, receiver: string): void => {
     gone.set(id, receiver);
-    while (gone.size > keepKeys) gone.delete(gone.keys().next().value as string);
+    trim(gone, keepKeys);
   };
   const evict = (rec: Rec): void => {
     records.delete(rec.id);
@@ -702,7 +710,8 @@ export function createRelay(options: RelayOptions): Relay {
 
   function onTimeout(rec: Rec): void {
     if (closed || rec.state !== 'sending') return;
-    leaveSending(rec);
+    // The timer has fired, so there is nothing to cancel.
+    rec.cancel = null;
     // The adapter is told to write no more. Its promise may still be pending, and then the engine stays busy: nothing else is given to it until the promise settles, a receipt comes, or the core gives up on it.
     abortDelivery(rec);
     log.write(`delivery of message ${rec.id} to ${rec.envelope.receiver} timed out after ${timeoutMs} ms, and the text may still reach the engine`);
@@ -716,7 +725,7 @@ export function createRelay(options: RelayOptions): Relay {
         onStuck(rec);
       }
     }
-    pump(rec.envelope.receiver);
+    // The engine stays busy, so nothing else goes into it until the adapter settles, a receipt comes, or the wait for the adapter ends.
   }
 
   function onStuck(rec: Rec): void {
@@ -740,7 +749,7 @@ export function createRelay(options: RelayOptions): Relay {
 
   const rememberKey = (route: RouteId, key: string, hash: string, id: MessageId): void => {
     ledger.set(`${route}\u0000${key}`, { hash, id });
-    while (ledger.size > keepKeys) ledger.delete(ledger.keys().next().value as string);
+    trim(ledger, keepKeys);
   };
   const declinedKey = (route: RouteId, hash: string): string => `${route}\u0000${hash}`;
 
@@ -807,7 +816,7 @@ export function createRelay(options: RelayOptions): Relay {
     if (auth.kind === 'ended' || refresh(auth.session)) return sessionEndedRefusal();
     const session = auth.session;
     // A message that does not exist and a message for another receiver are one answer. A message that the history dropped says so, to its own receiver only.
-    const rec = typeof id === 'string' ? records.get(id as MessageId) : undefined;
+    const rec = typeof id === 'string' ? records.get(id) : undefined;
     if (rec === undefined || rec.envelope.receiver !== session) {
       return typeof id === 'string' && gone.get(id) === session ? { ok: false, code: 'GAUGE_MESSAGE_UNKNOWN', reason: 'evicted' } : { ok: false, code: 'GAUGE_MESSAGE_UNKNOWN' };
     }
@@ -829,7 +838,7 @@ export function createRelay(options: RelayOptions): Relay {
 
   function approve(id: unknown): ControlReply {
     if (closed) return { ok: false, code: 'GAUGE_RELAY_CLOSED' };
-    const rec = typeof id === 'string' ? records.get(id as MessageId) : undefined;
+    const rec = typeof id === 'string' ? records.get(id) : undefined;
     if (rec === undefined) return { ok: false, code: 'GAUGE_MESSAGE_UNKNOWN' };
     if (rec.state !== 'pending') return { ok: false, code: 'GAUGE_MESSAGE_NOT_ACCEPTED', reason: rec.state };
     // The end of the receiver has failed this message already, when it is seen here.
@@ -846,7 +855,7 @@ export function createRelay(options: RelayOptions): Relay {
 
   function decline(id: unknown): ControlReply {
     if (closed) return { ok: false, code: 'GAUGE_RELAY_CLOSED' };
-    const rec = typeof id === 'string' ? records.get(id as MessageId) : undefined;
+    const rec = typeof id === 'string' ? records.get(id) : undefined;
     if (rec === undefined) return { ok: false, code: 'GAUGE_MESSAGE_UNKNOWN' };
     if (rec.state !== 'pending' && rec.state !== 'queued') return { ok: false, code: 'GAUGE_MESSAGE_NOT_ACCEPTED', reason: rec.state };
     const at = time();
@@ -854,7 +863,7 @@ export function createRelay(options: RelayOptions): Relay {
     refund(rec);
     settle(rec, 'declined', null);
     declined.add(declinedKey(rec.route.id, rec.bodyHash));
-    while (declined.size > KEEP_DECLINED_BODIES) declined.delete(declined.values().next().value as string);
+    trim(declined, KEEP_DECLINED_BODIES);
     if (state !== undefined) {
       state.declines += 1;
       // A sender that keeps proposing what the person declines is paused: the person decides when it goes on.
@@ -929,7 +938,7 @@ export function createRelay(options: RelayOptions): Relay {
     sizes: () => Object.freeze({ messages: records.size, keys: ledger.size, secrets: secrets.size, inflight: busy.size, declined: declined.size }),
     messages: (): readonly MessageView[] => Object.freeze([...records.values()].map(view)),
     message(id: unknown): MessageView | undefined {
-      const rec = typeof id === 'string' ? records.get(id as MessageId) : undefined;
+      const rec = typeof id === 'string' ? records.get(id) : undefined;
       return rec === undefined ? undefined : view(rec);
     },
     routes: (): readonly RouteView[] => Object.freeze([...routeStates.values()].map(routeView)),

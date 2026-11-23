@@ -1,7 +1,7 @@
 // The envelope: one frame for one message, the check of a body and of a key, and the fence that the receiver sees around peer text.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { idempotencyKey, messageId, nonce, receipt, routeId } from '../src/brand.js';
+import { idempotencyKey, messageId, nonce, receipt, routeId, sessionSecret } from '../src/brand.js';
 import { checkBody, checkEnvelope, checkKey, fenceText, frameOf, type Envelope } from '../src/envelope.js';
 
 const envelope = (over: Partial<Envelope> = {}): Envelope => ({ run: 'run-1', route: routeId('route-1'), sender: 'session-a', receiver: 'session-b', body: 'Hello.', time: 1_700_000_000_000, key: idempotencyKey('key-1'), ...over });
@@ -54,6 +54,12 @@ test('a body that holds a value the relay keeps hidden (a session secret) is ref
   const hidden = 'f'.repeat(32) + '0'.repeat(32);
   assert.deepEqual(checkBody(`here: ${hidden}`, [hidden]), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'relay_value' });
   assert.deepEqual(checkBody(`here: ${hidden.slice(0, 63)}`, [hidden]), { ok: true, value: `here: ${hidden.slice(0, 63)}` });
+});
+
+test('a text that has the shape of a secret and is also a hidden value is told as the shape', () => {
+  const token = `ghp_${'a1B2'.repeat(6)}`;
+  assert.deepEqual(checkBody(`use ${token} now`, [token]), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'pattern' });
+  assert.deepEqual(checkKey('aB3'.repeat(12), ['aB3'.repeat(12)]), { ok: false, code: 'GAUGE_MESSAGE_SECRET_FOUND', reason: 'pattern' });
 });
 
 test('a hidden value shorter than 8 characters, and an empty one, never match, so they cannot refuse every body', () => {
@@ -165,6 +171,15 @@ test('a body that holds its own end line, or a begin line with another nonce, do
 test('the fence refuses to wrap a body that holds the nonce or the receipt, because then the sender could close it', () => {
   assert.throws(() => fenceText({ envelope: envelope({ body: `x ${'a'.repeat(32)} y` }), message: messageId('msg-1'), nonce: nonce('a'.repeat(32)), receipt: receipt('b'.repeat(32)) }), TypeError);
   assert.throws(() => fenceText({ envelope: envelope({ body: `x ${'b'.repeat(32)} y` }), message: messageId('msg-1'), nonce: nonce('a'.repeat(32)), receipt: receipt('b'.repeat(32)) }), TypeError);
+});
+
+test('a secret, a receipt, and a nonce are 16 to 256 characters', () => {
+  for (const make of [sessionSecret, receipt, nonce]) {
+    assert.throws(() => make('x'.repeat(15)), TypeError);
+    assert.equal(make('x'.repeat(16)).length, 16);
+    assert.equal(make('x'.repeat(256)).length, 256);
+    assert.throws(() => make('x'.repeat(257)), TypeError);
+  }
 });
 
 test('the constructors of the brands check the shape and throw for a text that is wrong', () => {

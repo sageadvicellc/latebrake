@@ -58,6 +58,17 @@ test('a line is cut at 1,024 characters, after it is redacted, so a value that c
   assert.equal((lines[0] ?? '').endsWith('...'), true);
 });
 
+test('a line of 1,024 characters is kept whole, and a line of 1,025 is cut to 1,024 with three dots at its end', () => {
+  const { log, lines } = make();
+  const prefix = 'relay run-1: '.length;
+  log.write('a'.repeat(1024 - prefix));
+  log.write('b'.repeat(1025 - prefix));
+  assert.equal(lines[0]?.length, 1024);
+  assert.equal(lines[0]?.endsWith('...'), false);
+  assert.equal(lines[1]?.length, 1024);
+  assert.equal(lines[1]?.endsWith(`${'b'.repeat(10)}...`), true);
+});
+
 test('a log that throws is reported on standard error with the same safe line, and the writer never sees the throw', () => {
   const written: string[] = [];
   const original = process.stderr.write.bind(process.stderr);

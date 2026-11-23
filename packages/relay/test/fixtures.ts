@@ -46,6 +46,8 @@ export interface FakeEngine extends SessionPort {
   say(line: string): void;
   /** Resolves every delivery that waits, and in `late` mode writes the text of each. */
   release(): void;
+  /** Resolves the oldest delivery that waits, and no other. */
+  releaseFirst(): void;
   /** Rejects every delivery that waits. */
   failHung(message: string): void;
   /** How many deliveries wait now. */
@@ -113,6 +115,12 @@ export function createFakeEngine(session: string, options: FakeEngineOptions = {
         if (engine.mode === 'late' && !(engine.honorsAbort && entry.delivery.signal.aborted)) write(entry.delivery);
         entry.resolve(engine.fidelity);
       }
+    },
+    releaseFirst() {
+      const entry = waiting.shift();
+      if (entry === undefined) return;
+      if (engine.mode === 'late' && !(engine.honorsAbort && entry.delivery.signal.aborted)) write(entry.delivery);
+      entry.resolve(engine.fidelity);
     },
     failHung(message) { for (const entry of waiting.splice(0)) entry.reject(new Error(message)); },
     lastReceipt() {

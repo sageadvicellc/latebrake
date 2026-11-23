@@ -317,3 +317,48 @@ test('a receipt for a message that failed with delivery_failed or delivery_timeo
   assert.deepEqual(timed.confirm('sess-b', 'msg-1', slow?.lastReceipt()?.receipt ?? ''), { ok: true, state: 'delivered' });
   assert.deepEqual([timed.relay.control.message('msg-1')?.state, timed.relay.control.message('msg-1')?.reason, timed.relay.control.message('msg-1')?.failedBefore, timed.relay.control.message('msg-1')?.fidelity], ['delivered', null, 'delivery_timeout', 'weakened']);
 });
+
+test('the settle of an old delivery frees only its own engine slot: a late answer of a message that a receipt already proved does not free the engine of the message that runs now', async () => {
+  const { relay, engines, send, confirm } = build({ routes: auto });
+  const engine = engines['sess-b'];
+  if (engine) engine.mode = 'hang';
+  send('sess-a', 'route-1', 'k1', 'first');
+  send('sess-a', 'route-1', 'k2', 'second');
+  send('sess-a', 'route-1', 'k3', 'third');
+  await tick();
+  confirm('sess-b', 'msg-1', engine?.lastReceipt()?.receipt ?? '');
+  assert.equal(engine?.deliveries.length, 2, 'the second message runs now');
+  engine?.releaseFirst();
+  await tick();
+  assert.equal(engine?.deliveries.length, 2, 'the answer of the first message does not free the engine of the second');
+  assert.equal(relay.control.message('msg-3')?.state, 'queued');
+  engine?.releaseFirst();
+  await tick();
+  assert.equal(engine?.deliveries.length, 3);
+  assert.equal(engine?.maxActive, 2, 'the first delivery was still open when the second began, because its receipt had proved it: only the receipt frees an engine before the adapter settles');
+});
+
+test('a late answer that is no fidelity is not recorded', async () => {
+  const { relay, engines, send, timers } = build({ routes: auto });
+  const engine = engines['sess-b'];
+  if (engine) { engine.mode = 'hang'; engine.fidelity = 'maybe' as never; }
+  send('sess-a', 'route-1', 'k1', 'first');
+  await tick();
+  timers.fireAll();
+  engine?.release();
+  await tick();
+  assert.equal(relay.control.message('msg-1')?.fidelity, null);
+});
+
+test('a receipt for an early stop of the engine is no help: the settle of the old promise leaves a newer busy marker alone, also with a single release', async () => {
+  const { engines, send, timers } = build({ routes: auto });
+  const engine = engines['sess-b'];
+  if (engine) engine.mode = 'hang';
+  send('sess-a', 'route-1', 'k1', 'first');
+  await tick();
+  timers.fireAll();
+  assert.equal(engine?.deliveries.length, 1);
+  engine?.releaseFirst();
+  await tick();
+  assert.equal(timers.live(), 0);
+});

@@ -165,6 +165,91 @@ test('a message cap that stopped a route is not turned into a pause by a decline
   assert.equal(relay.control.routes()[0]?.stoppedBy, 'message_cap');
 });
 
+test('a decline on a route that a message cap stopped is no pause, and writes no line that says so', () => {
+  const { relay, send, lines } = build({ routes: [route('route-1', 'sess-a', 'sess-b', 'accepted-output', 1, 4), route('route-2', 'sess-b', 'sess-a')], options: { declineCap: 1 } });
+  send('sess-a', 'route-1', 'k1', 'one');
+  send('sess-a', 'route-1', 'k2', 'two');
+  relay.control.approve('msg-1');
+  relay.control.approve('msg-2');
+  relay.control.decline('msg-2');
+  assert.equal(relay.control.routes()[0]?.stoppedBy, 'message_cap');
+  assert.equal(lines.some(line => line.includes('paused')), false);
+});
+
+test('a message that is dropped after it ended writes no line, since no receipt waits for it', async () => {
+  const { send, lines, confirm, engines } = build({ routes: auto, options: { keepSettled: 1 } });
+  send('sess-a', 'route-1', 'k1', 'one');
+  await tick();
+  confirm('sess-b', 'msg-1', engines['sess-b']?.lastReceipt()?.receipt ?? '');
+  send('sess-a', 'route-1', 'k2', 'two');
+  await tick();
+  assert.equal(lines.some(line => line.includes('dropped from the history')), false);
+});
+
+test('the cause of a waiting route counts the message that an engine is taking: one pending and two that the receiver has accepted are waiting for the receiver', async () => {
+  const { relay, engines, send } = build({ routes: [route('route-1', 'sess-a', 'sess-b'), route('route-2', 'sess-b', 'sess-a')] });
+  if (engines['sess-b']) engines['sess-b'].mode = 'hang';
+  send('sess-a', 'route-1', 'k1', 'one');
+  send('sess-a', 'route-1', 'k2', 'two');
+  send('sess-a', 'route-1', 'k3', 'three');
+  relay.control.approve('msg-1');
+  relay.control.approve('msg-2');
+  await tick();
+  assert.deepEqual(relay.control.messages().map(view => view.state), ['sending', 'queued', 'pending']);
+  assert.equal(relay.control.routes()[0]?.waitingOn, 'receiver_busy');
+});
+
+test('a tie between the messages that wait for the person and those that wait for the receiver is told as waiting for the person', () => {
+  const { relay, send } = build({ states: { 'sess-b': 'waiting' } });
+  send('sess-a', 'route-1', 'k1', 'one');
+  send('sess-a', 'route-1', 'k2', 'two');
+  relay.control.approve('msg-1');
+  assert.deepEqual(relay.control.messages().map(view => view.state), ['queued', 'pending']);
+  assert.equal(relay.control.routes()[0]?.waitingOn, 'pending_approval');
+});
+
+test('a reply that quotes the body of a message that is in flight is taken: bodies are hidden in the log and not in the checks of a body', async () => {
+  const { relay, engines, send } = build({ routes: auto });
+  if (engines['sess-b']) engines['sess-b'].mode = 'hang';
+  send('sess-a', 'route-1', 'k1', 'the plan is to rename the module');
+  await tick();
+  assert.equal(send('sess-b', 'route-2', 'k2', 'Re: the plan is to rename the module, and I agree').ok, true);
+  assert.equal(relay.control.messages().length, 2);
+});
+
+test('a port is read once: the relay never reads state or deliver of a port again after it was made', async () => {
+  const reads = { state: 0, deliver: 0 };
+  const engine = createFakeEngine('sess-b');
+  const port = {
+    get state() { reads.state += 1; return () => engine.state(); },
+    get deliver() { reads.deliver += 1; return (delivery: Parameters<typeof engine.deliver>[0]) => engine.deliver(delivery); },
+  };
+  const a = createFakeEngine('sess-a');
+  const relay = createRelay({ run: 'run-1', routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 10, 5)], members: [{ session: 'sess-a', port: a }, { session: 'sess-b', port }] });
+  const secret = relay.control.issueSecret('sess-a');
+  assert.deepEqual(reads, { state: 1, deliver: 1 });
+  for (let i = 0; i < 3; i += 1) relay.write.send({ session: 'sess-a', secret, route: 'route-1', key: `k${i}`, body: `body ${i}` });
+  await tick();
+  relay.control.sessionChanged('sess-b');
+  assert.equal(engine.inputs.length, 3);
+  assert.deepEqual(reads, { state: 1, deliver: 1 });
+});
+
+test('the ledger keeps 4,096 keys by default', async () => {
+  const { relay, send } = build({ routes: auto });
+  for (let i = 0; i < 4100; i += 1) {
+    let reply = send('sess-a', 'route-1', `k${i}`, `body ${i}`);
+    // A cap that the run reaches is the person's to lift, and the person does it here.
+    if (!reply.ok) { relay.control.resume('route-1'); reply = send('sess-a', 'route-1', `k${i}`, `body ${i}`); }
+    assert.equal(reply.ok, true, String(i));
+    await tick();
+    if (i % 50 === 49) relay.control.resume('route-1');
+  }
+  assert.equal(relay.control.sizes().keys, 4096);
+  assert.equal((send('sess-a', 'route-1', 'k4099', 'body 4099') as { duplicate?: boolean }).duplicate, true);
+  assert.equal((send('sess-a', 'route-1', 'k3', 'body 3') as { duplicate?: boolean }).duplicate, false, 'the oldest keys left the ledger');
+});
+
 test('the decline cap and the keep of keys are set by options, and a bad value is a bug of the caller', () => {
   const a = createFakeEngine('sess-a'), b = createFakeEngine('sess-b');
   const make = (over: Record<string, unknown>) => () => createRelay({ run: 'run-1', routes: [route('route-1', 'sess-a', 'sess-b')], members: [{ session: 'sess-a', port: a }, { session: 'sess-b', port: b }], ...over });

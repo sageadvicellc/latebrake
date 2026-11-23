@@ -272,6 +272,32 @@ test('the run cap counts the messages of auto routes only: an approval of the pe
   assert.deepEqual(built.send('sess-a', 'route-1', 'k6', 'six'), { ok: false, code: 'GAUGE_RELAY_LOOP_CAP' });
 });
 
+test('an approval that is refused because its route is already stopped does not start the counts again', () => {
+  const { relay, send } = build({ routes: [route('route-1', 'sess-a', 'sess-b', 'accepted-output', 1, 5), route('route-2', 'sess-b', 'sess-a', 'auto', 100, 2)] });
+  send('sess-a', 'route-1', 'k1', 'one');
+  send('sess-a', 'route-1', 'k2', 'two');
+  send('sess-a', 'route-1', 'k3', 'three');
+  assert.equal(relay.control.approve('msg-1').ok, true);
+  assert.equal(relay.control.approve('msg-2').ok, false, 'the message cap of route-1 is reached, and the route is stopped');
+  assert.equal(send('sess-b', 'route-2', 'k4', 'four').ok, true);
+  assert.equal(send('sess-b', 'route-2', 'k5', 'five').ok, true);
+  assert.equal(relay.control.approve('msg-3').ok, false, 'the route is stopped already');
+  assert.deepEqual(send('sess-b', 'route-2', 'k6', 'six'), { ok: false, code: 'GAUGE_RELAY_LOOP_CAP' }, 'the refused approval did not give the pair a fresh count');
+});
+
+test('a message of an approval route that waited for its receiver and was declined gives back no place in the run count', () => {
+  const built = build({
+    routes: [route('route-1', 'sess-a', 'sess-b', 'accepted-output', 100, 50), route('route-2', 'sess-b', 'sess-a', 'auto', 100, 50)],
+    states: { 'sess-b': 'waiting' }, options: { runCap: 2 },
+  });
+  built.send('sess-a', 'route-1', 'k1', 'proposal');
+  assert.equal(built.relay.control.approve('msg-1').ok, true);
+  built.relay.control.decline('msg-1');
+  assert.equal(built.send('sess-b', 'route-2', 'k2', 'one').ok, true);
+  assert.equal(built.send('sess-b', 'route-2', 'k3', 'two').ok, true);
+  assert.equal(built.send('sess-b', 'route-2', 'k4', 'three').ok, false, 'two auto messages hold the run cap of two');
+});
+
 test('the run cap is a whole number from 1 to 10,000', () => {
   const a = createFakeEngine('sess-a'), b = createFakeEngine('sess-b');
   const make = (runCap: unknown) => () => createRelay({ run: 'run-1', routes: [route('route-1', 'sess-a', 'sess-b')], members: [{ session: 'sess-a', port: a }, { session: 'sess-b', port: b }], runCap: runCap as number });
