@@ -77,7 +77,11 @@ export interface HostOptions {
   readonly newId?: () => string;
 }
 
-/** What a start plan holds. `variables` are those the engine declares and those the person allowed, sorted. `sharedWith` are the engines that already run in the folder, sorted. */
+/**
+ * What a start plan holds. `variables` are those the engine declares and those the person allowed, sorted. `sharedWith` are the engines that already run in the folder, sorted.
+ * `program` and `folder` are real paths: a link is followed. `requestedFolder` is the folder as the caller wrote it, and `configuredProgram` is the program as the engine is configured. A core shows the real
+ * values to the person who approves, and the values as they were written to a Gauge, so a Gauge learns no path behind a link. The host plans again from `requestedFolder`, so a link that moved makes a plan stale.
+ */
 export interface StartPlanContent {
   readonly engine: string;
   readonly title: string;
@@ -87,6 +91,8 @@ export interface StartPlanContent {
   readonly billing: Billing;
   readonly variables: readonly string[];
   readonly sharedWith: readonly string[];
+  readonly requestedFolder: string;
+  readonly configuredProgram: string;
 }
 
 /** What a stop plan holds. `force` is true when the session is stopping already, and the stop sends the signal that cannot be ignored. */
@@ -94,14 +100,17 @@ export interface StopPlanContent {
   readonly session: string;
   readonly engine: string;
   readonly folder: string;
+  /** The folder as the session was asked for. */
+  readonly requestedFolder: string;
   readonly force: boolean;
 }
 
-/** What a read of a session gives. It holds no output of the engine. */
+/** What a read of a session gives. It holds no output of the engine. `folder` is the real folder, and `requestedFolder` is the folder as the session was asked for. */
 export interface SessionInfo {
   readonly id: string;
   readonly engine: string;
   readonly folder: string;
+  readonly requestedFolder: string;
   readonly state: SessionState;
   readonly billing: Billing;
   readonly model: ModelChoice | null;
@@ -191,6 +200,7 @@ interface Tracked {
   readonly session: Session;
   readonly engine: EngineSpec;
   readonly folder: string;
+  readonly requestedFolder: string;
   readonly model: ModelChoice | null;
   /** The key of the folder, which the pair rule and the shared folder rule compare. `folder` is for display. */
   readonly key: string;
@@ -393,7 +403,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
   let closed = false;
 
   const info = (record: Tracked): SessionInfo => Object.freeze({
-    id: record.session.id, engine: record.engine.id, folder: record.folder, state: record.session.state, billing: record.engine.billing,
+    id: record.session.id, engine: record.engine.id, folder: record.folder, requestedFolder: record.requestedFolder, state: record.session.state, billing: record.engine.billing,
     model: record.model === null ? null : Object.freeze({ provider: record.model.provider, model: record.model.model }), failure: record.session.failure,
   });
   /** The sessions that hold a place: those that have not ended, and those that have ended in state while their process still lives, because a process that lives is a process that runs. */
@@ -542,7 +552,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
     }
     const program = located;
     // A program whose path holds a control or separator character is not offered to the person: the plan shows the real path as it is.
-    if (hasUnsafeChar(program)) return notFound('program_missing');
+    // The program as the engine is configured is shown to a Gauge, so it is held to the same rule.
+    if (hasUnsafeChar(program) || hasUnsafeChar(spec.program)) return notFound('program_missing');
     const real = canonical(folder.value);
     if (real === undefined || !checkFolder(real.path).ok) return invalid('folder');
     if (typeof real.key !== 'string' || real.key === '') throw new Error('engine host: canonical gave a folder with no key');
@@ -561,6 +572,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
         engine: spec.id, title: spec.title, program, folder: real.path, model: model.value, billing: spec.billing,
         variables: Object.freeze(variables),
         sharedWith: Object.freeze(sorted(live.filter(record => record.key === real.key).map(record => record.engine))),
+        requestedFolder: folder.value, configuredProgram: spec.program,
       }),
     };
   }
@@ -581,8 +593,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
     return Object.fromEntries(entries);
   }
 
-  /** The request that makes a plan again. */
-  const requestOf = (plan: StartPlanContent): unknown => ({ engine: plan.engine, folder: plan.folder, model: plan.model, variables: plan.variables });
+  /** The request that makes a plan again: from the folder as it was asked for, so a link that moved gives another plan. */
+  const requestOf = (plan: StartPlanContent): unknown => ({ engine: plan.engine, folder: plan.requestedFolder, model: plan.model, variables: plan.variables });
 
   function beginStart(plan: StartPlanContent, approvals: { readonly sharedApproved: boolean }): BegunStart | HostRefusal {
     // The caller's objects are read once. Everything below runs from the plan that the host made itself and checked, and never from a second read of the caller's plan.
@@ -629,7 +641,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     let resolveStarted: Tracked['resolveStarted'] = () => undefined;
     const started = new Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal>(resolve => { resolveStarted = resolve; });
     const record: Tracked = {
-      session: createSession(id, sink, () => leftStarting(record)), engine: spec, folder: verified.folder, key, model: verified.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [], secrets, tailMargin, sink,
+      session: createSession(id, sink, () => leftStarting(record)), engine: spec, folder: verified.folder, requestedFolder: verified.requestedFolder, key, model: verified.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [], secrets, tailMargin, sink,
       killedByHost: false, startReason: undefined, resolveStarted,
     };
     records.set(id, record);
@@ -730,10 +742,12 @@ export function createEngineHost(options: HostOptions): EngineHost {
     const own = (key: string): unknown => { const descriptor = Object.getOwnPropertyDescriptor(value, key); return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined; };
     const texts = (item: unknown): string[] => { const list = readList(item, MAX_VARIABLES); return list !== undefined && list.every((entry): entry is string => typeof entry === 'string') ? list : bad(); };
     const engine = own('engine'), title = own('title'), program = own('program'), folder = own('folder'), billing = own('billing'), model = checkModel(own('model'));
+    const requestedFolder = own('requestedFolder'), configuredProgram = own('configuredProgram');
     if (typeof engine !== 'string' || typeof title !== 'string' || typeof program !== 'string' || typeof folder !== 'string' || !model.ok || own('model') === undefined) return bad();
+    if (typeof requestedFolder !== 'string' || typeof configuredProgram !== 'string') return bad();
     if (!isBilling(billing)) return bad();
     return Object.freeze({
-      engine, title, program, folder, model: model.value, billing, variables: Object.freeze(texts(own('variables'))), sharedWith: Object.freeze(texts(own('sharedWith'))),
+      engine, title, program, folder, model: model.value, billing, variables: Object.freeze(texts(own('variables'))), sharedWith: Object.freeze(texts(own('sharedWith'))), requestedFolder, configuredProgram,
     });
   }
 
@@ -789,7 +803,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!record) return refusal('ENGINE_SESSION_UNKNOWN');
     // A session that has ended but whose program has not been seen to go still holds its place, and its kill may have been refused. A stop of it is the kill again, and it is a forced stop.
     if (isTerminal(record.session.state) && record.exited) return refusal('ENGINE_SESSION_ENDED');
-    return { ok: true, plan: Object.freeze({ session: id.value, engine: record.engine.id, folder: record.folder, force: record.session.state === 'stopping' || isTerminal(record.session.state) }) };
+    return { ok: true, plan: Object.freeze({ session: id.value, engine: record.engine.id, folder: record.folder, requestedFolder: record.requestedFolder, force: record.session.state === 'stopping' || isTerminal(record.session.state) }) };
   }
 
   function beginStop(sessionId: unknown): BegunStop | HostRefusal {

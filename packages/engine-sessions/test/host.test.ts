@@ -51,9 +51,78 @@ test('a start plan lists the engine, the real program, the folder, the model cho
   const planned = r.host.planStart(request('alpha', '/work/one', { variables: ['ZED', 'ALPHA'] }));
   assert.deepEqual(planned, {
     ok: true,
-    plan: { engine: 'alpha', title: 'Engine alpha', program: '/bin/alpha', folder: '/work/one', model: null, billing: 'local', variables: ['ALPHA', 'HOME', 'PATH', 'ZED'], sharedWith: [] },
+    plan: { engine: 'alpha', title: 'Engine alpha', program: '/bin/alpha', folder: '/work/one', model: null, billing: 'local', variables: ['ALPHA', 'HOME', 'PATH', 'ZED'], sharedWith: [], requestedFolder: '/work/one', configuredProgram: '/bin/alpha' },
   });
 });
+
+// The folder and the program as they were asked for, kept beside the real ones: a core shows the real values to the person and the asked-for values to a Gauge.
+
+/** A host where `/link/*` is a link to `/real/*`, and the program `claude` is found at a real path behind a link. The link can be moved to another folder by the test. */
+function linked(target = { to: '/real/one' }) {
+  return rig({
+    locate: program => (program === 'claude' ? '/real/bin/claude-1.2' : program),
+    canonical: folder => { const real = folder.startsWith('/link/') ? target.to : folder; return { path: real, key: real }; },
+  }, [spec('alpha', { program: 'claude' }), spec('beta')]);
+}
+
+test('a start plan keeps the folder and the program as they were asked for, beside the real folder and the real program', () => {
+  const r = linked();
+  const planned = r.host.planStart(request('alpha', '/link/one'));
+  assert.ok(planned.ok);
+  assert.equal(planned.plan.folder, '/real/one');
+  assert.equal(planned.plan.requestedFolder, '/link/one');
+  assert.equal(planned.plan.program, '/real/bin/claude-1.2');
+  assert.equal(planned.plan.configuredProgram, 'claude');
+});
+
+test('a session, and the plan to stop it, keep the folder as it was asked for, beside the real folder', async () => {
+  const r = linked();
+  const id = await startOne(r, 'alpha', '/link/one');
+  const info = r.host.get(id);
+  assert.equal(info?.folder, '/real/one');
+  assert.equal(info?.requestedFolder, '/link/one');
+  assert.equal(r.host.list('alpha')[0]?.requestedFolder, '/link/one');
+  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'alpha', folder: '/real/one', requestedFolder: '/link/one', force: false } });
+});
+
+test('a start begins from the folder as it was asked for: a link that moved since the plan makes the plan stale, and nothing starts', () => {
+  const target = { to: '/real/one' };
+  const r = linked(target);
+  const planned = r.host.planStart(request('alpha', '/link/one'));
+  assert.ok(planned.ok);
+  target.to = '/real/two';
+  assert.throws(() => r.host.beginStart(planned.plan, { sharedApproved: false }), /does not match the state now/);
+  assert.equal(r.host.launched, 0);
+});
+
+test('a group plan keeps the folders as asked for, and a group begins from them: a link that moved makes the group stale', () => {
+  const target = { to: '/real/one' };
+  const r = linked(target);
+  const grouped = r.host.planStartGroup([request('alpha', '/link/one'), request('beta', '/work/two')]);
+  assert.ok(grouped.ok);
+  assert.deepEqual(grouped.plans.map(plan => [plan.folder, plan.requestedFolder, plan.configuredProgram]), [['/real/one', '/link/one', 'claude'], ['/work/two', '/work/two', '/bin/beta']]);
+  target.to = '/real/two';
+  assert.throws(() => r.host.beginStartGroup(grouped.plans, { sharedApproved: false }), /do not match the state now/);
+  assert.equal(r.host.launched, 0);
+});
+
+test('a group member that is read from a caller needs the folder and the program as they were asked for', () => {
+  const r = linked();
+  const grouped = r.host.planStartGroup([request('alpha', '/link/one')]);
+  assert.ok(grouped.ok);
+  const plan = grouped.plans[0]!;
+  for (const key of ['requestedFolder', 'configuredProgram'] as const) {
+    const { [key]: _left, ...rest } = plan;
+    assert.throws(() => r.host.beginStartGroup([rest as unknown as typeof plan], { sharedApproved: false }), /is a start plan/, key);
+    assert.throws(() => r.host.beginStartGroup([{ ...plan, [key]: 5 } as unknown as typeof plan], { sharedApproved: false }), /is a start plan/, `${key} that is not text`);
+  }
+});
+
+test('a program that is configured with a hidden or separator character is not offered, as a real path with one is not', () => {
+  const r = rig({ locate: () => '/bin/alpha' }, [spec('alpha', { program: '/bin/al\u2028pha' })]);
+  assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
+});
+
 
 test('a plan changes nothing: no session exists and no program was launched', () => {
   const r = rig();
@@ -462,9 +531,9 @@ test('a stop of a session that is not there is ENGINE_SESSION_UNKNOWN, and one t
 test('a stop plan names the session, its engine and folder, and says force only when the session is stopping', async () => {
   const r = rig({ stopTimeoutMs: 20 });
   const id = await startOne(r, 'beta', '/work/one');
-  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'beta', folder: '/work/one', force: false } });
+  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'beta', folder: '/work/one', requestedFolder: '/work/one', force: false } });
   await r.host.stop(id);
-  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'beta', folder: '/work/one', force: true } });
+  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'beta', folder: '/work/one', requestedFolder: '/work/one', force: true } });
 });
 
 test('a planned stop changes nothing, and the program gets no signal', async () => {
@@ -485,7 +554,7 @@ test('a read gives a new frozen copy with no output of the engine, oldest first,
   assert.deepEqual(all.map(item => item.id), [one, two, three]);
   assert.deepEqual(r.host.list('alpha').map(item => item.id), [one, three]);
   assert.deepEqual(r.host.list('nothing'), []);
-  assert.deepEqual(Object.keys(all[0] ?? {}).sort(), ['billing', 'engine', 'failure', 'folder', 'id', 'model', 'state']);
+  assert.deepEqual(Object.keys(all[0] ?? {}).sort(), ['billing', 'engine', 'failure', 'folder', 'id', 'model', 'requestedFolder', 'state']);
   const picky = rig({}, [spec('picky', { modelArgs: choice => [choice.model] })]);
   const chosen = await startOne(picky, 'picky', '/work/one', { model: { provider: 'p', model: 'm' } });
   const first = picky.host.get(chosen)?.model, second = picky.host.get(chosen)?.model;
@@ -639,7 +708,7 @@ test('a session that a claim failed still counts for the pair, the cap, and the 
   assert.equal(stateOf(r, id), 'failed');
   assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_PAIR_BUSY' });
   assert.deepEqual(r.host.planStart(request('beta', '/work/two')), { ok: false, code: 'ENGINE_LIMIT' });
-  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'alpha', folder: '/work/one', force: true } }, 'its process lives, so the stop is a kill again');
+  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'alpha', folder: '/work/one', requestedFolder: '/work/one', force: true } }, 'its process lives, so the stop is a kill again');
   const reads = [r.host.list(), r.host.list('alpha'), r.host.get(id)];
   assert.equal(reads.length, 3, 'a read does not throw');
   programOf(r, 0).exit(null, 'SIGKILL');
@@ -1225,7 +1294,7 @@ test('a failed session whose kill did not land keeps its place, and a stop of it
   assert.equal(stateOf(r, id), 'failed');
   assert.deepEqual(programOf(r, 0).signals, ['kill']);
   assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_PAIR_BUSY' });
-  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'alpha', folder: '/work/one', force: true } });
+  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'alpha', folder: '/work/one', requestedFolder: '/work/one', force: true } });
   lands = true;
   const begun = r.host.beginStop(id);
   assert.ok(begun.ok);
