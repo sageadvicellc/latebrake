@@ -64,7 +64,7 @@ A layout is refused with `GAUGE_PROTECTED` and one of three reasons:
 - `replaced`: a place holds another Gauge than the protected Gauge it is for. A place is for a protected Gauge when the file says so (`default`), and also when the place is one of the five places of the default home that the core holds for a protected Gauge (`DEFAULT_TILES`). The file cannot vouch for itself: a text that changes both the `gauge` and the `default` of the `harnesses` place is still `replaced`.
 - `removed`: an enabled protected Gauge, or `settings`, is on no tile and not on the shelf.
 
-The shelf counts as a reachable place, so a protected Gauge may sit on the shelf and not on the home. The default layout does this for the Gauge manager. A person may also take Harnesses off the home by dropping its tile, and it then sits on the shelf. Whether Harnesses must stay on the home is a decision that is still open.
+The shelf counts as a reachable place, so a protected Gauge may sit on the shelf and not on the home. The default layout does this for the Gauge manager. A person may also take Harnesses off the home by dropping its tile, and it then sits on the shelf. This is decided: Harnesses may leave the home for the shelf, and the shelf counts as reachable for every protected Gauge.
 
 A change that would do the same is refused the same way. A swap that would take a protected Gauge out of its place is `replaced`. Settings has no place that a Gauge can fill, so there is nothing to replace: the ways to break its rule are to hide it and to drop it.
 
