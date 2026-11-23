@@ -15,7 +15,7 @@ import { DEFAULT_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES, appendAuditStep, auditLin
 import { escapeForPlan } from './plan-text.js';
 import { startSteps, stopSteps } from './session-plan.js';
 import {
-  LAYOUT_KINDS, PLAN_ACTIONS, SESSION_ACTIONS, type AuditEntry, type AuditRead, type Core, type CoreRefusal, type CoreReply, type EngineCode, type GaugeApplied, type GaugePlan, type GaugeSummary, type LayoutKind, type LayoutSafe, type PlanAction,
+  LAYOUT_KINDS, PLAN_ACTIONS, SESSION_ACTIONS, type AuditEntry, type AuditRead, type Core, type CoreRefusal, type CoreReply, type EngineCode, type EngineReasonCode, type GaugeApplied, type GaugePlan, type GaugeSummary, type LayoutKind, type LayoutSafe, type PlanAction,
   type SessionAction, type SessionModel,
 } from './types.js';
 
@@ -206,7 +206,7 @@ function describe(manifest: GaugeManifest): readonly string[] {
 const digestOfGrant = (plan: GrantContent): string => sha256(JSON.stringify(['grant', plan.id, plan.version, plan.permissions, plan.steps, plan.manifestHash, plan.folderHash]));
 const sealedGrant = (plan: GrantContent): SealedGrant => ({ ...plan, permissions: [...plan.permissions], steps: [...plan.steps], digest: digestOfGrant(plan) });
 
-type PlainCode = Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | 'ENGINE_REQUEST_INVALID'>;
+type PlainCode = Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | EngineReasonCode>;
 const refuse = (code: PlainCode, reason?: ManifestReason): Refusal => (reason === undefined ? { ok: false, code } : { ok: false, code, reason });
 /** A refusal because a Gauge is protected: the lifecycle gives no reason. */
 const protectedRefusal = (): Refusal => ({ ok: false, code: 'GAUGE_PROTECTED' });
@@ -216,11 +216,20 @@ const refusalOf = (result: LayoutRefusal | UnknownGaugeRefusal): Refusal => (res
 const auditRefusal = (reason: AuditReason): Refusal => ({ ok: false, code: 'GAUGE_AUDIT_FAILED', reason });
 /** A refusal because of a grant: the code `GAUGE_GRANT_MISSING` with a reason of the closed set, or with none when the permission is plainly not granted. */
 const deny = (reason?: GrantReason): Refusal => (reason === undefined ? { ok: false, code: 'GAUGE_GRANT_MISSING' } : { ok: false, code: 'GAUGE_GRANT_MISSING', reason });
-/** A refusal of the Engine Host, as the core gives it. `ENGINE_REQUEST_INVALID` keeps its reason, and every other engine code has none. */
-const engineRefusal = (refusal: HostRefusal): Refusal => (refusal.code === 'ENGINE_REQUEST_INVALID' ? { ok: false, code: refusal.code, reason: refusal.reason } : { ok: false, code: refusal.code });
+/** A refusal of the Engine Host, as the core gives it. `ENGINE_REQUEST_INVALID`, `ENGINE_NOT_FOUND`, and `ENGINE_START_FAILED` keep their reason, and every other engine code has none. */
+const engineRefusal = (refusal: HostRefusal): Refusal => {
+  if (refusal.code === 'ENGINE_REQUEST_INVALID') return { ok: false, code: refusal.code, reason: refusal.reason };
+  if (refusal.code === 'ENGINE_NOT_FOUND') return { ok: false, code: refusal.code, reason: refusal.reason };
+  if (refusal.code === 'ENGINE_START_FAILED') return { ok: false, code: refusal.code, reason: refusal.reason };
+  return { ok: false, code: refusal.code };
+};
 const reply = (refusal: Refusal): CoreReply => (refusal.reason === undefined ? { ok: false, code: refusal.code } : { ok: false, code: refusal.code, reason: refusal.reason });
 /** True when the value is a list of text with no hole. A hole is not a line of text. */
-const isDenseTexts = (value: unknown): value is string[] => Array.isArray(value) && Array.from(value as unknown[]).every((item): item is string => typeof item === 'string');
+/** Reads a list of text by index, once (see `readList`). A list with a hole, an accessor, or an item that is not text reads as `undefined`. */
+const denseTexts = (value: unknown): string[] | undefined => {
+  const items = readList(value);
+  return items !== undefined && items.every((item): item is string => typeof item === 'string') ? items : undefined;
+};
 
 /**
  * A core that answers from fixture data and gives stable refusal codes. A design or a Gauge builds against it before the real core exists.
@@ -499,8 +508,9 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (typeof action !== 'string' || !(PLAN_ACTIONS as readonly string[]).includes(action) || typeof id !== 'string' || typeof nonce !== 'string') return undefined;
     const nullable = (field: unknown): field is string | null => field === null || typeof field === 'string';
     if (!nullable(folder) || !nullable(from) || !nullable(to) || !nullable(manifestHash) || !nullable(folderHash) || (origin !== 'stock' && origin !== 'third-party')) return undefined;
-    if (!isDenseTexts(steps)) return undefined;
-    return { ...sealed({ action: action as PlanAction, id, folder, from, to, origin, steps, manifestHash, folderHash }), nonce };
+    const stepList = denseTexts(steps);
+    if (stepList === undefined) return undefined;
+    return { ...sealed({ action: action as PlanAction, id, folder, from, to, origin, steps: stepList, manifestHash, folderHash }), nonce };
   }
 
   /** Finds the approval a caller sent. An unknown, old, or expired approval reads as `undefined`, and an expired or stale one is forgotten. */
@@ -602,9 +612,10 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   /** Reads a list of permission names: a non-empty list of text with no repeat, sorted. Anything else reads as `undefined`. */
   function readNames(value: unknown): readonly string[] | undefined {
     try {
-      if (!Array.isArray(value) || value.length === 0 || value.length > PERMISSION_NAMES.length) return undefined;
+      const items = readList(value, PERMISSION_NAMES.length);
+      if (items === undefined || items.length === 0) return undefined;
       const names: string[] = [];
-      for (const item of value as unknown[]) {
+      for (const item of items) {
         if (typeof item !== 'string') return undefined;
         names.push(item);
       }
@@ -639,8 +650,9 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (action !== 'grant' || typeof id !== 'string' || typeof version !== 'string' || typeof nonce !== 'string') return undefined;
     const nullable = (field: unknown): field is string | null => field === null || typeof field === 'string';
     if (!nullable(manifestHash) || !nullable(folderHash)) return undefined;
-    if (!isDenseTexts(permissions) || !isDenseTexts(steps)) return undefined;
-    return { ...sealedGrant({ id, version, permissions, steps, manifestHash, folderHash }), nonce };
+    const permissionList = denseTexts(permissions), stepList = denseTexts(steps);
+    if (permissionList === undefined || stepList === undefined) return undefined;
+    return { ...sealedGrant({ id, version, permissions: permissionList, steps: stepList, manifestHash, folderHash }), nonce };
   }
 
   function applyGrant(params: Readonly<Record<string, unknown>>): CoreReply {
@@ -824,8 +836,10 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     const steps = field('steps'), baseHash = field('baseHash'), nextHash = field('nextHash'), nonce = field('nonce');
     if (action !== 'layout' || !isLayoutKind(kind) || typeof nonce !== 'string' || typeof baseHash !== 'string' || typeof nextHash !== 'string') return undefined;
     const nullable = (field: unknown): field is string | null => field === null || typeof field === 'string';
-    if (!nullable(place) || !nullable(gauge) || !nullable(text) || !(revision === null || (typeof revision === 'number' && Number.isSafeInteger(revision))) || !isDenseTexts(steps)) return undefined;
-    const content: LayoutContent = { kind, place, gauge, revision, text, steps: [...steps], baseHash, nextHash };
+    if (!nullable(place) || !nullable(gauge) || !nullable(text) || !(revision === null || (typeof revision === 'number' && Number.isSafeInteger(revision)))) return undefined;
+    const stepList = denseTexts(steps);
+    if (stepList === undefined) return undefined;
+    const content: LayoutContent = { kind, place, gauge, revision, text, steps: stepList, baseHash, nextHash };
     return { ...content, digest: layoutDigest(content), nonce };
   }
 

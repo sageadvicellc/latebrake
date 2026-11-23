@@ -11,5 +11,5 @@ test('the type that ties the engine codes to the registry holds, and it fails wh
   // @ts-expect-error a list that has an extra code is not the same set
   const extra: Exactly<'A', 'A' | 'B'> = true;
   assert.deepEqual([holds, same, missing, extra], [true, true, true, true]);
-  assert.equal(ENGINE_CODES.length, 9);
+  assert.equal(ENGINE_CODES.length, 7);
 });

@@ -1,7 +1,10 @@
 import type { GaugeCode } from '../../gauge-errors/src/index.js';
 import type { AuditReason, GrantReason, ManifestReason, PermissionName } from '../../gauge-manifest/src/index.js';
 import type { Layout, LayoutReason, LayoutRevision, ProtectedReason } from '../../gauge-layout/src/index.js';
-import type { Billing, ModelChoice, RequestReason, SessionFailure, SessionState } from '../../engine-sessions/src/index.js';
+import type { ModelChoice, RequestReason } from '../../engine-sessions/src/request.js';
+import type { SessionFailure } from '../../engine-sessions/src/session.js';
+import type { SessionState } from '../../engine-sessions/src/states.js';
+import type { Billing, NotFoundReason, StartFailedReason } from '../../engine-sessions/src/vocab.js';
 
 /** The wire names of the calls the core offers. Wire identifiers keep the `bowerloom` prefix until the rename. */
 export type CoreMethod =
@@ -261,11 +264,11 @@ export type CoreResult<T> = { readonly ok: true; readonly value: T } | CoreRefus
 /**
  * A refusal, with its reason typed by its code. `GAUGE_GRANT_MISSING` has a grant reason or none. `GAUGE_AUDIT_FAILED` always has an audit reason. `GAUGE_LAYOUT_INVALID` always has a layout reason.
  * `GAUGE_PROTECTED` has a protected reason (`hidden`, `removed`, `replaced`) when the layout refused it, and none when the lifecycle did. `ENGINE_REQUEST_INVALID` always has a request reason (which field was wrong),
- * and the other engine codes have none. Every other code has a manifest reason or none.
+ * `ENGINE_NOT_FOUND` and `ENGINE_START_FAILED` always have a reason of their own closed set, and the other engine codes have none. Every other code has a manifest reason or none.
  */
-/** The engine codes that never carry a reason. `ENGINE_REQUEST_INVALID` always carries one. */
+/** The engine codes that never carry a reason. `ENGINE_REQUEST_INVALID`, `ENGINE_NOT_FOUND`, and `ENGINE_START_FAILED` always carry one. */
 export const ENGINE_CODES = Object.freeze([
-  'ENGINE_NOT_FOUND', 'MODEL_NOT_FOR_ENGINE', 'ENGINE_LIMIT', 'ENGINE_PAIR_BUSY', 'ENGINE_FOLDER_SHARED', 'ENGINE_START_FAILED', 'ENGINE_SESSION_UNKNOWN', 'ENGINE_SESSION_ENDED', 'ENGINE_STOP_TIMEOUT',
+  'MODEL_NOT_FOR_ENGINE', 'ENGINE_LIMIT', 'ENGINE_PAIR_BUSY', 'ENGINE_FOLDER_SHARED', 'ENGINE_SESSION_UNKNOWN', 'ENGINE_SESSION_ENDED', 'ENGINE_STOP_TIMEOUT',
 ] as const);
 export type EngineCode = (typeof ENGINE_CODES)[number];
 
@@ -274,14 +277,19 @@ export type Exactly<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) :
 /**
  * A compile-time check that ties the engine codes of this package to the registry: it is `true` only when `ENGINE_CODES` and `ENGINE_REQUEST_INVALID` are exactly the registry codes that hold the word `ENGINE`.
  * A code added to the registry and not here, or here and not in the registry, makes this type `never`, and the declaration that uses it in `test/engine-codes-type.test.ts` stops compiling.
+ * The pattern is the word ENGINE anywhere in the code, so a future registry code that holds the word and is not an engine session code will also fail this check, on purpose: it must be added here, or this pattern must be replaced by an explicit list.
  */
-export type EngineCodesMatchRegistry = Exactly<EngineCode | 'ENGINE_REQUEST_INVALID', Extract<GaugeCode, `${string}ENGINE${string}`>>;
+export type EngineCodesMatchRegistry = Exactly<EngineCode | EngineReasonCode, Extract<GaugeCode, `${string}ENGINE${string}`>>;
+/** The engine codes that always carry a reason. */
+export type EngineReasonCode = 'ENGINE_REQUEST_INVALID' | 'ENGINE_NOT_FOUND' | 'ENGINE_START_FAILED';
 
 export type CoreRefusal =
   | { readonly ok: false; readonly code: EngineCode; readonly reason?: never }
   | { readonly ok: false; readonly code: 'ENGINE_REQUEST_INVALID'; readonly reason: RequestReason }
+  | { readonly ok: false; readonly code: 'ENGINE_NOT_FOUND'; readonly reason: NotFoundReason }
+  | { readonly ok: false; readonly code: 'ENGINE_START_FAILED'; readonly reason: StartFailedReason }
   | { readonly ok: false; readonly code: 'GAUGE_GRANT_MISSING'; readonly reason?: GrantReason }
   | { readonly ok: false; readonly code: 'GAUGE_AUDIT_FAILED'; readonly reason: AuditReason }
   | { readonly ok: false; readonly code: 'GAUGE_LAYOUT_INVALID'; readonly reason: LayoutReason }
   | { readonly ok: false; readonly code: 'GAUGE_PROTECTED'; readonly reason?: ProtectedReason }
-  | { readonly ok: false; readonly code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | 'ENGINE_REQUEST_INVALID'>; readonly reason?: ManifestReason };
+  | { readonly ok: false; readonly code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | EngineReasonCode>; readonly reason?: ManifestReason };

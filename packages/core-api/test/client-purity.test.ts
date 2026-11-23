@@ -2,11 +2,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const CLIENT = fileURLToPath(new URL('../src/client.js', import.meta.url));
-const IMPORT = /(?:^|\n)\s*(?:import|export)\b[^'"\n]*?from\s*['"]([^'"]+)['"]|(?:^|\n)\s*import\s*['"]([^'"]+)['"]/g;
+/** A static import or re-export, on one line or many, a bare `import 'x'`, and a dynamic `import('x')` or `require('x')`. */
+const IMPORT = /(?:^|[\n;])\s*(?:import|export)\b[^'";]*?\bfrom\s*['"]([^'"]+)['"]|(?:^|[\n;])\s*import\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)|\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
 
 /** Every module that the client reaches by a static import, as absolute paths, and every `node:` module on the way. */
 function graph(entry: string): { readonly files: Set<string>; readonly nodes: Set<string> } {
@@ -18,7 +20,7 @@ function graph(entry: string): { readonly files: Set<string>; readonly nodes: Se
     files.add(file);
     const text = fs.readFileSync(file, 'utf8');
     for (const match of text.matchAll(IMPORT)) {
-      const target = match[1] ?? match[2] ?? '';
+      const target = match[1] ?? match[2] ?? match[3] ?? match[4] ?? '';
       if (target.startsWith('.')) queue.push(path.resolve(path.dirname(file), target));
       else nodes.add(target);
     }
@@ -42,4 +44,17 @@ test('the graph reader finds imports and exports, so the check above is not empt
   assert.ok(files.size >= 8, `${files.size} modules`);
   const sample = fs.readFileSync(CLIENT, 'utf8');
   assert.match(sample, /from '\.\.\/\.\.\/engine-sessions\/src\/request\.js'/);
+});
+
+test('the graph reader sees a multi-line import, a bare import, a re-export, and a dynamic import', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'purity-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'a.js'), "import {\n  one,\n  two,\n} from './b.js';\nimport './c.js';\nexport { x } from './d.js';\nconst e = await import('./e.js');\nconst f = await import('node:fs');\n");
+    for (const name of ['b', 'c', 'd', 'e']) fs.writeFileSync(path.join(dir, `${name}.js`), 'export const x = 1;\n');
+    const { files, nodes } = graph(path.join(dir, 'a.js'));
+    assert.deepEqual([...files].map(file => path.basename(file)).sort(), ['a.js', 'b.js', 'c.js', 'd.js', 'e.js']);
+    assert.deepEqual([...nodes], ['node:fs']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

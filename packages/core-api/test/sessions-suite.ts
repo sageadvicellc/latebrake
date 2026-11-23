@@ -248,7 +248,8 @@ export function runSessionsSuite(name: string, makeHarness: (folders: readonly G
   test(`${name}: an engine that the core does not hold, or whose program is not on this computer, is ENGINE_NOT_FOUND`, async t => {
     const w = await prepare(t);
     const folder = w.harness.folder('alpha');
-    for (const engine of ['fixture-unknown', 'fixture-missing']) assert.deepEqual(outcome(await w.client.planSessionStart(GAUGE, { engine, folder })), refused('ENGINE_NOT_FOUND'), engine);
+    assert.deepEqual(outcome(await w.client.planSessionStart(GAUGE, { engine: 'fixture-unknown', folder })), refused('ENGINE_NOT_FOUND', 'engine'));
+    assert.deepEqual(outcome(await w.client.planSessionStart(GAUGE, { engine: 'fixture-missing', folder })), refused('ENGINE_NOT_FOUND', 'program_missing'));
   });
 
   // Approval

@@ -328,7 +328,7 @@ test('a refusal of ENGINE_REQUEST_INVALID needs a reason of the closed set, and 
     { ok: false, code: 'ENGINE_REQUEST_INVALID' }, { ok: false, code: 'ENGINE_REQUEST_INVALID', reason: 'syntax' }, { ok: false, code: 'ENGINE_REQUEST_INVALID', reason: 'Folder' }, { ok: false, code: 'ENGINE_REQUEST_INVALID', reason: 5 },
     { ok: false, code: 'ENGINE_REQUEST_INVALID', reason: undefined },
   ]) await assert.rejects(refused(reply), CoreProtocolError, JSON.stringify(reply));
-  for (const code of ['ENGINE_NOT_FOUND', 'MODEL_NOT_FOR_ENGINE', 'ENGINE_LIMIT', 'ENGINE_PAIR_BUSY', 'ENGINE_FOLDER_SHARED', 'ENGINE_START_FAILED', 'ENGINE_SESSION_UNKNOWN', 'ENGINE_SESSION_ENDED', 'ENGINE_STOP_TIMEOUT']) {
+  for (const code of ['MODEL_NOT_FOR_ENGINE', 'ENGINE_LIMIT', 'ENGINE_PAIR_BUSY', 'ENGINE_FOLDER_SHARED', 'ENGINE_SESSION_UNKNOWN', 'ENGINE_SESSION_ENDED', 'ENGINE_STOP_TIMEOUT']) {
     assert.deepEqual(await refused({ ok: false, code }), { ok: false, code }, code);
     assert.deepEqual(await refused({ ok: false, code, reason: undefined }), { ok: false, code }, `${code} with an undefined reason`);
     await assert.rejects(refused({ ok: false, code, reason: 'folder' }), CoreProtocolError, `${code} with a request reason`);
@@ -339,4 +339,67 @@ test('a refusal of ENGINE_REQUEST_INVALID needs a reason of the closed set, and 
 test('a request reason goes with no other code', async () => {
   const refused = (reply: unknown) => createCoreClient(scripted(reply)).planSessionStop('g', 's-1');
   for (const code of ['GAUGE_PLAN_CHANGED', 'UNKNOWN_GAUGE', 'GAUGE_GRANT_MISSING', 'GAUGE_PROTECTED']) await assert.rejects(refused({ ok: false, code, reason: 'folder' }), CoreProtocolError, code);
+});
+
+test('ENGINE_NOT_FOUND and ENGINE_START_FAILED always carry a reason of their own closed set, and no other', async () => {
+  const refused = (reply: unknown) => createCoreClient(scripted(reply)).planSessionStop('g', 's-1');
+  for (const reason of ['engine', 'program_missing', 'program_not_executable']) assert.deepEqual(await refused({ ok: false, code: 'ENGINE_NOT_FOUND', reason }), { ok: false, code: 'ENGINE_NOT_FOUND', reason }, reason);
+  for (const reason of ['program_missing', 'not_executable', 'folder_unusable', 'shutting_down', 'timed_out', 'other']) {
+    assert.deepEqual(await refused({ ok: false, code: 'ENGINE_START_FAILED', reason }), { ok: false, code: 'ENGINE_START_FAILED', reason }, reason);
+  }
+  for (const bad of [undefined, '', 'folder', 'Engine', 5, null, 'not_executable', 'duplicate_key']) {
+    await assert.rejects(refused({ ok: false, code: 'ENGINE_NOT_FOUND', ...(bad === undefined ? {} : { reason: bad }) }), CoreProtocolError, `not found with ${String(bad)}`);
+  }
+  for (const bad of [undefined, '', 'folder', 'Other', 5, null, 'program_not_executable', 'engine']) {
+    await assert.rejects(refused({ ok: false, code: 'ENGINE_START_FAILED', ...(bad === undefined ? {} : { reason: bad }) }), CoreProtocolError, `start failed with ${String(bad)}`);
+  }
+});
+
+test('a list of sessions is at most as long as a host keeps: 320 pass, and 321 are refused', async () => {
+  const many = (count: number) => Array.from({ length: count }, (_, index) => ({ ...SESSION, id: `s-${index}` }));
+  const result = await listing(many(320));
+  assert.ok(result.ok);
+  assert.equal(result.value.length, 320);
+  await assert.rejects(listing(many(321)), protocolError('bowerloom.sessions.list'));
+});
+
+/** The other lists of the client are read with the same reader: an iterator, a subclass, and an accessor are not followed. */
+test('every list in every reply is read by index from own data properties, for the grants, audit, layout, route, and Gauge calls too', async () => {
+  class Sub extends Array {}
+  const iterating = (list: unknown[]) => { const copy = [...list, { bad: true }]; Object.defineProperty(copy, Symbol.iterator, { value: function* () { yield* list; } }); return copy; };
+  const accessor = (list: unknown[]) => { const copy = [...list]; Object.defineProperty(copy, 0, { get() { return list[0]; }, enumerable: true }); return copy; };
+  const calls: readonly (readonly [string, (client: ReturnType<typeof createCoreClient>) => Promise<unknown>, unknown[]])[] = [
+    ['listGauges', client => client.listGauges(), [{ id: 'a', title: 'A', version: '1.0.0', kind: 'ui', origin: 'stock', protected: false }]],
+    ['listRoutes', client => client.listRoutes(), ['/gauges/a']],
+    ['listGrants', client => client.listGrants('a'), [{ permission: 'engines.read', manifestHash: null, folderHash: null }]],
+    ['listLayoutRevisions', client => client.listLayoutRevisions(), []],
+  ];
+  for (const [name, call, good] of calls) {
+    assert.ok((await call(createCoreClient(ok(good)))) !== undefined, name);
+    if (good.length === 0) continue;
+    for (const [label, bad] of [['subclass', Sub.from(good)], ['iterator', iterating(good)], ['accessor', accessor(good)]] as const) {
+      await assert.rejects(call(createCoreClient(ok(bad))), CoreProtocolError, `${name} ${label}`);
+    }
+  }
+  const audit = { entries: [{ seq: 1, at: '2026-01-01T00:00:00.000Z', action: 'grant', via: 'plan', id: 'a', version: '1.0.0', permission: 'engines.read', manifestHash: null, folderHash: null }], firstSeq: 1, droppedCount: 0, auditFailed: false };
+  for (const [label, bad] of [['subclass', Sub.from(audit.entries)], ['iterator', iterating(audit.entries)], ['accessor', accessor(audit.entries)]] as const) {
+    await assert.rejects(createCoreClient(ok({ ...audit, entries: bad })).readAudit(), CoreProtocolError, `readAudit ${label}`);
+  }
+});
+
+test('the lists of an outgoing call are copied from the caller by index too: a hostile list is a TypeError, and a plan whose list cannot be read is sent without it', async () => {
+  class Sub extends Array {}
+  const core = scripted({ ok: false, code: 'UNKNOWN_GAUGE' });
+  const client = createCoreClient(core);
+  await assert.rejects(client.planGrant('a', Sub.from(['engines.read'])), TypeError);
+  await assert.rejects(client.revoke('a', Sub.from(['engines.read'])), TypeError);
+  const accessor = ['engines.read'];
+  Object.defineProperty(accessor, 0, { get() { return 'engines.read'; }, enumerable: true });
+  await assert.rejects(client.planGrant('a', accessor), TypeError);
+  await assert.rejects(client.planSessionStart('g', { engine: 'e', folder: '/f', variables: Sub.from(['A']) }), TypeError);
+  assert.equal(core.calls.length, 0, 'nothing was sent');
+  const hostile = { ...START, steps: accessor } as unknown as SessionPlan;
+  await client.applySession(hostile, 'approval');
+  const sent = (core.calls[0]?.params as { plan: Record<string, unknown> }).plan;
+  assert.equal(Object.hasOwn(sent, 'steps'), false, 'a list that cannot be read is not sent');
 });

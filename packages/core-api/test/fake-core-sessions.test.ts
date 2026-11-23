@@ -90,7 +90,7 @@ test('a core with no engine host refuses every engine as not found', async () =>
   }
   const grant = must(await client.planGrant(GAUGE, ['sessions.start']));
   must(await client.applyGrant(grant, core.approve(grant.nonce)));
-  assert.deepEqual(await client.planSessionStart(GAUGE, { engine: ENGINE, folder: '/work/alpha' }), { ok: false, code: 'ENGINE_NOT_FOUND' });
+  assert.deepEqual(await client.planSessionStart(GAUGE, { engine: ENGINE, folder: '/work/alpha' }), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'engine' });
 });
 
 test('a second approval is for a plan that names another engine in its folder, and for a plan that is still current', async t => {
@@ -213,7 +213,9 @@ test('a plan for a shared folder is a changed plan once the other engine has gon
   assert.deepEqual(shared.sharedWith, [ENGINE]);
   const approval = fake.approve(shared.nonce), second = fake.approveShared(shared.nonce);
   // The first engine goes by itself, not through the core, so the core has no applied step and every approval is still good.
-  await rig.host.killAll();
+  const [running] = rig.host.list(ENGINE);
+  assert.ok(running !== undefined);
+  assert.equal((await rig.host.stop(running.id)).ok, true);
   assert.deepEqual(await client.applySession(shared, approval, second), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
   assert.equal(rig.host.launched, 1);
 });
@@ -271,4 +273,32 @@ test('the lists of a plan that is sent back are read by index, from own data pro
     assert.deepEqual(await apply({ ...planned, [key]: iterating }), changed, `${key} iterator`);
   }
   assert.equal((await apply(planned)).ok, true, 'no refusal used the approval up');
+});
+
+test('the lists of a grant or revoke that is sent in are read by index: a subclass, an iterator, and an accessor are an invalid request', async t => {
+  const { fake } = await ready(t);
+  class Sub extends Array {}
+  const accessor = ['sessions.read'];
+  Object.defineProperty(accessor, 0, { get() { return 'sessions.read'; }, enumerable: true });
+  const iterating = ['sessions.read', 'extra'];
+  Object.defineProperty(iterating, Symbol.iterator, { value: function* () { yield 'sessions.read'; } });
+  for (const [label, list] of [['subclass', Sub.from(['sessions.read'])], ['accessor', accessor], ['iterator', iterating]] as const) {
+    assert.deepEqual(await fake.call('bowerloom.grants.plan', { id: GAUGE, permissions: list }), { ok: false, code: 'GAUGE_GRANT_MISSING', reason: label === 'iterator' ? 'unknown_permission' : 'invalid_request' }, `plan ${label}`);
+    assert.deepEqual(await fake.call('bowerloom.grants.revoke', { id: GAUGE, permissions: list }), { ok: false, code: 'GAUGE_GRANT_MISSING', reason: label === 'iterator' ? 'unknown_permission' : 'invalid_request' }, `revoke ${label}`);
+  }
+});
+
+test('the steps of an old lifecycle, grant, or layout plan that is sent back are read by index too', async t => {
+  const { client, fake } = await ready(t);
+  const grant = must(await client.planGrant(GAUGE, ['sessions.read']));
+  const approval = fake.approve(grant.nonce);
+  class Sub extends Array {}
+  const accessor = [...grant.steps];
+  Object.defineProperty(accessor, 0, { get() { return grant.steps[0]; }, enumerable: true });
+  const iterating = [...grant.steps, 'extra'];
+  Object.defineProperty(iterating, Symbol.iterator, { value: function* () { yield* grant.steps; } });
+  for (const hostile of [Sub.from(grant.steps), accessor, iterating]) {
+    assert.deepEqual(await fake.call('bowerloom.grants.apply', { plan: { ...grant, steps: hostile }, approval }), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+  }
+  assert.equal((await fake.call('bowerloom.grants.apply', { plan: grant, approval })).ok, true);
 });
