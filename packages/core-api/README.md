@@ -274,7 +274,7 @@ The `steps` of a job plan and of a run plan are the text the person approves. Th
 
 ### What is not covered
 
-Relay routes between the sessions of a run (ticket 8 of the W4 list); the traces of a run; stopping a whole run in one plan (each session is stopped with its own plan); delivering the task and the harness to the engine; a check that a harness exists; a refusal that names the session that cannot start; a Jobs Gauge; saving jobs on disk; and the call identity work (who may call these methods).
+Relay between the sessions of a run: the rules, the bus, and the fake engine pair are in `packages/relay` (ticket 8 of the W4 list), and the routes of a job, the relay calls, and the relay start of a run are not carried here; the traces of a run; stopping a whole run in one plan (each session is stopped with its own plan); delivering the task and the harness to the engine; a check that a harness exists; a refusal that names the session that cannot start; a Jobs Gauge; saving jobs on disk; and the call identity work (who may call these methods).
 
 ## What the client checks in a reply
 

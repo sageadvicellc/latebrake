@@ -2,7 +2,7 @@
 
 Jobs and runs (v0.9.1). A job is a saved definition of AI work. A run is one execution of a job: a group of sessions that start from one approved plan. This package holds the rules. `packages/core-api` carries them over the seam, with the plans, the grants, and the approvals, and asks the Engine Host (`packages/engine-sessions`) to start the sessions. This README is the contract.
 
-Out of scope here: relay routes between the sessions of a run, the traces of a run, a Jobs Gauge, schedules, and unattended runs. The Core API refuses a schedule and an unattended run.
+Out of scope here: relay routes between the sessions of a run (the rules and the bus are in `packages/relay`; the job definition holds no route), the traces of a run, a Jobs Gauge, schedules, and unattended runs. The Core API refuses a schedule and an unattended run.
 
 ## The job definition
 
@@ -65,7 +65,7 @@ The engine codes of a run are those of the sessions (`packages/engine-sessions`)
 
 ## Not built
 
-Relay routes inside a job (ticket 8), traces of a run, stopping a whole run, delivering the task to the engine (needs the message paths of the adapters), a check that a harness exists, a refusal that names the session that failed, a Jobs Gauge, and persistence of jobs on disk.
+Relay routes inside a job definition, in a job plan, and in a run (`packages/relay` checks routes against the labels of a job and carries the messages, and nothing here calls it), traces of a run, stopping a whole run, delivering the task to the engine (needs the message paths of the adapters), a check that a harness exists, a refusal that names the session that failed, a Jobs Gauge, and persistence of jobs on disk.
 
 ## Tests
 

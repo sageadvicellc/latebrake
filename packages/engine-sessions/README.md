@@ -2,7 +2,7 @@
 
 The engine sessions of the Engine Host (v0.9.1): the session states and their legal moves, the session machine, the host that starts, watches, and stops sessions, and a process launcher. It holds the rules of the cap, of one session for each engine and folder pair, and of a folder that two engines share. The Core API carries it over the seam: `packages/core-api` holds the plans and the approvals, and asks the host to do what the person approved. This README is the contract.
 
-Out of scope here: real engine adapters, model sources and keys, relay, traces, the terminal pane, and the app. The fake engines of the tests stand in for real ones.
+Out of scope here: real engine adapters, model sources and keys, relay (see `packages/relay`), traces, the terminal pane, and the app. The fake engines of the tests stand in for real ones.
 
 ## Session states
 
