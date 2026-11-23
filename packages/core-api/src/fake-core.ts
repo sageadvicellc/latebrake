@@ -732,8 +732,8 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   const layoutRefusal = (reason: Parameters<typeof layoutInvalid>[0]): Refusal => layoutInvalid(reason);
 
   /**
-   * Plans a change to the layout. Nothing changes. Every check of the change runs here, so the plan the person sees is one that can be applied, with one exception: a counter that is full
-   * (`bad_revision`) is found when the plan is applied. A start that broke inside the reader (`internal`) refuses every plan, so nothing overwrites a file that the core could not read.
+   * Plans a change to the layout. Nothing changes. Every check of the change runs here, so the plan the person sees is one that can be applied: a change that would write a revision is
+   * refused with `bad_revision` when the revision counter is full, as applying it would. A start that broke inside the reader (`internal`) refuses every plan, so nothing overwrites a file that the core could not read.
    */
   function planLayout(params: Readonly<Record<string, unknown>>): LayoutPlanned {
     const kind = params['kind'];
@@ -790,6 +790,8 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
         break;
       }
     }
+    // A change that would write a revision cannot be applied at a full counter, so the plan is refused now. A lifecycle step is never refused for it: its plan says that it replaces in place.
+    if (layoutSaved !== null && layoutSaved.revision >= MAX_REVISION && canonicalText(next) !== canonicalText(base)) return layoutRefusal('bad_revision');
     const baseHash = sha256(canonicalText(base)), nextHash = sha256(canonicalText(next));
     const place = (kind === 'swap' || kind === 'default') && typeof placeParam === 'string' ? placeParam : null;
     const gauge = (kind === 'swap' || kind === 'propose') && typeof gaugeParam === 'string' ? gaugeParam : null;

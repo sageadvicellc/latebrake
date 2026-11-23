@@ -44,6 +44,8 @@ export const LAYOUT_FOLDERS: readonly GaugeFolder[] = [
   { name: 'guard-folder', location: 'bundled', manifest: manifestOf({ id: 'fixture-guard', title: 'Fixture Guard', protected: true, tile: { expandable: false, resizable: false, entry: 'ui/tile.js' } }), files: { 'ui/tile.js': FILE } },
   // A stock update that makes Jobs protected.
   { name: 'jobs-protected', location: 'bundled', manifest: manifestOf({ id: 'jobs', title: 'Jobs', version: '2.0.0', protected: true, tile: { expandable: false, resizable: true, entry: 'ui/tile.js', sizes: ['large', 'medium', 'full'] } }), files: { 'ui/tile.js': FILE } },
+  // A stock update that makes Engines and usage protected.
+  { name: 'engines-protected', location: 'bundled', manifest: manifestOf({ id: 'engines-usage', title: 'Engines and usage', version: '2.0.0', protected: true, tile: { expandable: false, resizable: true, entry: 'ui/tile.js', sizes: ['large', 'medium', 'full'] } }), files: { 'ui/tile.js': FILE } },
   // A Gauge that tries to take the id of the Settings page.
   { name: 'settings-folder', location: 'user', manifest: manifestOf({ id: 'settings', title: 'Fixture Settings', tile: { expandable: false, resizable: true, entry: 'ui/tile.js' } }), files: { 'ui/tile.js': FILE } },
 ];

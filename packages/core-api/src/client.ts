@@ -252,6 +252,16 @@ function layoutPlanOf(value: unknown): LayoutPlan | undefined {
   return Object.freeze({ action, kind: kind as LayoutKind, place, gauge, revision: revision, text, steps: Object.freeze(steps), digest, baseHash, nextHash, nonce });
 }
 
+/** A copy of a plan to send: its own properties, with each named list copied. A list that the plan only inherits is not sent, so the core refuses the plan as incomplete. */
+function ownLists(plan: object, keys: readonly string[]): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...plan };
+  for (const key of keys) {
+    const list = Object.hasOwn(plan, key) ? (plan as Record<string, unknown>)[key] : undefined;
+    if (Array.isArray(list)) copy[key] = [...(list as unknown[])];
+  }
+  return copy;
+}
+
 /** Builds the client on a core: the fake core now, the real core later. */
 export function createCoreClient(core: Core): CoreClient {
   /** Calls the core, then reads the reply. A throw from the call itself reaches the caller unchanged. A throw while reading the reply is a protocol error. */
@@ -370,7 +380,7 @@ export function createCoreClient(core: Core): CoreClient {
     planLayoutDefault: place => layoutPlanning({ kind: 'default', place }),
     planLayoutRestore: revision => layoutPlanning({ kind: 'restore', revision }),
     planLayoutPropose: gauge => layoutPlanning({ kind: 'propose', gauge }),
-    applyLayout: (plan, approval) => ask('bowerloom.layout.apply', { plan: { ...plan, steps: [...plan.steps] }, ...(approval === undefined ? {} : { approval }) }, (method, result) => {
+    applyLayout: (plan, approval) => ask('bowerloom.layout.apply', { plan: ownLists(plan, ['steps']), ...(approval === undefined ? {} : { approval }) }, (method, result) => {
       if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not an applied layout change');
       const kind = own(result, 'kind'), revision = own(result, 'revision'), changed = own(result, 'changed');
       if (typeof kind !== 'string' || !KINDS.includes(kind) || !POSITIVE(revision) || typeof changed !== 'boolean') throw new CoreProtocolError(method, 'result is not an applied layout change');
@@ -391,7 +401,7 @@ export function createCoreClient(core: Core): CoreClient {
     planEnable: id => planning('enable', { id }),
     planDisable: id => planning('disable', { id }),
     planRemove: id => planning('remove', { id }),
-    applyPlan: (plan, approval) => ask('bowerloom.gauges.apply', { plan: { ...plan, steps: [...plan.steps] }, ...(approval === undefined ? {} : { approval }) }, (method, result) => {
+    applyPlan: (plan, approval) => ask('bowerloom.gauges.apply', { plan: ownLists(plan, ['steps']), ...(approval === undefined ? {} : { approval }) }, (method, result) => {
       const applied = appliedOf(result);
       if (!applied) throw new CoreProtocolError(method, 'result is not an applied plan');
       if (applied.action !== plan.action || applied.id !== plan.id) throw new CoreProtocolError(method, 'result is for another plan');
@@ -412,7 +422,7 @@ export function createCoreClient(core: Core): CoreClient {
       if (!sameList(plan.permissions, [...permissions].sort())) throw new CoreProtocolError(method, 'result is a plan for other permissions than were asked');
       return plan;
     }),
-    applyGrant: (plan, approval) => ask('bowerloom.grants.apply', { plan: { ...plan, permissions: [...plan.permissions], steps: [...plan.steps] }, ...(approval === undefined ? {} : { approval }) }, (method, result) => {
+    applyGrant: (plan, approval) => ask('bowerloom.grants.apply', { plan: ownLists(plan, ['permissions', 'steps']), ...(approval === undefined ? {} : { approval }) }, (method, result) => {
       if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not an applied grant');
       const id = own(result, 'id'), permissions = permissionNames(own(result, 'permissions'));
       if (typeof id !== 'string' || !permissions) throw new CoreProtocolError(method, 'result is not an applied grant');
