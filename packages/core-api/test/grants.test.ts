@@ -112,8 +112,8 @@ test('a grant plan for the three jobs permissions says what each one really give
   assert.deepEqual(grantSteps({ id: 'fixture-jobber', version: '1.0.0', permissions: ['jobs.read', 'jobs.run', 'jobs.write'], engines: ['fixture-engine'], ...HASHES }), [
     'grant 3 permissions to fixture-jobber 1.0.0',
     'permission jobs.read (read): Read every saved job, with the folder and the task text of each session, and the runs of the jobs.',
-    'permission jobs.run (act): Ask for a plan to run a job, which also needs the start-session grant for the engine of each session. The Gauge never skips the plan.',
-    'permission jobs.write (write): Ask for a plan to create, change, or delete a job, and see the title of that job in the plan. The Gauge never skips the plan.',
+    'permission jobs.run (act): Ask for a plan to run a job, and see its folders, programs, and tasks; each engine needs a start grant. The Gauge never skips the plan.',
+    'permission jobs.write (write): Ask for a plan to create, change, or delete a job; the plan shows its old title, session count, and hash. The Gauge never skips the plan.',
     'engines: fixture-engine',
     `bind the grant to manifest ${A} and folder ${B}`,
   ]);

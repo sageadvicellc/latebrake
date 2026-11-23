@@ -56,27 +56,30 @@ function sessionLines(session: JobSession, index: number): string[] {
  */
 export function jobSteps(input: JobStepsInput): string[] {
   const gauge = escapeForPlan(input.gauge);
-  const job = input.job === null ? '' : escapeForPlan(input.job);
-  const shown = input.definition ?? input.before;
-  const count = shown?.sessions.length ?? 0;
+  // A plan holds what its kind needs: a create and an update hold the new definition, an update and a delete hold the job and the job as it is. A plan that lacks one is a bug of the caller.
+  const needDefinition = (): JobDefinition => { if (input.definition === null) throw new Error(`a ${input.kind} plan needs the definition`); return input.definition; };
+  const needBefore = (): JobDefinition => { if (input.before === null || input.job === null) throw new Error(`an ${input.kind} plan needs the id of the job and the job as it is`); return input.before; };
+  const job = input.kind === 'create' ? '' : escapeForPlan(input.job ?? '');
+  const shown = input.kind === 'delete' ? needBefore() : needDefinition();
+  const count = shown.sessions.length;
   const head = input.kind === 'create'
-    ? `Gauge ${gauge} asks to create a job: ${escapeForPlan(input.definition?.title ?? '')}`
+    ? `Gauge ${gauge} asks to create a job: ${escapeForPlan(needDefinition().title)}`
     : input.kind === 'update'
-      ? `Gauge ${gauge} asks to replace the job ${job}, ${escapeForPlan(input.before?.title ?? '')}, with the job below`
-      : `Gauge ${gauge} asks to delete the job ${job}, ${escapeForPlan(input.before?.title ?? '')}`;
+      ? `Gauge ${gauge} asks to replace the job ${job}, ${escapeForPlan(needBefore().title)}, with the job below`
+      : `Gauge ${gauge} asks to delete the job ${job}, ${escapeForPlan(needBefore().title)}`;
   const tail = input.kind === 'create'
     ? ['a job is a saved definition: creating it starts no session, and a run needs a plan of its own', HARNESS_LINE, 'the core makes the id of the job when you approve']
     : input.kind === 'update'
       ? ['the job keeps its id, and a run that began already is not changed', HARNESS_LINE]
       : ['deleting a job stops no session: a run that began already goes on, and it keeps the title of the job'];
-  const before = input.before?.sessions.length ?? 0;
+  const before = input.kind === 'update' ? needBefore().sessions.length : 0;
   return [
     head,
-    ...(input.kind === 'update' ? [`new title: ${escapeForPlan(input.definition?.title ?? '')}`] : []),
+    ...(input.kind === 'update' ? [`new title: ${escapeForPlan(needDefinition().title)}`] : []),
     input.kind === 'update'
       ? `the job held ${before} ${plural(before, 'session', 'sessions')} and will hold ${count} ${plural(count, 'session', 'sessions')}`
       : `the job holds ${count} ${plural(count, 'session', 'sessions')}`,
-    ...(input.definition?.sessions ?? []).flatMap(sessionLines),
+    ...(input.kind === 'delete' ? [] : needDefinition().sessions.flatMap(sessionLines)),
     ...tail,
     `bind the change to job ${input.baseHash ?? 'none'} and result ${input.nextHash ?? 'none'}`,
   ];

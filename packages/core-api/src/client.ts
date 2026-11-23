@@ -147,7 +147,7 @@ export interface CoreClient {
    * Applies a run plan: every session of the run starts, or none stays running. It needs the person's approval (`approval`), and a plan with `shared` needs the second approval too (`sharedApproval`), once for the whole run.
    * The call waits until every session has said that it runs. When a session fails, ends before it says it runs, or does not say so in time, the others are stopped and the refusal is that first failure (`ENGINE_START_FAILED` with its
    * reason), with `member` (the session) and `run` (the id of the run, which stays recorded and reads as a group that ended). When a session that started cannot be stopped, the refusal is `GAUGE_RUN_ROLLBACK_FAILED` with the same `run` and
-   * `member` and the reason of the first failure as `cause`: that session is left running, and the person stops it.
+   * `member` (the session that failed first, which may not be the one that stays) and the reason of the first failure as `cause`: a session of the run is left running, and the person stops it.
    * A start gives the run as a group of its sessions.
    */
   applyRun(plan: RunPlan, approval?: string, sharedApproval?: string): Promise<CoreResult<RunSummary>>;

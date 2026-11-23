@@ -8,8 +8,8 @@ import {
   MAX_REVISION, PAGE_IDS, canonicalText, checkLayout, defaultLayout, droppedRevision, layoutObject, newFile, parseLayout, parseLayoutFile, proposeTile, reconcileLayout, saveRevision, serializeLayoutFile, swapPlace, defaultPlace, tileInfoOf, invalid as layoutInvalid,
   type GaugeInfo, type Layout, type LayoutFile, type LayoutRefusal, type TileInfo, type UnknownGaugeRefusal,
 } from '../../gauge-layout/src/index.js';
-import { BILLING_SOURCES, checkModel, checkSessionId, createEngineHost, readList, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
-import { MAX_JOB_SESSIONS, checkDefinition, hashDefinition, type JobDefinition } from '../../jobs/src/definition.js';
+import { checkModel, checkSessionId, createEngineHost, isBilling, readList, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
+import { MAX_JOB_SESSIONS, checkDefinition, hashDefinition, type DefinitionRefusal, type JobDefinition } from '../../jobs/src/definition.js';
 import { checkJobId, createJobStore, type Job } from '../../jobs/src/store.js';
 import { createRunBook, type PlannedRun, type RunOutcome, type RunRefusal, type RunView } from '../../jobs/src/runs.js';
 import { isRunId } from '../../jobs/src/ids.js';
@@ -903,7 +903,6 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     'session', plan.action, plan.gauge, plan.engine, plan.folder, plan.session, plan.program, plan.model === null ? null : [plan.model.provider, plan.model.model], plan.billing, plan.variables, plan.sharedWith, plan.force, plan.steps,
   ]));
   const isSessionAction = (value: unknown): value is SessionAction => typeof value === 'string' && (SESSION_ACTIONS as readonly string[]).includes(value);
-  const isBilling = (value: unknown): value is Billing => typeof value === 'string' && (BILLING_SOURCES as readonly string[]).includes(value);
   /** A session as it goes over the seam: a new object each time, with no output of the engine. */
   const sessionObject = (info: SessionInfo) => ({
     id: info.id, engine: info.engine, folder: info.folder, state: info.state, billing: info.billing, model: info.model === null ? null : { provider: info.model.provider, model: info.model.model }, failure: info.failure,
@@ -1049,9 +1048,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     return keys.some(key => !known.includes(key)) ? jobInvalid('request') : undefined;
   }
   /** The refusal of the definition check as the core gives it. */
-  const definitionRefusal = (refused: Exclude<ReturnType<typeof checkDefinition>, { readonly ok: true }>): Refusal => (refused.code === 'GAUGE_JOB_INVALID'
-    ? { ok: false, code: refused.code, reason: refused.reason }
-    : { ok: false, code: refused.code, reason: refused.reason });
+  const definitionRefusal = (refused: DefinitionRefusal): Refusal => refused;
   const hashOf = (definition: JobDefinition | null): string | null => (definition === null ? null : hashDefinition(definition));
   /** A definition as it goes over the seam: new objects each time. */
   const definitionObject = (definition: JobDefinition) => ({

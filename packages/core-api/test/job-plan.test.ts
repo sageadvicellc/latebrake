@@ -152,3 +152,11 @@ test('a job of one session says so in the singular, in a create and in a delete'
   assert.equal(jobSteps({ ...CREATE, definition: one.value })[1], 'the job holds 1 session');
   assert.equal(jobSteps({ kind: 'delete', gauge: 'g', job: 'job-1', before: one.value, definition: null, baseHash: HASH_A, nextHash: null })[1], 'the job holds 1 session');
 });
+
+test('a plan that is missing the definition or the job it needs is a bug of the caller, and throws, and never prints a blank title', () => {
+  assert.throws(() => jobSteps({ ...CREATE, definition: null }), /definition/);
+  assert.throws(() => jobSteps({ kind: 'update', gauge: 'g', job: 'job-1', before: defined(), definition: null, baseHash: HASH_A, nextHash: HASH_B }), /definition/);
+  assert.throws(() => jobSteps({ kind: 'update', gauge: 'g', job: 'job-1', before: null, definition: defined(), baseHash: HASH_A, nextHash: HASH_B }), /job/);
+  assert.throws(() => jobSteps({ kind: 'delete', gauge: 'g', job: 'job-1', before: null, definition: null, baseHash: HASH_A, nextHash: null }), /job/);
+  assert.throws(() => jobSteps({ kind: 'delete', gauge: 'g', job: null, before: defined(), definition: null, baseHash: HASH_A, nextHash: null }), /id/);
+});

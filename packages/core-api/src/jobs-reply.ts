@@ -1,7 +1,7 @@
 import { checkEngineId, checkFolder, checkModel, checkSessionId, readList } from '../../engine-sessions/src/request.js';
 import { SESSION_STATES } from '../../engine-sessions/src/states.js';
 import { hasPlanUnsafeChar, hasUnsafeChar } from '../../engine-sessions/src/text.js';
-import { BILLING_SOURCES, type Billing } from '../../engine-sessions/src/vocab.js';
+import { isBilling } from '../../engine-sessions/src/vocab.js';
 import { MAX_JOB_SESSIONS, canonicalDefinition, checkDefinition, checkTaskText, hashDefinition, isLabel, isTitle, type JobDefinition } from '../../jobs/src/definition.js';
 import { checkJobId, isRunId } from '../../jobs/src/ids.js';
 import type { RunSessionPlan } from '../../jobs/src/runs.js';
@@ -14,7 +14,6 @@ import { JOB_KINDS, type JobKind, type JobListing, type JobPlan, type JobRecord,
  */
 
 const isJobKind = (value: unknown): value is JobKind => typeof value === 'string' && (JOB_KINDS as readonly string[]).includes(value);
-const isBilling = (value: unknown): value is Billing => typeof value === 'string' && (BILLING_SOURCES as readonly string[]).includes(value);
 const isRunState = (value: unknown): value is RunSessionSummary['state'] => typeof value === 'string' && (value === 'forgotten' || value === 'hidden' || (SESSION_STATES as readonly string[]).includes(value));
 const MAX_TITLE_OF_ENGINE = 64;
 
