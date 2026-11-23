@@ -896,3 +896,26 @@ test('the client reads each own list of a plan once, through its data property: 
   assert.throws(() => client.applyPlan(null as never, 'a'), TypeError);
   assert.throws(() => client.applyPlan(undefined as never, 'a'), TypeError);
 });
+
+test('a plan whose JSON has a __proto__ key and no own list is sent with that key as an own property, and never with the list by inheritance', async () => {
+  const calls: Record<string, unknown>[] = [];
+  const spy = { call: async (_method: string, params: Record<string, unknown>) => { calls.push(params); return { ok: false as const, code: 'GAUGE_PLAN_CHANGED' }; } };
+  const client = createCoreClient(spy as never);
+  const A = 'a'.repeat(64);
+  const inherited = '"__proto__":{"steps":["x"],"permissions":["engines.read"]}';
+  const lifecycle = JSON.parse(`{"action":"install","id":"x","folder":"f","from":null,"to":"1.0.0","origin":"user","digest":"${A}","manifestHash":"${A}","folderHash":"${A}","nonce":"${A}",${inherited}}`) as unknown;
+  const grant = JSON.parse(`{"action":"grant","id":"x","version":"1.0.0","digest":"${A}","manifestHash":"${A}","folderHash":"${A}","nonce":"${A}",${inherited}}`) as unknown;
+  const layout = JSON.parse(`{"action":"layout","kind":"swap","place":"p","gauge":"g","revision":null,"text":null,"digest":"${A}","baseHash":"${A}","nextHash":"${A}","nonce":"${A}",${inherited}}`) as unknown;
+  await client.applyPlan(lifecycle as never, 'a');
+  await client.applyGrant(grant as never, 'a');
+  await client.applyLayout(layout as never, 'a');
+  for (const call of calls) {
+    const sent = call['plan'] as Record<string, unknown>;
+    assert.equal(Object.getPrototypeOf(sent), Object.prototype);
+    assert.equal(Object.hasOwn(sent, '__proto__'), true);
+    assert.equal(sent['steps'], undefined);
+    assert.equal(sent['permissions'], undefined);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(sent, '__proto__')?.value, { steps: ['x'], permissions: ['engines.read'] });
+  }
+  assert.equal(calls.length, 3);
+});

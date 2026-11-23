@@ -263,7 +263,8 @@ function ownLists(plan: object, keys: readonly string[]): Record<string, unknown
     // `Object.keys` lists the enumerable own string keys only, so a hidden property is never seen. An accessor has no `value`, and is skipped without being read.
     if (!descriptor || !('value' in descriptor)) continue;
     const value: unknown = descriptor.value;
-    copy[key] = keys.includes(key) && Array.isArray(value) ? [...(value as unknown[])] : value;
+    // A key such as `__proto__` stays an own data property of the copy: it is defined, and not assigned, so it never changes the prototype of the copy.
+    Object.defineProperty(copy, key, { value: keys.includes(key) && Array.isArray(value) ? [...(value as unknown[])] : value, enumerable: true, writable: true, configurable: true });
   }
   return copy;
 }

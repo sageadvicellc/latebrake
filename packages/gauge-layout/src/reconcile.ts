@@ -20,9 +20,10 @@ export interface ReconcileOptions {
  * Brings a layout back in line with the Gauges the core holds, after a lifecycle step changed them. The core does this inside the same approved plan, and saves the result as a normal revision.
  *
  * - A Gauge that is disabled, removed, or has lost its tile leaves its tile. The place goes back to its default Gauge when that Gauge is enabled, has a tile, is not hidden, is not on another
- *   tile, and has a size that fits (the size of the place first, then its manifest order). Otherwise the tile is dropped, and it stays gone: a restore of an earlier revision brings it back.
+ *   tile, and has a size that fits (the size of the place first, then the order of its manifest). Otherwise the tile is dropped, and it stays gone: a restore of an earlier revision brings it back.
  *   A Gauge that is enabled and lost only its tile goes to the shelf.
- * - A tile whose Gauge no longer allows its size takes the first allowed size that is no bigger than the tile and that fits, in the same cell. When none does, the Gauge goes to the shelf.
+ * - A tile whose Gauge no longer allows its size takes the first allowed size, in the order of its manifest, that is no bigger than the tile, in the same cell. Such a size always fits (the four
+ *   sizes are nested rectangles anchored at the top left). When the Gauge allows none, it goes to the shelf.
  * - A place that is for a protected Gauge (its default became protected, or it is a place of the default home for one) and that another Gauge fills gives the place back to the protected
  *   Gauge. A protected Gauge on the shelf takes the place, and the Gauge that was there goes to the shelf. A protected Gauge on another tile exchanges places with it. When neither fits, the
  *   tile is dropped and the Gauge that was there goes to the shelf.
@@ -75,12 +76,11 @@ export function reconcileLayout(layout: Layout, table: GaugeTable, options: Reco
     const home = DEFAULT_TILES.find(candidate => candidate.place === tile.place && candidate.gauge !== tile.gauge && isProtected(candidate.gauge));
     return home?.gauge;
   };
-  // Why this ends. A claim is a place that is for a protected Gauge that it does not hold. Only a Gauge that became protected can be claimed. Such a Gauge is claimed by at most its own place of the
-  // default home and by the places that name it as their default. A repair settles one claim: it puts the protected Gauge into the place, or drops the tile. In an exchange the other tile gets the
-  // displaced Gauge, and when its old default was the protected Gauge it takes the displaced Gauge as its default, so it does not claim the Gauge again. It may still claim another protected Gauge
-  // through its own place or its default, and that claim is settled in its turn. A claim is settled in at most three rounds: its own repair, the repair of the claim that its exchange hands to
-  // another tile, and one more for the claim that this one hands on. So the loop ends within three rounds for each tile, and the bound is three rounds for each tile and one more. The bound is only a
-  // guard: when it is reached there is a bug, and the check at the end throws.
+  // Why this ends. The input layout is valid under the table from before the step, so a place can only claim a Gauge that became protected in this step. A claim is a place that is for such a Gauge
+  // that it does not hold. A Gauge is claimed by at most its own place of the default home and by the places that name it as their default. A repair settles one claim: it puts the protected Gauge
+  // into the place, or drops the tile. In an exchange the other tile gets the displaced Gauge, and when its old default is any protected Gauge it takes the displaced Gauge as its default, so it does not
+  // claim that Gauge again. It may still claim a protected Gauge through its own place of the default home, and that claim is settled in its turn. Measured, a tile needs at most two rounds. The bound is
+  // three rounds for each tile and one more, which keeps slack, and it is only a guard: when it is reached there is a bug, and the check at the end throws.
   const bound = 3 * placed.length + 1;
   for (let round = 0; round <= bound; round += 1) {
     const holder = placed.find(tile => claim(tile) !== undefined);

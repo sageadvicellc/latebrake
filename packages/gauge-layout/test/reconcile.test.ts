@@ -419,3 +419,18 @@ test('a tile that must shrink takes the first size of the manifest that is no bi
   const reversed = changed('library', { tile: { resizable: true, sizes: ['small', 'medium'] } });
   assert.equal(tileOf(reconcileLayout(big, reversed), 'wide')?.size, 'small');
 });
+
+test('an exchange resets the default of the other place when that default is any protected Gauge, so the place does not claim a third protected Gauge', () => {
+  // Engines holds Projects. Library fills Models, whose default is Tracing, which is on the shelf. Both Library and Tracing are protected.
+  const layout = layoutFrom(copy => ({
+    ...copy,
+    tiles: copy.tiles.map(tile => (tile.place === 'engines' ? { ...tile, gauge: 'projects', default: 'library' } : tile.place === 'models' ? { ...tile, gauge: 'library', default: 'tracing' } : tile)),
+    shelf: copy.shelf.filter(id => id !== 'projects' && id !== 'library'),
+  }));
+  const table = new Map(changed('library', { protected: true })).set('tracing', { ...(TABLE.get('tracing') as GaugeInfo), protected: true });
+  const next = reconcileLayout(layout, table);
+  assert.equal(key(tileOf(next, 'engines')), 'engines library library 0 0 large');
+  assert.equal(key(tileOf(next, 'models')), 'models projects projects 4 1 small');
+  assert.equal(next.shelf.includes('tracing'), true);
+  valid(next, table);
+});
