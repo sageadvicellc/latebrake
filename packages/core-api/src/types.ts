@@ -377,6 +377,8 @@ export const JOB_CODES = Object.freeze(['GAUGE_JOB_UNKNOWN', 'GAUGE_JOB_LIMIT', 
 export type JobCode = (typeof JOB_CODES)[number];
 /** The job codes that always carry a reason. */
 export type JobReasonCode = 'GAUGE_JOB_INVALID' | 'GAUGE_JOB_NOT_INTERACTIVE';
+/** A compile-time check that ties the job codes of this package to the registry: it is `true` only when `JOB_CODES` and `JobReasonCode` are exactly the registry codes that start with `GAUGE_JOB_` or `GAUGE_RUN_`. */
+export type JobCodesMatchRegistry = Exactly<JobCode | JobReasonCode, Extract<GaugeCode, `GAUGE_JOB_${string}` | `GAUGE_RUN_${string}`>>;
 
 export type CoreRefusal =
   | { readonly ok: false; readonly code: EngineCode; readonly reason?: never }
