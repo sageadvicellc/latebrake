@@ -194,7 +194,7 @@ The `steps` are the text the person approves. They are a contract, in this order
 
 Start: `Gauge <gauge> asks for a new session of the engine <engine> (<title>)`; `program: <path>`; `folder: <path>`; `model: <provider> <model>, as the Gauge asks` or `model: the engine's own default, and the core picks none`; `billing source: ...`; `variables passed: <names>` or `none`; `the program gets these variables only, and it starts with an argument list and never through a shell`; `the core never answers a permission prompt of the engine: you answer it yourself`; for a shared folder, the `notice: ...` line and `a second approval is needed, for the shared folder`; and `start the program in the folder, and keep the session until it stops or fails`.
 
-Stop: `Gauge <gauge> asks to stop session <session> of the engine <engine>`; `folder: <path>`; the stop signal line with the wait in milliseconds, or the kill signal line for a session that is stopping already; and `if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT`.
+Stop: `Gauge <gauge> asks to stop session <session> of the engine <engine>`; `folder: <path>`; the stop signal line with the wait in milliseconds, or the kill signal line for a session that is stopping already, or, for a session that has ended but whose program may still run, the line `the session has ended, but its program may still be running: send the kill signal again, ...`; and `if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT`, or, for an ended session, the line that it keeps its state and that its place is free when the program has gone.
 
 ### The second approval
 
