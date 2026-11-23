@@ -53,7 +53,9 @@ export function reconcileLayout(layout: Layout, table: GaugeTable, options: Reco
   const toShelf = new Set<string>();
   for (const tile of resize) {
     const info = usable(tile.gauge);
-    // A size that is no bigger than the tile, in the cell of the tile, is inside the grid and shares no cell with any other tile, so it needs no check against them.
+    // A size that is no bigger than the tile, in the cell of the tile, needs no check against the grid or the other tiles. The four sizes are rectangles that are nested and anchored at the top left
+    // (small in medium in large in full, in cells), so a smaller one lies inside the old one, and the old one was inside the grid and apart from the other tiles, as `layoutOf` required. A test holds
+    // the sizes to this, so a size of another shape fails loudly.
     const next = info ? shrinkTo(tile, info.tile.sizes).map(size => ({ ...tile, size }))[0] : undefined;
     if (next) placed.push(next);
     else { onTiles.delete(tile.gauge); toShelf.add(tile.gauge); }
@@ -73,11 +75,13 @@ export function reconcileLayout(layout: Layout, table: GaugeTable, options: Reco
     const home = DEFAULT_TILES.find(candidate => candidate.place === tile.place && candidate.gauge !== tile.gauge && isProtected(candidate.gauge));
     return home?.gauge;
   };
-  // Why this ends. Each round repairs one tile and gives the other tile of an exchange the default of its own Gauge, so that tile never claims the protected Gauge again. A repair either puts a
-  // protected Gauge into the place that claims it, or drops the tile, and the places of the default home that it fills are never claimed again. So every round strictly lowers the number of
-  // places that are claimed by a protected Gauge that they do not hold, and that number is at most the number of tiles. The bound below is only a guard: when it is reached there is a bug, and the
-  // check at the end throws.
-  const bound = placed.length + 1;
+  // Why this ends. A claim is a place that is for a protected Gauge that it does not hold. Only a Gauge that became protected can be claimed. Such a Gauge is claimed by at most its own place of the
+  // default home and by the places that name it as their default. A repair settles one claim: it puts the protected Gauge into the place, or drops the tile. In an exchange the other tile gets the
+  // displaced Gauge, and when its old default was the protected Gauge it takes the displaced Gauge as its default, so it does not claim the Gauge again. It may still claim another protected Gauge
+  // through its own place or its default, and that claim is settled in its turn. A claim is settled in at most three rounds: its own repair, the repair of the claim that its exchange hands to
+  // another tile, and one more for the claim that this one hands on. So the loop ends within three rounds for each tile, and the bound is three rounds for each tile and one more. The bound is only a
+  // guard: when it is reached there is a bug, and the check at the end throws.
+  const bound = 3 * placed.length + 1;
   for (let round = 0; round <= bound; round += 1) {
     const holder = placed.find(tile => claim(tile) !== undefined);
     if (!holder) break;
@@ -94,8 +98,8 @@ export function reconcileLayout(layout: Layout, table: GaugeTable, options: Reco
       const rest = others.filter(tile => tile !== onTile);
       for (const size of sizesToTry(holder.size, info.tile.sizes)) {
         for (const otherSize of moving ? sizesToTry(onTile.size, moving.tile.sizes) : []) {
-          // The tile that gets the displaced Gauge takes that Gauge as its default. If it kept its own default, and that was the protected Gauge, it would claim it again.
-          const a = { ...holder, gauge: wanted, default: wanted, size }, b = { ...onTile, gauge: holder.gauge, default: holder.gauge, size: otherSize };
+          // The tile that gets the displaced Gauge keeps its own default, unless that default is a protected Gauge: then it takes the displaced Gauge as its default, or it would claim that Gauge again.
+          const a = { ...holder, gauge: wanted, default: wanted, size }, b = { ...onTile, gauge: holder.gauge, default: isProtected(onTile.default) ? holder.gauge : onTile.default, size: otherSize };
           if (!repaired && fitsAmong(a, [...rest, b]) && fitsAmong(b, [...rest, a])) { placed = [...rest, a, b]; repaired = true; }
         }
       }

@@ -348,3 +348,74 @@ test('the shelf stays within its cap: a protected Gauge that must be added pushe
   assert.equal(next.shelf.includes('gauge-manager'), true);
   assert.equal(next.shelf.includes('harnesses'), true);
 });
+
+/** Five places that each hold a plain Gauge `g<n>` and have a default `d<n>`. Flipping the first `flips` home Gauges and defaults to protected gives every one of those places two claims. */
+const claimed = (flips: number, extraProtected: readonly string[] = []) => {
+  const homeIds = ['engines-usage', 'jobs', 'harnesses', 'local-models', 'memory-explorer'];
+  const places = ['engines', 'jobs', 'harnesses', 'models', 'memory'];
+  const cells = [[0, 0], [2, 0], [4, 0], [4, 1], [5, 1]] as const;
+  const plain = (isProtected: boolean): GaugeInfo => ({ enabled: true, protected: isProtected, tile: { resizable: true, sizes: ['small', 'medium', 'large', 'full'] } });
+  const table = new Map<string, GaugeInfo>();
+  for (const id of [...homeIds, 'd1', 'd2', 'd3', 'd4', 'd5', 'g1', 'g2', 'g3', 'g4', 'g5']) table.set(id, plain(false));
+  for (let index = 0; index < flips; index += 1) { table.set(homeIds[index] as string, plain(true)); table.set(`d${index + 1}`, plain(true)); }
+  for (const id of extraProtected) table.set(id, plain(true));
+  const layout = layoutFrom(() => ({
+    ...HOME,
+    tiles: places.map((place, index) => ({ place, gauge: `g${index + 1}`, default: `d${index + 1}`, col: cells[index]?.[0] ?? 0, row: cells[index]?.[1] ?? 0, size: 'small' })),
+    shelf: ['settings', ...homeIds, 'd1', 'd2', 'd3', 'd4', 'd5'].sort(),
+    hidden: [],
+  }));
+  return { layout, table };
+};
+
+test('places that each have two claims by protected Gauges are all given back, for one to five flips at once', () => {
+  const expected = [
+    ['engines-usage', 'g2', 'g3', 'g4', 'g5'],
+    ['engines-usage', 'jobs', 'g3', 'g4', 'g5'],
+    ['engines-usage', 'jobs', 'harnesses', 'g4', 'g5'],
+    ['engines-usage', 'jobs', 'harnesses', 'local-models', 'g5'],
+    ['engines-usage', 'jobs', 'harnesses', 'local-models', 'memory-explorer'],
+  ];
+  for (let flips = 1; flips <= 5; flips += 1) {
+    const { layout, table } = claimed(flips);
+    const next = reconcileLayout(layout, table);
+    assert.deepEqual(next.tiles.map(tile => tile.gauge), expected[flips - 1], String(flips));
+    valid(next, table);
+  }
+});
+
+test('places that name one protected Gauge as their default and that also have a protected home Gauge are given back, with four flips and an extra claim', () => {
+  const { layout, table } = claimed(3, ['d4']);
+  const next = reconcileLayout(layout, table);
+  assert.deepEqual(next.tiles.map(tile => tile.gauge), ['engines-usage', 'jobs', 'harnesses', 'd4', 'g5']);
+  valid(next, table);
+  assert.equal(next.shelf.includes('g4'), true);
+});
+
+test('an exchange keeps the default of the other place when that default is not the protected Gauge, and takes the displaced Gauge as default when it is', () => {
+  const projectsHold = layoutFrom(copy => ({ ...copy, tiles: copy.tiles.map(tile => (tile.place === 'engines' ? { ...tile, gauge: 'projects', default: 'projects' } : tile.place === 'jobs' ? { ...tile, gauge: 'engines-usage', default: 'jobs' } : tile)), shelf: copy.shelf.filter(id => id !== 'projects' && id !== 'engines-usage').concat('jobs').sort() }));
+  const table = changed('engines-usage', { protected: true });
+  const next = reconcileLayout(projectsHold, table);
+  assert.equal(key(tileOf(next, 'engines')), 'engines engines-usage engines-usage 0 0 large');
+  assert.equal(key(tileOf(next, 'jobs')), 'jobs projects jobs 2 0 large');
+  valid(next, table);
+  const named = layoutFrom(copy => ({ ...copy, tiles: copy.tiles.map(tile => (tile.place === 'engines' ? { ...tile, gauge: 'projects', default: 'projects' } : tile.place === 'jobs' ? { ...tile, gauge: 'engines-usage', default: 'engines-usage' } : tile)), shelf: copy.shelf.filter(id => id !== 'projects' && id !== 'engines-usage' && id !== 'jobs') }));
+  assert.equal(key(tileOf(reconcileLayout(named, table), 'jobs')), 'jobs projects projects 2 0 large');
+});
+
+test('an exchange gives the other tile a size that the displaced Gauge allows, and takes the size of the tile first', () => {
+  const fixed = layoutFrom(copy => ({ ...copy, tiles: copy.tiles.map(tile => (tile.place === 'engines' ? { ...tile, gauge: 'fixed-clock', default: 'fixed-clock', size: 'small' } : tile.place === 'jobs' ? { ...tile, gauge: 'engines-usage', default: 'engines-usage' } : tile)), shelf: copy.shelf.filter(id => id !== 'fixed-clock' && id !== 'engines-usage') }));
+  const table = changed('engines-usage', { protected: true });
+  const next = reconcileLayout(fixed, table);
+  assert.equal(key(tileOf(next, 'engines')), 'engines engines-usage engines-usage 0 0 large');
+  assert.equal(key(tileOf(next, 'jobs')), 'jobs fixed-clock fixed-clock 2 0 small');
+  valid(next, table);
+});
+
+test('a tile that must shrink takes the first size of the manifest that is no bigger, and not the last', () => {
+  const big = layoutFrom(copy => ({ ...copy, tiles: [...copy.tiles, { place: 'wide', gauge: 'library', default: 'library', col: 0, row: 2, size: 'large' }], shelf: copy.shelf.filter(id => id !== 'library') }));
+  const table = changed('library', { tile: { resizable: true, sizes: ['medium', 'small'] } });
+  assert.equal(tileOf(reconcileLayout(big, table), 'wide')?.size, 'medium');
+  const reversed = changed('library', { tile: { resizable: true, sizes: ['small', 'medium'] } });
+  assert.equal(tileOf(reconcileLayout(big, reversed), 'wide')?.size, 'small');
+});

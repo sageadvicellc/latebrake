@@ -42,3 +42,11 @@ test('a tile is as wide as its size, and no wider than the columns that the wind
   assert.equal(spanOn('medium', 3), 2);
   assert.equal(spanOn('small', 1), 1);
 });
+
+test('the four sizes are rectangles that are nested and anchored at the top left, so a smaller size always lies inside a bigger one', () => {
+  const order = ['small', 'medium', 'large', 'full'] as const;
+  for (let index = 1; index < order.length; index += 1) {
+    const smaller = sizeUnits(order[index - 1] as (typeof order)[number]), bigger = sizeUnits(order[index] as (typeof order)[number]);
+    assert.ok(smaller.w <= bigger.w && smaller.h <= bigger.h, `${order[index - 1]} in ${order[index]}`);
+  }
+});
