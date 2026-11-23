@@ -190,10 +190,10 @@ export function runSessionsSuite(name: string, makeHarness: (folders: readonly G
   test(`${name}: a model choice is listed in the plan when the engine can take one, and refused with MODEL_NOT_FOR_ENGINE when it cannot, and it is never dropped`, async t => {
     const w = await prepare(t);
     const folder = w.harness.folder('alpha');
-    const choice = { provider: 'local-llama', model: 'qwen 7b' };
+    const choice = { provider: 'local-llama', model: 'qwen3-7b' };
     const planned = await plan(w, { engine: 'fixture-chooser', folder, model: choice });
     assert.deepEqual(planned.model, choice);
-    assert.ok(planned.steps.includes('model: local-llama qwen 7b, as the Gauge asks'));
+    assert.ok(planned.steps.includes('model: local-llama qwen3-7b, as the Gauge asks'));
     assert.deepEqual(outcome(await w.client.planSessionStart(GAUGE, { engine: ENGINE, folder, model: choice })), refused('MODEL_NOT_FOR_ENGINE'));
     assert.deepEqual((await plan(w, { engine: 'fixture-chooser', folder, model: null })).model, null);
     assert.deepEqual(w.harness.launches(), 0);
@@ -509,7 +509,7 @@ export function runSessionsSuite(name: string, makeHarness: (folders: readonly G
     await bring(w, 'reader-folder', 'fixture-reader', ['sessions.read']);
     const other = await startSession(w, { engine: 'fixture-other', folder: w.harness.folder('alpha') });
     const mine = await startSession(w, { engine: ENGINE, folder: w.harness.folder('beta') });
-    assert.deepEqual(outcome(await w.client.planSessionStop('fixture-narrow', other.session)), refused('GAUGE_GRANT_MISSING', 'engine_not_listed'), 'an engine the Gauge does not list');
+    assert.deepEqual(outcome(await w.client.planSessionStop('fixture-narrow', other.session)), refused('ENGINE_SESSION_UNKNOWN'), 'a session of an engine the Gauge does not list reads as unknown');
     assert.deepEqual(outcome(await w.client.planSessionStop('fixture-reader', mine.session)), refused('GAUGE_GRANT_MISSING', 'not_declared'), 'a Gauge that does not declare the permission');
     must(await w.client.revoke(GAUGE, ['sessions.stop']));
     assert.deepEqual(outcome(await w.client.planSessionStop(GAUGE, mine.session)), refused('GAUGE_GRANT_MISSING'), 'a grant that was revoked');
@@ -554,9 +554,25 @@ export function runSessionsSuite(name: string, makeHarness: (folders: readonly G
     assert.deepEqual((await listOf(w, ENGINE, 'fixture-reader')).map(item => item.id), [mine.session]);
     assert.equal(must(await w.client.getSession('fixture-reader', mine.session)).id, mine.session);
     assert.deepEqual(outcome(await w.client.listSessions('fixture-reader', 'fixture-other')), refused('GAUGE_GRANT_MISSING', 'engine_not_listed'));
-    assert.deepEqual(outcome(await w.client.getSession('fixture-reader', other.session)), refused('GAUGE_GRANT_MISSING', 'engine_not_listed'));
+    assert.deepEqual(outcome(await w.client.getSession('fixture-reader', other.session)), refused('ENGINE_SESSION_UNKNOWN'));
     assert.deepEqual(outcome(await w.client.listSessions('no-such-gauge', ENGINE)), refused('UNKNOWN_GAUGE'));
     assert.deepEqual(outcome(await w.client.getSession('no-such-gauge', mine.session)), refused('UNKNOWN_GAUGE'));
+  });
+
+  test(`${name}: a session of an engine that the caller has no grant for reads exactly as a session that is not there, for a get and for a stop, so a Gauge cannot find which ids exist`, async t => {
+    const w = await prepare(t);
+    await bring(w, 'narrow-folder', 'fixture-narrow');
+    const hidden = await startSession(w, { engine: 'fixture-other', folder: w.harness.folder('alpha') });
+    const absent = 's-0000000000000000';
+    assert.deepEqual(outcome(await w.client.getSession('fixture-narrow', hidden.session)), outcome(await w.client.getSession('fixture-narrow', absent)));
+    assert.deepEqual(outcome(await w.client.planSessionStop('fixture-narrow', hidden.session)), outcome(await w.client.planSessionStop('fixture-narrow', absent)));
+    assert.deepEqual(outcome(await w.client.getSession('fixture-narrow', absent)), refused('ENGINE_SESSION_UNKNOWN'));
+    // The grant check comes first: a Gauge with no grant at all gets the grant refusal for any id, existing or not, so the refusal never says whether the id exists.
+    must(await w.client.revoke('fixture-narrow', ['sessions.read', 'sessions.stop']));
+    assert.deepEqual(outcome(await w.client.getSession('fixture-narrow', hidden.session)), refused('GAUGE_GRANT_MISSING'));
+    assert.deepEqual(outcome(await w.client.getSession('fixture-narrow', absent)), refused('GAUGE_GRANT_MISSING'));
+    assert.deepEqual(outcome(await w.client.planSessionStop('fixture-narrow', hidden.session)), refused('GAUGE_GRANT_MISSING'));
+    assert.deepEqual(outcome(await w.client.planSessionStop('fixture-narrow', absent)), refused('GAUGE_GRANT_MISSING'));
   });
 
   test(`${name}: a read of a session that is not there is ENGINE_SESSION_UNKNOWN, and a malformed id is a request refusal`, async t => {

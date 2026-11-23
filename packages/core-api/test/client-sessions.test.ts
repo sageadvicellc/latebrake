@@ -167,15 +167,81 @@ test('a plan reads own properties only: a field that the reply inherits reads as
   await assert.rejects(starting(partial), protocolError('bowerloom.sessions.plan'));
 });
 
-test('a getter that throws while a reply is read is a protocol error, and a field is read once', async () => {
+test('a getter in a reply is never run: an own accessor reads as missing, so the reply is refused, for a plan, an applied plan, and a session', async () => {
+  let runs = 0;
+  const accessor = (base: object, key: string) => { const copy = { ...base }; Object.defineProperty(copy, key, { get() { runs += 1; return (base as Record<string, unknown>)[key]; }, enumerable: true }); return copy; };
+  for (const key of Object.keys(START)) await assert.rejects(starting(accessor(START, key)), protocolError('bowerloom.sessions.plan'), `plan ${key}`);
+  for (const key of Object.keys(STOP)) await assert.rejects(stopping(accessor(STOP, key)), protocolError('bowerloom.sessions.plan'), `stop plan ${key}`);
+  const applied = { action: 'start', session: 's-1', engine: 'fixture-engine', state: 'running' };
+  for (const key of Object.keys(applied)) await assert.rejects(applying(accessor(applied, key)), protocolError('bowerloom.sessions.apply'), `applied ${key}`);
+  for (const key of Object.keys(SESSION)) {
+    await assert.rejects(reading(accessor(SESSION, key)), protocolError('bowerloom.sessions.get'), `session ${key}`);
+    await assert.rejects(listing([accessor(SESSION, key)]), protocolError('bowerloom.sessions.list'), `listed session ${key}`);
+  }
+  await assert.rejects(starting({ ...START, model: accessor({ provider: 'p', model: 'm' }, 'provider') }, { engine: 'fixture-engine', folder: '/work/alpha', model: { provider: 'p', model: 'm' } }), protocolError('bowerloom.sessions.plan'), 'a model accessor');
+  assert.equal(runs, 0, 'no getter ran');
+});
+
+test('a getter that throws while a reply is read is a protocol error', async () => {
   const reply = { ...START };
   Object.defineProperty(reply, 'steps', { get() { throw new Error('boom'); }, enumerable: true });
   await assert.rejects(starting(reply), protocolError('bowerloom.sessions.plan'));
+});
+
+test('a list in a reply is read by index once: an iterator, a subclass, a list that changes between two reads, and a hole are not followed', async () => {
+  const iterating = ['one'];
+  Object.defineProperty(iterating, Symbol.iterator, { value: function* () { yield 'x'; yield 42; } });
+  const plan = (steps: unknown) => starting({ ...START, steps });
+  assert.deepEqual((await plan(iterating)), { ok: true, value: { ...START, steps: ['one'] } }, 'the iterator is ignored');
+  class Sub extends Array {}
+  await assert.rejects(plan(Sub.from(['one'])), protocolError('bowerloom.sessions.plan'), 'a subclass');
   let reads = 0;
-  const counted = { ...START };
-  Object.defineProperty(counted, 'engine', { get() { reads += 1; return 'fixture-engine'; }, enumerable: true });
-  assert.ok((await starting(counted)).ok);
+  const changing = new Proxy(['fine'], { get(target, key, receiver) { if (key === '0') { reads += 1; return reads === 1 ? 'fine' : 42; } return Reflect.get(target, key, receiver); }, getOwnPropertyDescriptor(target, key) { const d = Reflect.getOwnPropertyDescriptor(target, key); if (key === '0' && d) { reads += 1; return { ...d, value: reads === 1 ? 'fine' : 42 }; } return d; } });
+  const result = await plan(changing);
+  assert.ok(result.ok);
+  assert.deepEqual(result.value.steps, ['fine'], 'the list is read once, so the frozen plan holds text only');
   assert.equal(reads, 1);
+  await assert.rejects(plan(['a', , 'b']), protocolError('bowerloom.sessions.plan'), 'a hole');
+  await assert.rejects(listing(Object.assign(Object.create(Array.prototype) as object, { length: 0 })), protocolError('bowerloom.sessions.list'));
+  class Many extends Array {}
+  await assert.rejects(listing(Many.from([SESSION])), protocolError('bowerloom.sessions.list'), 'a subclass of sessions');
+});
+
+test('a plan program and a step may not hold a control, format, or separator character, and a step may not hold a look-alike space or a combining mark', async () => {
+  for (const bad of ['\u0000', '\u202e', '\u200b', '\u2028', '\n', '\u0085']) {
+    await assert.rejects(starting({ ...START, program: `/bin/a${bad}b` }), protocolError('bowerloom.sessions.plan'), `program ${JSON.stringify(bad)}`);
+    await assert.rejects(starting({ ...START, steps: [`one${bad}two`] }), protocolError('bowerloom.sessions.plan'), `step ${JSON.stringify(bad)}`);
+  }
+  for (const bad of ['\u00a0', '\u3000', '\u3164', '\u2800', '\u115f', '\u1160', '\uffa0', 'e\u0301']) {
+    await assert.rejects(starting({ ...START, steps: [`one${bad}two`] }), protocolError('bowerloom.sessions.plan'), `step ${JSON.stringify(bad)}`);
+  }
+  assert.ok((await starting({ ...START, steps: ['one two', 'caf\u00e9 \u{1F680}', 'escaped \\u{a0}'] })).ok);
+});
+
+test('a request is read once: a getter on the request runs once, and the plan is checked against the values that were sent', async () => {
+  let engineReads = 0, folderReads = 0, modelReads = 0, variableReads = 0;
+  const flipping = {
+    get engine() { engineReads += 1; return engineReads === 1 ? 'fixture-engine' : 'fixture-other'; },
+    get folder() { folderReads += 1; return '/work/alpha'; },
+    get model() { modelReads += 1; return modelReads === 1 ? { provider: 'p', model: 'm' } : null; },
+    get variables() { variableReads += 1; return variableReads === 1 ? ['ASKED'] : []; },
+  };
+  const core = scripted({ ok: true, result: { ...START, model: { provider: 'p', model: 'm' }, variables: ['ASKED', 'FIXTURE_DECLARED'] } });
+  const result = await createCoreClient(core).planSessionStart('fixture-sessioner', flipping);
+  assert.ok(result.ok, JSON.stringify(result));
+  assert.deepEqual([engineReads, folderReads, modelReads, variableReads], [1, 1, 1, 1]);
+  assert.deepEqual(core.calls[0]?.params, { action: 'start', gauge: 'fixture-sessioner', engine: 'fixture-engine', folder: '/work/alpha', model: { provider: 'p', model: 'm' }, variables: ['ASKED'] });
+});
+
+test('an applied plan is checked against the copy that was sent: a plan whose fields change between reads cannot make a result fit', async () => {
+  let reads = 0;
+  const moving = { ...START } as Record<string, unknown>;
+  Object.defineProperty(moving, 'engine', { get() { reads += 1; return reads === 1 ? 'fixture-engine' : 'fixture-other'; }, enumerable: true });
+  await assert.rejects(createCoreClient(ok({ action: 'start', session: 's-1', engine: 'fixture-other', state: 'running' })).applySession(moving as unknown as SessionPlan), TypeError);
+  const noAction = { ...START } as Record<string, unknown>;
+  Object.defineProperty(noAction, 'action', { get() { return 'start'; }, enumerable: true });
+  await assert.rejects(createCoreClient(ok({ action: 'start', session: 's-1', engine: 'fixture-engine', state: 'running' })).applySession(noAction as unknown as SessionPlan), /plan needs an own action/);
+  await assert.rejects(createCoreClient(ok({})).applySession({ ...START, engine: 5 } as unknown as SessionPlan), TypeError);
 });
 
 // The apply

@@ -1,7 +1,8 @@
-const UNSAFE_IN_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\\]/gu;
+import { escapeText } from '../../engine-sessions/src/text.js';
 
 /**
- * Makes a value safe to put in a line of a plan. A line break, a control, format, or separator character, and a backslash become a visible escape such as
- * `\u{a}`, so no value can end a line or start a new one, and a person reads what the value really holds. Every value that goes in a line a person approves goes through this one helper.
+ * Makes a value safe to put in a line of a plan. A line break, a control, format, or separator character, a backslash, a space that is not the plain space, a blank letter, and a combining mark
+ * become a visible escape such as `\u{a}`, so no value can end a line, start a new one, or pass for another text, and a person reads what the value really holds. Every value that goes in a line
+ * a person approves goes through this one helper. It is the escape of `packages/engine-sessions`, which the logs use too.
  */
-export const escapeForPlan = (value: string): string => value.replace(UNSAFE_IN_TEXT, char => (char === '\\' ? '\\\\' : `\\u{${char.codePointAt(0)?.toString(16) ?? ''}}`));
+export const escapeForPlan = (value: string): string => escapeText(value);

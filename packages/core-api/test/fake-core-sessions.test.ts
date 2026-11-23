@@ -235,3 +235,40 @@ test('the person who disables the Gauge ends its access to sessions at once', as
   assert.deepEqual(await client.planSessionStart(GAUGE, { engine: ENGINE, folder: rig.folder('alpha') }), { ok: false, code: 'GAUGE_GRANT_MISSING', reason: 'gauge_disabled' });
   assert.deepEqual(await client.listSessions(GAUGE, ENGINE), { ok: false, code: 'GAUGE_GRANT_MISSING', reason: 'gauge_disabled' });
 });
+
+test('two plans that are the same plan, with the same digest and two nonces: the second approval of one never starts the other', async t => {
+  const { rig, client, fake } = await ready(t);
+  const folder = rig.folder('alpha');
+  const first = must(await client.planSessionStart(GAUGE, { engine: ENGINE, folder }));
+  must(await client.applySession(first, fake.approve(first.nonce)));
+  const a = must(await client.planSessionStart(GAUGE, { engine: 'fixture-other', folder }));
+  const b = must(await client.planSessionStart(GAUGE, { engine: 'fixture-other', folder }));
+  assert.equal(a.digest, b.digest);
+  assert.notEqual(a.nonce, b.nonce);
+  const approvalB = fake.approve(b.nonce), sharedA = fake.approveShared(a.nonce);
+  assert.deepEqual(await client.applySession(b, approvalB, sharedA), { ok: false, code: 'ENGINE_FOLDER_SHARED' });
+  assert.equal(rig.host.launched, 1);
+  const sharedB = fake.approveShared(b.nonce);
+  assert.equal((await client.applySession(b, approvalB, sharedB)).ok, true);
+});
+
+test('the lists of a plan that is sent back are read by index, from own data properties: an iterator, a subclass, and an accessor are a changed plan', async t => {
+  const { rig, client, fake } = await ready(t);
+  const planned = must(await client.planSessionStart(GAUGE, { engine: ENGINE, folder: rig.folder('alpha') }));
+  const approval = fake.approve(planned.nonce);
+  const apply = (plan: unknown) => fake.call('bowerloom.sessions.apply', { plan, approval });
+  const changed = { ok: false, code: 'GAUGE_PLAN_CHANGED' };
+  for (const key of ['variables', 'sharedWith', 'steps'] as const) {
+    // The list holds one more item than the plan, and its iterator yields exactly the plan: a core that followed the iterator would accept it.
+    const iterating: unknown[] = [...planned[key], 'extra'];
+    Object.defineProperty(iterating, Symbol.iterator, { value: function* () { yield* planned[key]; } });
+    class Sub extends Array {}
+    const accessor: unknown[] = [...planned[key]];
+    if (accessor.length === 0) accessor.push('x');
+    Object.defineProperty(accessor, 0, { get() { return 'x'; }, enumerable: true });
+    assert.deepEqual(await apply({ ...planned, [key]: Sub.from(planned[key]) }), changed, `${key} subclass`);
+    assert.deepEqual(await apply({ ...planned, [key]: accessor }), changed, `${key} accessor`);
+    assert.deepEqual(await apply({ ...planned, [key]: iterating }), changed, `${key} iterator`);
+  }
+  assert.equal((await apply(planned)).ok, true, 'no refusal used the approval up');
+});

@@ -269,6 +269,14 @@ export const ENGINE_CODES = Object.freeze([
 ] as const);
 export type EngineCode = (typeof ENGINE_CODES)[number];
 
+/** `true` when the two types are the same set of literals, and `never` otherwise. */
+export type Exactly<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
+/**
+ * A compile-time check that ties the engine codes of this package to the registry: it is `true` only when `ENGINE_CODES` and `ENGINE_REQUEST_INVALID` are exactly the registry codes that hold the word `ENGINE`.
+ * A code added to the registry and not here, or here and not in the registry, makes this type `never`, and the declaration that uses it in `test/engine-codes-type.test.ts` stops compiling.
+ */
+export type EngineCodesMatchRegistry = Exactly<EngineCode | 'ENGINE_REQUEST_INVALID', Extract<GaugeCode, `${string}ENGINE${string}`>>;
+
 export type CoreRefusal =
   | { readonly ok: false; readonly code: EngineCode; readonly reason?: never }
   | { readonly ok: false; readonly code: 'ENGINE_REQUEST_INVALID'; readonly reason: RequestReason }

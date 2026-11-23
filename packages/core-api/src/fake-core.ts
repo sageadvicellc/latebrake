@@ -8,7 +8,7 @@ import {
   MAX_REVISION, PAGE_IDS, canonicalText, checkLayout, defaultLayout, droppedRevision, layoutObject, newFile, parseLayout, parseLayoutFile, proposeTile, reconcileLayout, saveRevision, serializeLayoutFile, swapPlace, defaultPlace, tileInfoOf, invalid as layoutInvalid,
   type GaugeInfo, type Layout, type LayoutFile, type LayoutRefusal, type TileInfo, type UnknownGaugeRefusal,
 } from '../../gauge-layout/src/index.js';
-import { BILLING_SOURCES, checkModel, checkSessionId, createEngineHost, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
+import { BILLING_SOURCES, checkModel, checkSessionId, createEngineHost, readList, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
 import { FIXTURE_GAUGES, HOME_STOCK } from './fixtures.js';
 import { layoutChangeSteps, layoutSteps } from './layout-plan.js';
 import { DEFAULT_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES, appendAuditStep, auditLine, grantSteps } from './grants.js';
@@ -884,6 +884,29 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   });
 
   /**
+   * The engines for which a Gauge holds a permission now: the engines of its manifest that pass the one enforcement point. When there are none, the refusal of the check, so a Gauge with no grant at all gets the
+   * grant refusal whatever id it names. A stop and a get look at this before they look at a session, so the refusal never says whether an id exists.
+   */
+  function grantedEngines(gaugeId: unknown, permission: 'sessions.read' | 'sessions.stop'): { readonly ok: true; readonly engines: ReadonlySet<string> } | Refusal {
+    const current = typeof gaugeId === 'string' ? installed.get(gaugeId) : undefined;
+    if (typeof gaugeId !== 'string' || !current) return refuse('UNKNOWN_GAUGE');
+    const engines = new Set<string>();
+    let first: Refusal | undefined;
+    for (const engine of current.engines) {
+      const checked = enforce(gaugeId, permission, engine);
+      if (checked.ok) engines.add(engine);
+      else first ??= checked;
+    }
+    if (engines.size > 0) return { ok: true, engines };
+    // No engine is granted: the refusal of the first engine, or, for a Gauge that lists none, the check without an engine.
+    if (first) return first;
+    const bare = enforce(gaugeId, permission, undefined);
+    // A permission that is scoped by engine never passes without one, so reaching here with an allow is a bug, and it throws.
+    if (bare.ok) throw new Error('a permission scoped by engine was allowed with no engine');
+    return bare;
+  }
+
+  /**
    * Plans a start or a stop of a session. Nothing changes. Every check runs here, so the plan the person sees is one that can be applied: the permission (the one enforcement point), the shape of the request,
    * the engine and its program, the model choice, the pair, the cap, and the folder that another engine uses. A stop for a session that is not there names the session as unknown, so a Gauge that holds no
    * grant for it learns only what the id already says.
@@ -902,11 +925,13 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
       };
       return { ok: true, ...content, digest: sessionDigest(content), start: c };
     }
-    if (typeof gauge !== 'string' || !installed.has(gauge)) return refuse('UNKNOWN_GAUGE');
+    const granted = grantedEngines(gauge, 'sessions.stop');
+    if (!granted.ok) return granted;
     const id = checkSessionId(params['session']);
     if (!id.ok) return engineRefusal({ ok: false, code: 'ENGINE_REQUEST_INVALID', reason: id.reason });
     const found = host.get(id.value);
-    if (!found) return engineRefusal({ ok: false, code: 'ENGINE_SESSION_UNKNOWN' });
+    // A session of an engine that the Gauge has no grant for reads exactly as a session that is not there.
+    if (!found || !granted.engines.has(found.engine)) return engineRefusal({ ok: false, code: 'ENGINE_SESSION_UNKNOWN' });
     const allowed = enforce(gauge, 'sessions.stop', found.engine);
     if (!allowed.ok) return allowed;
     const planned = host.planStop(id.value);
@@ -922,15 +947,17 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   /** Reads the session plan a caller sends back. Anything that is not a whole plan reads as `undefined`. The digest is computed here, and the one the caller sent is ignored. */
   function readSessionPlan(value: unknown): (SessionContent & { readonly digest: string; readonly nonce: string }) | undefined {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
-    const field = (key: string): unknown => ownField(value, key);
+    // Own data properties only, each read once: an accessor reads as missing, and no getter runs.
+    const field = (key: string): unknown => { const descriptor = Object.getOwnPropertyDescriptor(value, key); return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined; };
+    const texts = (item: unknown): string[] | undefined => { const items = readList(item); return items !== undefined && items.every((entry): entry is string => typeof entry === 'string') ? items : undefined; };
     const action = field('action'), gauge = field('gauge'), engine = field('engine'), folder = field('folder'), session = field('session'), program = field('program');
-    const rawModel = field('model'), billing = field('billing'), variables = field('variables'), sharedWith = field('sharedWith'), force = field('force'), steps = field('steps'), nonce = field('nonce');
+    const rawModel = field('model'), billing = field('billing'), variables = texts(field('variables')), sharedWith = texts(field('sharedWith')), force = field('force'), steps = texts(field('steps')), nonce = field('nonce');
     if (!isSessionAction(action) || typeof gauge !== 'string' || typeof engine !== 'string' || typeof folder !== 'string' || typeof nonce !== 'string' || typeof force !== 'boolean' || !isBilling(billing)) return undefined;
     const nullable = (item: unknown): item is string | null => item === null || typeof item === 'string';
-    if (!nullable(session) || !nullable(program) || rawModel === undefined || !isDenseTexts(variables) || !isDenseTexts(sharedWith) || !isDenseTexts(steps)) return undefined;
+    if (!nullable(session) || !nullable(program) || rawModel === undefined || variables === undefined || sharedWith === undefined || steps === undefined) return undefined;
     const model = checkModel(rawModel);
     if (!model.ok) return undefined;
-    const content: SessionContent = { action, gauge, engine, folder, session, program, model: model.value, billing, variables: [...variables], sharedWith: [...sharedWith], force, steps: [...steps] };
+    const content: SessionContent = { action, gauge, engine, folder, session, program, model: model.value, billing, variables, sharedWith, force, steps };
     return { ...content, digest: sessionDigest(content), nonce };
   }
 
@@ -1088,13 +1115,12 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
         }
         case 'bowerloom.sessions.get': {
           const gauge = params['gauge'];
-          if (typeof gauge !== 'string' || !installed.has(gauge)) return reply(refuse('UNKNOWN_GAUGE'));
+          const granted = grantedEngines(gauge, 'sessions.read');
+          if (!granted.ok) return reply(granted);
           const id = checkSessionId(params['session']);
           if (!id.ok) return reply(engineRefusal({ ok: false, code: 'ENGINE_REQUEST_INVALID', reason: id.reason }));
           const found = host.get(id.value);
-          if (!found) return reply(engineRefusal({ ok: false, code: 'ENGINE_SESSION_UNKNOWN' }));
-          const allowed = enforce(gauge, 'sessions.read', found.engine);
-          if (!allowed.ok) return reply(allowed);
+          if (!found || !granted.engines.has(found.engine)) return reply(engineRefusal({ ok: false, code: 'ENGINE_SESSION_UNKNOWN' }));
           return { ok: true, result: sessionObject(found) };
         }
         case 'bowerloom.gauges.routes':

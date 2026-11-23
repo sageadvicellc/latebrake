@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startSteps, stopSteps, type StartStepsInput } from '../src/session-plan.js';
+import { escapeForPlan } from '../src/plan-text.js';
 
 const BREAKS = new RegExp('[\\n\\r\\u2028\\u2029\\u202e]');
 const BASE: StartStepsInput = {
@@ -23,11 +24,11 @@ test('a plain start plan reads exactly like this', () => {
 });
 
 test('a start plan with a model choice, a local billing source, no variables, and a shared folder reads exactly like this', () => {
-  assert.deepEqual(startSteps({ ...BASE, model: { provider: 'local-llama', model: 'qwen 7b' }, billing: 'local', variables: [], sharedWith: ['fixture-other'] }), [
+  assert.deepEqual(startSteps({ ...BASE, model: { provider: 'local-llama', model: 'qwen-7b' }, billing: 'local', variables: [], sharedWith: ['fixture-other'] }), [
     'Gauge fixture-sessioner asks for a new session of the engine fixture-engine (Fixture Engine)',
     'program: /usr/bin/fake',
     'folder: /work/alpha',
-    'model: local-llama qwen 7b, as the Gauge asks',
+    'model: local-llama qwen-7b, as the Gauge asks',
     'billing source: local, so no provider is billed',
     'variables passed: none',
     'the program gets these variables only, and it starts with an argument list and never through a shell',
@@ -72,4 +73,14 @@ test('every value is escaped, so no value can add or forge a line of the plan', 
   for (const line of stop) assert.equal(BREAKS.test(line), false, line);
   assert.equal(stop[0], `Gauge ${escaped} asks to stop session ${escaped} of the engine ${escaped}`);
   assert.equal(stop[1], `folder: ${escaped}`);
+});
+
+test('the look-alike spaces, the blank letters, and the combining marks are escaped in a plan, and the plain space and precomposed letters are not', () => {
+  const cases: readonly (readonly [string, string])[] = [
+    ['a\u00a0b', 'a\\u{a0}b'], ['a\u3000b', 'a\\u{3000}b'], ['\u3164', '\\u{3164}'], ['\u2800', '\\u{2800}'], ['\u115f\u1160\uffa0', '\\u{115f}\\u{1160}\\u{ffa0}'],
+    ['e\u0301', 'e\\u{301}'], ['a b', 'a b'], ['caf\u00e9', 'caf\u00e9'], ['\u202f', '\\u{202f}'],
+  ];
+  for (const [value, expected] of cases) assert.equal(escapeForPlan(value), expected, JSON.stringify(value));
+  const lines = startSteps({ ...BASE, folder: '/work/a\u00a0b\u3164' });
+  assert.equal(lines[2], 'folder: /work/a\\u{a0}b\\u{3164}');
 });
