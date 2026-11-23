@@ -42,6 +42,8 @@ export const LAYOUT_FOLDERS: readonly GaugeFolder[] = [
   { name: 'quiet-fixed-update', location: 'user', manifest: manifestOf({ id: 'fixture-quiet', title: 'Fixture Quiet', version: '1.1.0', tile: { expandable: false, resizable: false, entry: 'ui/tile.js' } }), files: { 'ui/tile.js': FILE } },
   // A stock Gauge that is protected.
   { name: 'guard-folder', location: 'bundled', manifest: manifestOf({ id: 'fixture-guard', title: 'Fixture Guard', protected: true, tile: { expandable: false, resizable: false, entry: 'ui/tile.js' } }), files: { 'ui/tile.js': FILE } },
+  // A stock update that makes Jobs protected.
+  { name: 'jobs-protected', location: 'bundled', manifest: manifestOf({ id: 'jobs', title: 'Jobs', version: '2.0.0', protected: true, tile: { expandable: false, resizable: true, entry: 'ui/tile.js', sizes: ['large', 'medium', 'full'] } }), files: { 'ui/tile.js': FILE } },
   // A Gauge that tries to take the id of the Settings page.
   { name: 'settings-folder', location: 'user', manifest: manifestOf({ id: 'settings', title: 'Fixture Settings', tile: { expandable: false, resizable: true, entry: 'ui/tile.js' } }), files: { 'ui/tile.js': FILE } },
 ];
@@ -580,15 +582,16 @@ export function runLayoutSuite(name: string, makeHarness: (folders: readonly Gau
     await bring(s, 'proposer-folder', 'fixture-proposer');
     assert.deepEqual(outcome(await s.client.planLayoutPropose('fixture-proposer')), { ok: false, code: 'GAUGE_GRANT_MISSING' });
     await grantPropose(s, 'fixture-proposer');
+    const base = await read(s.client);
     const plan = must(await s.client.planLayoutPropose('fixture-proposer'));
     assert.equal(plan.steps[0], 'add fixture-proposer to the layout, as the Gauge asked');
     assert.ok(plan.steps.includes('tile place-1: fixture-proposer medium at column 0 row 2'));
     assert.deepEqual({ kind: plan.kind, gauge: plan.gauge, place: plan.place }, { kind: 'propose', gauge: 'fixture-proposer', place: null });
-    assert.deepEqual(await read(s.client), { layout: HOME_DOC, revision: 1, safe: null });
+    assert.deepEqual(await read(s.client), base);
     assert.deepEqual(outcome(await s.client.applyLayout(plan)), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
-    assert.deepEqual(await read(s.client), { layout: HOME_DOC, revision: 1, safe: null });
+    assert.deepEqual(await read(s.client), base);
     const applied = must(await s.client.applyLayout(plan, await s.harness.approve(plan)));
-    assert.deepEqual(applied, { kind: 'propose', revision: 2, changed: true });
+    assert.deepEqual(applied, { kind: 'propose', revision: base.revision + 1, changed: true });
     assert.deepEqual((await read(s.client)).layout.tiles.at(-1), { place: 'place-1', gauge: 'fixture-proposer', default: 'fixture-proposer', col: 0, row: 2, size: 'medium' });
   });
 
@@ -620,22 +623,28 @@ export function runLayoutSuite(name: string, makeHarness: (folders: readonly Gau
     const s = await start();
     await bring(s, 'proposer-folder', 'fixture-proposer');
     await grantPropose(s, 'fixture-proposer');
+    const base = await read(s.client);
     const plan = must(await s.client.planLayoutPropose('fixture-proposer'));
     const approval = await s.harness.approve(plan);
     must(await s.client.revoke('fixture-proposer', ['layout.propose']));
     assert.deepEqual(outcome(await s.client.applyLayout(plan, approval)), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
-    assert.deepEqual(await read(s.client), { layout: HOME_DOC, revision: 1, safe: null });
+    assert.deepEqual(await read(s.client), base);
   });
 
   test(`${name}: disabling the Gauge after the plan is approved stops the proposal, with nothing changed`, async () => {
     const s = await start();
     await bring(s, 'proposer-folder', 'fixture-proposer');
     await grantPropose(s, 'fixture-proposer');
+    const base = await read(s.client);
     const plan = must(await s.client.planLayoutPropose('fixture-proposer'));
     const approval = await s.harness.approve(plan);
     await lifecycle(s, s.client.planDisable('fixture-proposer'));
     assert.deepEqual(outcome(await s.client.applyLayout(plan, approval)), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
-    assert.deepEqual(await read(s.client), { layout: HOME_DOC, revision: 1, safe: null });
+    // The step took the Gauge off the shelf, and nothing else changed: the proposal added no tile.
+    const after = await read(s.client);
+    assert.equal(after.revision, base.revision + 1);
+    assert.equal(after.layout.tiles.length, 5);
+    assert.equal(after.layout.shelf.includes('fixture-proposer'), false);
   });
 
   test(`${name}: a Gauge has no call that changes the layout without a plan, so the layout never changes by itself`, async () => {
@@ -814,9 +823,8 @@ export function runLayoutSuite(name: string, makeHarness: (folders: readonly Gau
 
   test(`${name}: a lifecycle step that does not touch the layout says nothing about it and saves no revision`, async () => {
     const s = await ready();
-    await bring(s, 'quiet-folder', 'fixture-quiet', false);
     const before = await read(s.client);
-    const plan = must(await s.client.planEnable('fixture-quiet'));
+    const plan = must(await s.client.planInstall('quiet-folder'));
     assert.deepEqual(layoutLines(plan), []);
     await lifecycle(s, Promise.resolve({ ok: true as const, value: plan }));
     assert.deepEqual(await read(s.client), before);
@@ -835,9 +843,75 @@ export function runLayoutSuite(name: string, makeHarness: (folders: readonly Gau
     const s = await ready();
     const swaps = ['tracing', 'library'];
     for (let step = 0; step < 10; step += 1) await change(s, s.client.planLayoutSwap('models', swaps[step % 2] ?? 'tracing'));
-    // After 10 changes revision 11 is in use and the file holds 10 earlier revisions, so the step saves a revision and drops the oldest, revision 1.
+    // After 10 changes the file holds 10 earlier revisions, so the step saves a revision and drops the oldest.
+    const oldest = must(await s.client.listLayoutRevisions()).at(-1)?.revision;
+    assert.equal(must(await s.client.listLayoutRevisions()).length, 10);
     const plan = must(await s.client.planDisable('jobs'));
-    assert.ok(plan.steps.includes('layout: drop revision 1, the oldest, because the file keeps at most 10 earlier revisions'));
+    assert.ok(plan.steps.includes(`layout: drop revision ${oldest}, the oldest, because the file keeps at most 10 earlier revisions`));
+  });
+
+  test(`${name}: a stock update that makes a Gauge protected gives its place back in the same approved plan, and the arrangement of the person stays`, async () => {
+    const s = await ready();
+    await change(s, s.client.planLayoutSwap('jobs', 'library'));
+    await change(s, s.client.planLayoutSwap('models', 'tracing'));
+    const before = await read(s.client);
+    const plan = must(await s.client.planUpdate('jobs-protected'));
+    assert.deepEqual(layoutLines(plan), [
+      'layout: tile jobs holds jobs large instead of library',
+      'layout: remove jobs from the shelf',
+      'layout: add library to the shelf',
+      `layout: keep the layout now in use as revision ${before.revision}, and keep at most 10 earlier revisions`,
+    ]);
+    await lifecycle(s, Promise.resolve({ ok: true as const, value: plan }));
+    const after = await read(s.client);
+    assert.equal(after.revision, before.revision + 1);
+    assert.deepEqual(after.layout.tiles.find(tile => tile.place === 'jobs'), { place: 'jobs', gauge: 'jobs', default: 'jobs', col: 2, row: 0, size: 'large' });
+    assert.equal(placeOf(after, 'models'), 'tracing');
+    assert.equal(after.layout.shelf.includes('library'), true);
+    for (const place of ['engines', 'harnesses', 'memory']) assert.deepEqual(after.layout.tiles.find(tile => tile.place === place), before.layout.tiles.find(tile => tile.place === place), place);
+    assert.deepEqual(must(await s.client.listLayoutRevisions())[0]?.layout, before.layout);
+    await everyChangeWorks(s);
+  });
+
+  test(`${name}: a Gauge that is disabled and then enabled again, or that was never on the layout, ends on the shelf, and swap and default then work`, async () => {
+    const s = await ready();
+    for (const id of ['fixture-clock', 'jobs']) {
+      await lifecycle(s, s.client.planDisable(id));
+      const plan = must(await s.client.planEnable(id));
+      assert.ok(plan.steps.includes(`layout: add ${id} to the shelf`), id);
+      await lifecycle(s, Promise.resolve({ ok: true as const, value: plan }));
+      const state = await read(s.client);
+      assert.equal(state.layout.shelf.includes(id), true, id);
+      assert.equal(state.layout.tiles.some(tile => tile.gauge === id), false, id);
+    }
+    // The tile of Jobs stays gone. A swap puts Jobs on a tile again, and the default action then works.
+    await change(s, s.client.planLayoutSwap('engines', 'jobs'));
+    assert.equal(placeOf(await read(s.client), 'engines'), 'jobs');
+    await change(s, s.client.planLayoutDefault('engines'));
+    assert.equal(placeOf(await read(s.client), 'engines'), 'engines-usage');
+    // A Gauge that is installed and enabled for the first time is on the shelf too.
+    await bring(s, 'quiet-folder', 'fixture-quiet');
+    assert.equal((await read(s.client)).layout.shelf.includes('fixture-quiet'), true);
+  });
+
+  test(`${name}: a plan says when a place gets another default, and when a hidden entry goes`, async () => {
+    const s = await ready();
+    await change(s, s.client.planLayoutSwap('models', 'projects'));
+    await change(s, s.client.planLayoutSet(homeText(home => ({ ...home, tiles: home.tiles.map(tile => (tile.place === 'models' ? { ...tile, gauge: 'projects' } : tile)), shelf: home.shelf.filter(id => id !== 'projects' && id !== 'library' && id !== 'local-models'), hidden: ['library', 'local-models'] }))));
+    const defaultGone = must(await s.client.planRemove('local-models'));
+    assert.ok(defaultGone.steps.includes('layout: place models has the default projects'));
+    assert.ok(defaultGone.steps.includes('layout: remove local-models from the hidden list'));
+    const library = must(await s.client.planDisable('library'));
+    assert.ok(library.steps.includes('layout: remove library from the hidden list'));
+  });
+
+  test(`${name}: a hidden Gauge stays hidden when a step on another Gauge would give its place back to it`, async () => {
+    const s = await ready();
+    await change(s, s.client.planLayoutSet(homeText(home => ({ ...home, tiles: home.tiles.map(tile => (tile.place === 'models' ? { ...tile, gauge: 'projects' } : tile)), shelf: home.shelf.filter(id => id !== 'projects' && id !== 'local-models'), hidden: ['local-models'] }))));
+    await lifecycle(s, s.client.planDisable('projects'));
+    const state = await read(s.client);
+    assert.equal(state.layout.tiles.some(tile => tile.place === 'models'), false);
+    assert.deepEqual(state.layout.hidden, ['local-models']);
   });
 
   // Reads
