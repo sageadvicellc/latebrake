@@ -4,6 +4,8 @@ import { createFakeCore, type GaugeFolder } from '../src/fake-core.js';
 import { createCoreClient } from '../src/client.js';
 import type { GaugePlan, GrantPlan } from '../src/types.js';
 import { GRANT_FOLDERS, MIN_AUDIT_MAX_BYTES, runGrantsSuite } from './grants-suite.js';
+import { MAX_AUDIT_MAX_BYTES, auditLine } from '../src/grants.js';
+import { MAX_AUDIT_RECORDS } from '../src/types.js';
 
 // The one grants suite, run against the fake core. The fake core gives the person's approval through its own `approve`, which no Gauge can reach.
 runGrantsSuite('fake core grants', (folders, options) => {
@@ -328,4 +330,25 @@ test('the lines of a grant plan from the core hold no control, format, or separa
 
 test('a method of the grants calls that the core does not offer is a programming error', async () => {
   await assert.rejects(createFakeCore().call('bowerloom.grants.explode' as never, {}), /unknown core method/);
+});
+
+test('the audit size cap has an upper bound, so the number of records a read can give is bounded too', () => {
+  assert.equal(MAX_AUDIT_MAX_BYTES, 1024 * 1024);
+  assert.doesNotThrow(() => createFakeCore({ auditMaxBytes: MAX_AUDIT_MAX_BYTES }));
+  for (const auditMaxBytes of [MAX_AUDIT_MAX_BYTES + 1, 4 * 1024 * 1024, Number.MAX_SAFE_INTEGER]) assert.throws(() => createFakeCore({ auditMaxBytes }), RangeError, String(auditMaxBytes));
+  const shortest = Buffer.byteLength(auditLine({ seq: 1, at: '1970-01-01T00:00:00.000Z', action: 'grant', via: 'plan', id: 'abc', version: null, permission: 'engines.read', manifestHash: null, folderHash: null }));
+  assert.equal(Math.floor(MAX_AUDIT_MAX_BYTES / shortest) <= MAX_AUDIT_RECORDS, true, 'a file at the bound never holds more records than a read may give');
+});
+
+test('a read of an audit file that is full at the largest cap works, and holds no more records than a read may give', async () => {
+  const core = createFakeCore({ folders: FOLDERS, auditMaxBytes: MAX_AUDIT_MAX_BYTES });
+  const client = await install(core, 'solo-folder', 'fixture-solo');
+  for (let round = 0; round < 1300; round += 1) {
+    await grantOnce(core, 'fixture-solo', ['engines.read', 'usage.read']);
+    assert.ok((await client.revoke('fixture-solo', ['engines.read', 'usage.read'])).ok);
+  }
+  const read = await readOf(client);
+  assert.equal(read.droppedCount > 0, true, 'the file is full, so its oldest records were dropped');
+  assert.equal(read.entries.length > 3000 && read.entries.length <= MAX_AUDIT_RECORDS, true);
+  assert.equal(Buffer.byteLength(core.auditFile()) <= MAX_AUDIT_MAX_BYTES, true);
 });

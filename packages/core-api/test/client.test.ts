@@ -222,12 +222,17 @@ for (const [name, reply] of [
   ['a getter on the reply', { get ok() { return boom(); }, result: [] }],
   ['a getter on the result', { ok: true, get result() { return boom(); } }],
   ['a proxy as the reply', new Proxy({}, { getOwnPropertyDescriptor: boom, get: (_target, key) => (key === 'then' ? undefined : boom()), has: boom })],
-  ['a proxy as the list', { ok: true, result: new Proxy([], { get: boom }) }],
+  ['a proxy as the list', { ok: true, result: new Proxy([], { getOwnPropertyDescriptor: boom }) }],
 ] as const) {
   test(`the client turns a throw from ${name} into a CoreProtocolError that names the method`, async () => {
     await assert.rejects(createCoreClient(scripted(reply)).listGauges(), (error: unknown) => error instanceof CoreProtocolError && error.method === 'bowerloom.gauges.list');
   });
 }
+
+test('the client reads a list by index and never runs a get trap of a proxy', async () => {
+  const result = await createCoreClient(scripted({ ok: true, result: new Proxy([], { get: boom }) })).listGauges();
+  assert.deepEqual(result, { ok: true, value: [] });
+});
 
 test('the client turns a throw from a getter on a Gauge into a CoreProtocolError that names the method', async () => {
   const hostile = { ...GOOD, get title() { return boom(); } };

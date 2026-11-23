@@ -18,6 +18,8 @@ const STABLE = [
   'GAUGE_GRANT_MISSING', 'GAUGE_GRANT_STALE', 'GAUGE_TRACES_OWN_STEP', 'GAUGE_AUDIT_FAILED',
   'GAUGE_LAYOUT_INVALID',
   'GAUGE_PLAN_NOT_APPROVED', 'GAUGE_PLAN_CHANGED',
+  'ENGINE_NOT_FOUND', 'ENGINE_REQUEST_INVALID', 'MODEL_NOT_FOR_ENGINE', 'ENGINE_LIMIT', 'ENGINE_PAIR_BUSY', 'ENGINE_FOLDER_SHARED',
+  'ENGINE_START_FAILED', 'ENGINE_SESSION_UNKNOWN', 'ENGINE_SESSION_ENDED', 'ENGINE_STOP_TIMEOUT',
 ];
 
 test('the registry lists the stable codes, each once, in a fixed order', () => {
@@ -100,8 +102,10 @@ test('the naming rules refuse a code that breaks them, and say why', () => {
     GAUGE_NOEXTENSION: 'EXTENSION',
     GAUGE_MODULES: 'MODULE',
     GAUGE_SUBMODULE_X: 'MODULE',
-    BAD_MANIFEST: 'the word GAUGE',
-    GAUGES_ONLY: 'the word GAUGE',
+    BAD_MANIFEST: 'the word GAUGE or the word ENGINE',
+    GAUGES_ONLY: 'the word GAUGE or the word ENGINE',
+    ENGINES_ONLY: 'the word GAUGE or the word ENGINE',
+    SUBENGINE_LIMIT: 'the word GAUGE or the word ENGINE',
     EXTENSION_EXISTS: 'EXTENSION',
     MODULE_NOT_FOUND: 'MODULE',
     GAUGE_ABSURDLY_LONG_CODE_NAME_THAT_NOBODY_CAN_READ_AT_A_GLANCE: 'at most 40',
@@ -116,6 +120,23 @@ test('the naming rules refuse a code that breaks them, and say why', () => {
 
 test('the word GAUGE may lead, follow, or sit in the middle of a code', () => {
   for (const code of ['GAUGE_EXISTS', 'UNKNOWN_GAUGE', 'BAD_GAUGE_PLAN']) assert.deepEqual(codeNameProblems(code), [], code);
+});
+
+test('the word ENGINE is the other scope word: the Engine Host spec names ENGINE_LIMIT and ENGINE_STOP_TIMEOUT, so a code may hold ENGINE in place of GAUGE', () => {
+  for (const code of ['ENGINE_LIMIT', 'ENGINE_STOP_TIMEOUT', 'MODEL_NOT_FOR_ENGINE', 'BAD_ENGINE_PLAN']) assert.deepEqual(codeNameProblems(code), [], code);
+});
+
+test('the engine codes name what they refuse, in one line each', () => {
+  assert.equal(GAUGE_MEANINGS.ENGINE_NOT_FOUND, 'No engine has that id, or its program is missing or cannot run. The reason says which.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_REQUEST_INVALID, 'The request for a session is malformed, so no plan was made. The reason says which field.');
+  assert.equal(GAUGE_MEANINGS.MODEL_NOT_FOR_ENGINE, 'The engine cannot take a main-model choice, and the core never picks another model on its own.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_LIMIT, 'The cap on sessions is reached, so no session can start until one ends.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_PAIR_BUSY, 'This engine already has a session in this folder.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_FOLDER_SHARED, 'Another engine runs in this folder, so the start needs a second approval from the person.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_START_FAILED, 'The program of the engine could not be started, so the session failed. The reason says why.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_SESSION_UNKNOWN, 'No session has that id, or none that this Gauge may use.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_SESSION_ENDED, 'The session has stopped or failed already, so there is nothing to stop.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_STOP_TIMEOUT, 'The engine did not stop in time, so the session stays stopping.');
 });
 
 test('each new code has its own meaning, and the two removal and name codes are in the registry', () => {

@@ -30,6 +30,8 @@ export const MAX_AUDIT_LINE_BYTES = Buffer.byteLength(auditLine({
  * or ends, every permission of the list at once, one record each. So a step never has to drop a record of its own.
  */
 export const MIN_AUDIT_MAX_BYTES = PERMISSION_NAMES.length * MAX_AUDIT_LINE_BYTES;
+/** The largest size cap of the audit file that a core accepts: 1 MiB. With the shortest record, it holds fewer records than `MAX_AUDIT_RECORDS`, so a read of a legal file always fits the client's cap. */
+export const MAX_AUDIT_MAX_BYTES = 1024 * 1024;
 /** The default size cap of the audit file: 64 KiB. */
 export const DEFAULT_AUDIT_MAX_BYTES = 64 * 1024;
 
