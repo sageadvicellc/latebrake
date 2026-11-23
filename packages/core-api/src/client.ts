@@ -2,15 +2,21 @@ import { isGaugeCode, type GaugeCode } from '../../gauge-errors/src/index.js';
 import { PERMISSION_NAMES, isAuditReason, isGrantReason, isManifestReason, isPermission, isTracesPermission, type PermissionName } from '../../gauge-manifest/src/index.js';
 import { MAX_LAYOUT_BYTES, MAX_REVISIONS, canonicalText, isLayoutReason, isProtectedReason, layoutOf, parseLayoutText, sha256Hex, type Layout } from '../../gauge-layout/src/index.js';
 import { MAX_LIST_LENGTH, MAX_NAME_LENGTH, checkEngineId, checkFolder, checkModel, checkSessionId, isRequestReason, readList } from '../../engine-sessions/src/request.js';
+import { isJobReason, isNotInteractiveReason } from '../../jobs/src/definition.js';
+import { HEX_64, denseTexts, isRecord, isStrictlyIncreasing, isText, ownData, plainCopy } from './reading.js';
+import { jobListingOf, jobPlanOf, jobRecordOf, runPlanOf, runSummaryOf, sameDefinition } from './jobs-reply.js';
+import { checkDefinition } from '../../jobs/src/definition.js';
+import { MAX_JOBS, checkJobId } from '../../jobs/src/ids.js';
 import { SESSION_FAILURES, type SessionFailure } from '../../engine-sessions/src/session.js';
 import { SESSION_STATES, type SessionState } from '../../engine-sessions/src/states.js';
 import { hasPlanUnsafeChar, hasUnsafeChar } from '../../engine-sessions/src/text.js';
 import { BILLING_SOURCES, MAX_SESSIONS_LISTED, isNotFoundReason, isStartFailedReason, type Billing } from '../../engine-sessions/src/vocab.js';
 import {
-  ENGINE_CODES, LAYOUT_KINDS, MAX_AUDIT_RECORDS, PLAN_ACTIONS, SESSION_ACTIONS,
+  ENGINE_CODES, JOB_CODES, JOB_KINDS, LAYOUT_KINDS, MAX_AUDIT_RECORDS, PLAN_ACTIONS, SESSION_ACTIONS,
   type AuditEntry, type AuditRead, type Core, type CoreMethod, type CoreResult, type GaugeApplied, type GaugePlan, type GaugeSummary, type GrantApplied, type GrantEntry, type GrantPlan, type GrantRevoked,
   type LayoutApplied, type LayoutKind, type LayoutPlan, type LayoutRevisionEntry, type LayoutSafe, type LayoutState, type PermissionCheck, type PlanAction,
   type SessionAction, type SessionApplied, type SessionModel, type SessionPlan, type SessionSummary,
+  type JobApplied, type JobKind, type JobListing, type JobPlan, type JobRecord, type RunPlan, type RunSummary,
 } from './types.js';
 
 /** The core broke the contract: a reply of the wrong shape, or a code outside the registry. This is a bug, not a refusal. It names the method that failed. */
@@ -115,6 +121,37 @@ export interface CoreClient {
   listSessions(gauge: string, engine: string): Promise<CoreResult<readonly SessionSummary[]>>;
   /** Reads one session. It needs the `sessions.read` grant for the engine of the session. */
   getSession(gauge: string, session: string): Promise<CoreResult<SessionSummary>>;
+  /** Lists the saved jobs, oldest first, at most 64, with no folder and no task. It needs the `jobs.read` grant. */
+  listJobs(gauge: string): Promise<CoreResult<readonly JobListing[]>>;
+  /** Reads one saved job. It needs the `jobs.read` grant. */
+  getJob(gauge: string, job: string): Promise<CoreResult<JobRecord>>;
+  /**
+   * Asks for a plan to create a job from a definition: a title and one to eight sessions, each with a label, an engine, a harness, a folder, a model choice (or `null`), and a task. It needs the `jobs.write` grant.
+   * The definition is sent as it is, so a field that the core does not allow, such as a schedule, is refused by the core with its own code (`GAUGE_JOB_NOT_INTERACTIVE`), and is never dropped here.
+   * Nothing changes until the plan is applied with the person's approval, and the core makes the id of the job then.
+   */
+  planJobCreate(gauge: string, definition: unknown): Promise<CoreResult<JobPlan>>;
+  /** Asks for a plan to replace the definition of a job. It needs the `jobs.write` grant. The job keeps its id. */
+  planJobUpdate(gauge: string, job: string, definition: unknown): Promise<CoreResult<JobPlan>>;
+  /** Asks for a plan to delete a job. It needs the `jobs.write` grant. A run that began already goes on. */
+  planJobDelete(gauge: string, job: string): Promise<CoreResult<JobPlan>>;
+  /** Applies a job plan. Like every plan it needs the person's approval of this exact plan: without one the core refuses with `GAUGE_PLAN_NOT_APPROVED`, with a changed plan or a changed job `GAUGE_PLAN_CHANGED`. */
+  applyJob(plan: JobPlan, approval?: string): Promise<CoreResult<JobApplied>>;
+  /**
+   * Asks for a plan to run a job. It needs the `jobs.run` grant, and the `sessions.start` grant for the engine of every session of the job. The plan lists every session of the run, and the run starts through
+   * this one plan. v0.9.1 runs are interactive: a request for an unattended run is refused with `GAUGE_JOB_NOT_INTERACTIVE`.
+   */
+  planRun(gauge: string, job: string): Promise<CoreResult<RunPlan>>;
+  /**
+   * Applies a run plan: every session of the run starts, or none stays running. It needs the person's approval (`approval`), and a plan with `shared` needs the second approval too (`sharedApproval`), once for the whole run.
+   * When a session fails to start, the others are stopped and the refusal is the failure of the first session in the order of the plan. When a session that started cannot be stopped, the refusal is `GAUGE_RUN_ROLLBACK_FAILED`.
+   * A start gives the run as a group of its sessions.
+   */
+  applyRun(plan: RunPlan, approval?: string, sharedApproval?: string): Promise<CoreResult<RunSummary>>;
+  /** Lists the runs, oldest first. It needs the `jobs.read` grant. A session of an engine that the Gauge holds no `sessions.read` grant for reads as `hidden`. */
+  listRuns(gauge: string): Promise<CoreResult<readonly RunSummary[]>>;
+  /** Reads one run as a group of its sessions. It needs the `jobs.read` grant. */
+  getRun(gauge: string, run: string): Promise<CoreResult<RunSummary>>;
 }
 
 /** What a Gauge asks for when it starts a session. `model` is `null` or left out for the engine's own default. `variables` are names the person allows to pass, besides those the engine declares. */
@@ -146,16 +183,10 @@ function shown(value: unknown): string {
   return `${kept}...`;
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** Reads one own property, once. A property that is only inherited reads as missing. */
 const own = (record: Record<string, unknown>, key: string): unknown => (Object.hasOwn(record, key) ? record[key] : undefined);
 
-/** Reads one own data property, once, and never runs a getter: an accessor reads as missing. The session readers use this one. */
-function ownData(record: object, key: string): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(record, key);
-  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
-}
 
 /**
  * Builds a Gauge summary from a value, or gives back `undefined` when it is not one. Each of the six fields is read once, from the value's own
@@ -173,7 +204,6 @@ function summaryOf(value: unknown): GaugeSummary | undefined {
 }
 
 const ACTIONS: readonly string[] = PLAN_ACTIONS;
-const HEX_64 = /^[0-9a-f]{64}$/;
 const ROUTE = /^\/gauges\/[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const MAX_ID_LENGTH = 64;
 const nullableHash = (value: unknown): string | null | undefined => (value === null || (typeof value === 'string' && HEX_64.test(value)) ? value : undefined);
@@ -203,7 +233,6 @@ function appliedOf(value: unknown): GaugeApplied | undefined {
 }
 
 const sameList = (left: readonly string[], right: readonly string[]): boolean => left.length === right.length && left.every((item, index) => item === right[index]);
-const isText = (value: unknown): value is string => typeof value === 'string';
 /** The most Gauges a list of Gauges or of routes may hold. The shelf and the hidden list of a layout hold 100 each, and the core pages are few, so this is generous, and it is the cap of `readList` by name. */
 const MAX_GAUGES_LISTED = MAX_LIST_LENGTH;
 /** True when the value is a plain array whose length is above the cap. It reads the own length once, and never runs code of the value. */
@@ -216,10 +245,6 @@ function isTooLong(value: unknown, max: number): boolean {
     return false;
   }
 }
-/** Reads a list of text once, by index, from own data properties, with no hole, no accessor, no subclass, and no iterator (see `readList`). Gives a new list. */
-const denseTexts = (value: unknown): string[] | undefined => { const items = readList(value); return items !== undefined && items.every(isText) ? items : undefined; };
-/** True when the list is in strict order, so sorted with no repeat. Names compare by code unit, and permission names are plain ASCII. */
-const isStrictlyIncreasing = (list: readonly string[]): boolean => list.every((item, index) => index === 0 || (list[index - 1] ?? '') < item);
 const ISO_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
 const isIsoTime = (value: unknown): value is string => typeof value === 'string' && ISO_TIME.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
 
@@ -274,6 +299,10 @@ const KINDS: readonly string[] = LAYOUT_KINDS;
 const ENGINE_CODE_SET: ReadonlySet<string> = new Set(ENGINE_CODES);
 /** True for the engine codes that carry no reason. */
 const isEngineCode = (code: GaugeCode): code is Extract<GaugeCode, (typeof ENGINE_CODES)[number]> => ENGINE_CODE_SET.has(code);
+const JOB_CODE_SET: ReadonlySet<string> = new Set(JOB_CODES);
+/** True for the job and run codes that carry no reason. */
+const isJobCode = (code: GaugeCode): code is Extract<GaugeCode, (typeof JOB_CODES)[number]> => JOB_CODE_SET.has(code);
+const JOB_KIND_LIST: readonly string[] = JOB_KINDS;
 const SESSION_STATE_LIST: readonly string[] = SESSION_STATES;
 const SESSION_ACTION_LIST: readonly string[] = SESSION_ACTIONS;
 const BILLING_LIST: readonly string[] = BILLING_SOURCES;
@@ -417,7 +446,11 @@ export function createCoreClient(core: Core): CoreClient {
           if (isNotFoundReason(reason)) return { ok: false, code, reason };
         } else if (code === 'ENGINE_START_FAILED') {
           if (isStartFailedReason(reason)) return { ok: false, code, reason };
-        } else if (isEngineCode(code)) {
+        } else if (code === 'GAUGE_JOB_INVALID') {
+          if (isJobReason(reason)) return { ok: false, code, reason };
+        } else if (code === 'GAUGE_JOB_NOT_INTERACTIVE') {
+          if (isNotInteractiveReason(reason)) return { ok: false, code, reason };
+        } else if (isEngineCode(code) || isJobCode(code)) {
           if (reason === undefined) return { ok: false, code };
         } else {
           if (reason === undefined) return { ok: false, code };
@@ -478,6 +511,21 @@ export function createCoreClient(core: Core): CoreClient {
         const parsed = parseLayoutText(request.text ?? '');
         if (!parsed.ok) throw new CoreProtocolError(method, `result is a plan for a text that is not a layout: ${parsed.reason}`);
         if (plan.nextHash !== sha256Hex(canonicalText(parsed.layout))) throw new CoreProtocolError(method, 'result plan holds a hash that is not the hash of the text that was sent');
+      }
+      return plan;
+    });
+  /** A plan for a change to a job. It must answer the request: the same kind, the same Gauge, the same job, and the same definition. */
+  const jobPlanning = (request: { readonly kind: JobKind; readonly gauge: string; readonly job?: string; readonly definition?: unknown }) =>
+    ask('bowerloom.jobs.plan', { ...request }, (method, result) => {
+      const plan = jobPlanOf(result);
+      if (!plan) throw new CoreProtocolError(method, 'result is not a job plan');
+      if (plan.kind !== request.kind) throw new CoreProtocolError(method, `result is a plan for another change: ${shown(plan.kind)}`);
+      if (plan.gauge !== request.gauge || plan.job !== (request.job ?? null)) throw new CoreProtocolError(method, 'result is a plan for another Gauge or job');
+      if (request.kind !== 'delete') {
+        // The definition that was asked for must be one that the check accepts, and the plan must hold that definition and no other.
+        const asked = checkDefinition(request.definition);
+        if (!asked.ok) throw new CoreProtocolError(method, 'result is a plan for a definition that the check refuses');
+        if (plan.definition === null || !sameDefinition(plan.definition, asked.value)) throw new CoreProtocolError(method, 'result is a plan for another definition');
       }
       return plan;
     });
@@ -592,6 +640,81 @@ export function createCoreClient(core: Core): CoreClient {
       const summary = sessionSummaryOf(result);
       if (!summary) throw new CoreProtocolError(method, 'result is not a session');
       if (summary.id !== session) throw new CoreProtocolError(method, `result is for another session: ${shown(summary.id)}`);
+      return summary;
+    }),
+    listJobs: gauge => ask('bowerloom.jobs.list', { gauge }, (method, result) => {
+      const items = readList(result, MAX_JOBS);
+      if (items === undefined) throw new CoreProtocolError(method, 'result is not a list, or holds more jobs than a core keeps');
+      const jobs: JobListing[] = [];
+      for (const [index, item] of items.entries()) {
+        const listing = jobListingOf(item);
+        if (!listing) throw new CoreProtocolError(method, `result element ${index} is not a job`);
+        if (jobs.some(earlier => earlier.id === listing.id)) throw new CoreProtocolError(method, `result element ${index} repeats a job`);
+        jobs.push(listing);
+      }
+      return Object.freeze(jobs);
+    }),
+    getJob: (gauge, job) => ask('bowerloom.jobs.get', { gauge, job }, (method, result) => {
+      const record = jobRecordOf(result);
+      if (!record) throw new CoreProtocolError(method, 'result is not a job');
+      if (record.id !== job) throw new CoreProtocolError(method, `result is for another job: ${shown(record.id)}`);
+      return record;
+    }),
+    planJobCreate: async (gauge, definition) => jobPlanning({ kind: 'create', gauge, definition: plainCopy(definition) }),
+    planJobUpdate: async (gauge, job, definition) => jobPlanning({ kind: 'update', gauge, job, definition: plainCopy(definition) }),
+    planJobDelete: (gauge, job) => jobPlanning({ kind: 'delete', gauge, job }),
+    applyJob: async (plan, approval) => {
+      const sent = plainCopy(plan);
+      // The result is checked against the copy that was sent, which was read once, and never against a second read of the caller's plan.
+      const kind = isRecord(sent) ? ownData(sent, 'kind') : undefined, job = isRecord(sent) ? ownData(sent, 'job') : undefined;
+      if (!isRecord(sent) || typeof kind !== 'string' || !JOB_KIND_LIST.includes(kind)) throw new TypeError('applyJob: the plan needs an own kind of create, update, or delete');
+      if (kind !== 'create' && typeof job !== 'string') throw new TypeError('applyJob: an update or a delete plan needs an own job');
+      return ask('bowerloom.jobs.apply', { plan: sent, ...(approval === undefined ? {} : { approval }) }, (method, result) => {
+        if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not an applied job plan');
+        const gotKind = ownData(result, 'kind'), gotJob = ownData(result, 'job');
+        if (typeof gotKind !== 'string' || !JOB_KIND_LIST.includes(gotKind) || !checkJobId(gotJob).ok || typeof gotJob !== 'string') throw new CoreProtocolError(method, 'result is not an applied job plan');
+        if (gotKind !== kind || (kind !== 'create' && gotJob !== job)) throw new CoreProtocolError(method, 'result is for another plan');
+        return Object.freeze({ kind: gotKind as JobKind, job: gotJob });
+      });
+    },
+    planRun: (gauge, job) => ask('bowerloom.runs.plan', { gauge, job }, (method, result) => {
+      const plan = runPlanOf(result);
+      if (!plan) throw new CoreProtocolError(method, 'result is not a run plan');
+      if (plan.gauge !== gauge || plan.job !== job) throw new CoreProtocolError(method, 'result is a plan for another Gauge or job');
+      return plan;
+    }),
+    applyRun: async (plan, approval, sharedApproval) => {
+      const sent = plainCopy(plan);
+      const job = isRecord(sent) ? ownData(sent, 'job') : undefined, items = isRecord(sent) ? readList(ownData(sent, 'sessions')) : undefined;
+      if (!isRecord(sent) || typeof job !== 'string') throw new TypeError('applyRun: the plan needs an own job');
+      const asked = items?.map(item => (isRecord(item) ? [ownData(item, 'label'), ownData(item, 'engine')] : [undefined, undefined]));
+      if (asked === undefined || asked.length === 0 || asked.some(([label, engine]) => typeof label !== 'string' || typeof engine !== 'string')) throw new TypeError('applyRun: the plan needs own sessions with a label and an engine');
+      return ask('bowerloom.runs.apply', { plan: sent, ...(approval === undefined ? {} : { approval }), ...(sharedApproval === undefined ? {} : { sharedApproval }) }, (method, result) => {
+        const summary = runSummaryOf(result);
+        if (!summary) throw new CoreProtocolError(method, 'result is not a run');
+        // The run answers the plan: the same job, and the same sessions in the same order.
+        if (summary.job !== job || summary.sessions.length !== asked.length || summary.sessions.some((session, index) => session.label !== asked[index]?.[0] || session.engine !== asked[index]?.[1])) {
+          throw new CoreProtocolError(method, 'result is a run of another plan');
+        }
+        return summary;
+      });
+    },
+    listRuns: gauge => ask('bowerloom.runs.list', { gauge }, (method, result) => {
+      const items = readList(result, MAX_SESSIONS_LISTED);
+      if (items === undefined) throw new CoreProtocolError(method, 'result is not a list, or holds more runs than a host keeps sessions');
+      const runs: RunSummary[] = [];
+      for (const [index, item] of items.entries()) {
+        const summary = runSummaryOf(item);
+        if (!summary) throw new CoreProtocolError(method, `result element ${index} is not a run`);
+        if (runs.some(earlier => earlier.id === summary.id)) throw new CoreProtocolError(method, `result element ${index} repeats a run`);
+        runs.push(summary);
+      }
+      return Object.freeze(runs);
+    }),
+    getRun: (gauge, run) => ask('bowerloom.runs.get', { gauge, run }, (method, result) => {
+      const summary = runSummaryOf(result);
+      if (!summary) throw new CoreProtocolError(method, 'result is not a run');
+      if (summary.id !== run) throw new CoreProtocolError(method, `result is for another run: ${shown(summary.id)}`);
       return summary;
     }),
     listGauges: () => ask('bowerloom.gauges.list', {}, gaugeList),
