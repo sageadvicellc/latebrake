@@ -16,7 +16,8 @@ export const MAX_TASK_LENGTH = 4096;
 
 /**
  * Why a definition, or a job id, was refused with `GAUGE_JOB_INVALID`. `request`: not a plain record, or a field that the definition does not have. `title`, `sessions`, `label`, `engine`, `harness`, `folder`, `model`, `task`:
- * that field is missing or wrong (a label that repeats is a wrong label). `secret`: the task looks like a secret, and a job is stored and shown, so it never holds one. `job`: the id of a job is malformed.
+ * that field is missing or wrong (a label that repeats is a wrong label). `secret`: the title, a label, a folder, a model, or a task looks like a secret. A job is stored and shown to every Gauge that may read jobs, so the scan refuses the shapes it knows
+ * (the scan of `gauge-manifest`). It does not find every secret, and it also refuses a harmless word of 32 characters or more that mixes lower case, upper case, and digits. `job`: the id of a job is malformed.
  * A reason never holds a value that a caller sent.
  */
 export const JOB_REASONS = Object.freeze(['request', 'title', 'sessions', 'label', 'engine', 'harness', 'folder', 'model', 'task', 'secret', 'job'] as const);
@@ -63,9 +64,14 @@ const TASK_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 
 /** A plain record: an ordinary object or one with no prototype. A class instance, a list, and a value with a prototype of its own are not. */
 function isPlainRecord(value: unknown): value is object {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const proto: unknown = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+    const proto: unknown = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  } catch {
+    // A proxy whose trap throws, or one that was revoked, is not a plain record, and never a throw.
+    return false;
+  }
 }
 
 /**
@@ -91,42 +97,64 @@ export const isTitle = (value: unknown): value is string => typeof value === 'st
 
 const SESSION_FIELDS = Object.freeze(['label', 'engine', 'harness', 'folder', 'model', 'task'] as const);
 
-/** The refusal for a field that asks for a schedule or an unattended run, which is checked before anything else in a record, so the person is told the true cause. */
-function interactiveRefusal(fields: ReadonlyMap<string, unknown>): DefinitionRefusal | undefined {
-  if (fields.has('schedule')) return notInteractive('schedule');
-  if (fields.has('unattended')) return notInteractive('unattended');
-  return undefined;
+/**
+ * Looks for a schedule and for an unattended flag in the definition and in every session, before any other field is checked, so the person is told the true cause and an earlier invalid field never hides it.
+ * A schedule anywhere is named before an unattended flag anywhere. A session that is not a record, or that cannot be read, holds no flag the scan can see, and the full check refuses it later.
+ */
+function interactiveRefusal(top: ReadonlyMap<string, unknown>): DefinitionRefusal | undefined {
+  const found = new Set<NotInteractiveReason>();
+  if (top.has('schedule')) found.add('schedule');
+  if (top.has('unattended')) found.add('unattended');
+  const items = readList(top.get('sessions'), MAX_JOB_SESSIONS);
+  for (const item of items ?? []) {
+    if (!isPlainRecord(item)) continue;
+    const fields = ownFields(item);
+    if (fields === undefined) continue;
+    if (fields.has('schedule')) found.add('schedule');
+    if (fields.has('unattended')) found.add('unattended');
+  }
+  return found.has('schedule') ? notInteractive('schedule') : found.has('unattended') ? notInteractive('unattended') : undefined;
+}
+
+/** What a check of the task gives: the text, or the reason. */
+type TaskResult = { readonly ok: true; readonly value: string } | { readonly ok: false; readonly reason: Extract<JobReason, 'task' | 'secret'> };
+
+function checkTask(value: unknown): TaskResult {
+  if (typeof value !== 'string' || value.length < 1 || value.length > MAX_TASK_LENGTH) return { ok: false, reason: 'task' };
+  if (TASK_UNSAFE.test(value.replace(/[\n\t]/g, ''))) return { ok: false, reason: 'task' };
+  return looksLikeSecret(value) ? { ok: false, reason: 'secret' } : { ok: true, value };
 }
 
 /** Checks the text of a task: `undefined` when it is good, `task` when it is the wrong shape, and `secret` when it looks like a secret. The Core API client uses it to read a plan. */
 export function checkTaskText(value: unknown): Extract<JobReason, 'task' | 'secret'> | undefined {
-  if (typeof value !== 'string' || value.length < 1 || value.length > MAX_TASK_LENGTH) return 'task';
-  if (TASK_UNSAFE.test(value.replace(/[\n\t]/g, ''))) return 'task';
-  return looksLikeSecret(value) ? 'secret' : undefined;
+  const checked = checkTask(value);
+  return checked.ok ? undefined : checked.reason;
 }
 
 function checkSession(value: unknown): { readonly ok: true; readonly value: JobSession } | DefinitionRefusal {
   if (!isPlainRecord(value)) return invalid('request');
   const fields = ownFields(value);
   if (fields === undefined) return invalid('request');
-  const refused = interactiveRefusal(fields);
-  if (refused) return refused;
   if ([...fields.keys()].some(key => !(SESSION_FIELDS as readonly string[]).includes(key))) return invalid('request');
   const label = fields.get('label'), engine = fields.get('engine'), harness = fields.get('harness'), folder = fields.get('folder'), model = fields.get('model'), task = fields.get('task');
+  // A field is checked for its shape first, and then for a secret, so a field that is wrong is refused for that, and a secret is only looked for in a field that is otherwise good.
   if (!isLabel(label)) return invalid('label');
+  if (looksLikeSecret(label)) return invalid('secret');
   if (typeof engine !== 'string' || !checkEngineId(engine).ok) return invalid('engine');
   if (typeof harness !== 'string' || !checkEngineId(harness).ok) return invalid('harness');
   if (typeof folder !== 'string' || !checkFolder(folder).ok) return invalid('folder');
+  if (looksLikeSecret(folder)) return invalid('secret');
   // A model choice is written out: `null` for the engine's own default, or a provider and a model. A field that is left out is not a choice.
   const checkedModel = model === undefined ? undefined : checkModel(model);
   if (checkedModel === undefined || !checkedModel.ok) return invalid('model');
-  const badTask = checkTaskText(task);
-  if (badTask !== undefined) return invalid(badTask);
-  return { ok: true, value: Object.freeze({ label, engine, harness, folder, model: checkedModel.value, task: task as string }) };
+  if (checkedModel.value !== null && (looksLikeSecret(checkedModel.value.provider) || looksLikeSecret(checkedModel.value.model))) return invalid('secret');
+  const checkedTask = checkTask(task);
+  if (!checkedTask.ok) return invalid(checkedTask.reason);
+  return { ok: true, value: Object.freeze({ label, engine, harness, folder, model: checkedModel.value, task: checkedTask.value }) };
 }
 
 /**
- * Checks a job definition. A field that asks for a schedule or an unattended run is refused first, as `GAUGE_JOB_NOT_INTERACTIVE`. Every other refusal is `GAUGE_JOB_INVALID` with the field that is wrong. The sessions are a plain
+ * Checks a job definition. A schedule or an unattended flag, in the definition or in any session, is refused first, as `GAUGE_JOB_NOT_INTERACTIVE`, whatever else is wrong. Every other refusal is `GAUGE_JOB_INVALID` with the field that is wrong. The sessions are a plain
  * list of 1 to 8, each with exactly the six fields, and no two share a label. The value that comes out is new and frozen.
  */
 export function checkDefinition(value: unknown): { readonly ok: true; readonly value: JobDefinition } | DefinitionRefusal {
@@ -138,6 +166,7 @@ export function checkDefinition(value: unknown): { readonly ok: true; readonly v
   if ([...fields.keys()].some(key => key !== 'title' && key !== 'sessions')) return invalid('request');
   const title = fields.get('title');
   if (!isTitle(title)) return invalid('title');
+  if (looksLikeSecret(title)) return invalid('secret');
   const items = readList(fields.get('sessions'), MAX_JOB_SESSIONS);
   if (items === undefined || items.length === 0) return invalid('sessions');
   const sessions: JobSession[] = [];

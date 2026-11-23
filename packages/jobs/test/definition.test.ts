@@ -172,3 +172,52 @@ test('the hash of a definition is the SHA-256 of its canonical text, and any cha
   assert.ok(again.ok);
   assert.equal(hashDefinition(again.value), hashDefinition(base.value));
 });
+
+test('a schedule or an unattended flag in a later session is found first, before the reason of an earlier invalid field', () => {
+  const bad = session({ engine: 'Engine', task: '', folder: 'relative' });
+  assert.deepEqual(checkDefinition(definition({ sessions: [bad, session({ label: 'second', schedule: 'daily' })] })), interactive('schedule'));
+  assert.deepEqual(checkDefinition(definition({ sessions: [bad, session({ label: 'second', unattended: true })] })), interactive('unattended'));
+  assert.deepEqual(checkDefinition(definition({ title: '', sessions: [bad, bad, session({ label: 'third', schedule: null })] })), interactive('schedule'));
+  assert.deepEqual(checkDefinition(definition({ sessions: [session({ label: 'first', unattended: true }), session({ label: 'second', schedule: 'daily' })] })), interactive('schedule'), 'a schedule wins over an unattended flag, wherever each sits');
+  assert.deepEqual(checkDefinition(definition({ unattended: true, sessions: [bad, session({ label: 'second', schedule: 'daily' })] })), interactive('schedule'));
+  for (const hostile of [session({ label: 'second', schedule: 'daily', task: 7 })]) assert.deepEqual(checkDefinition(definition({ sessions: [bad, hostile] })), interactive('schedule'));
+  // A session list that cannot be read is still a refusal of the list.
+  const holey = [session()];
+  holey.length = 2;
+  assert.deepEqual(checkDefinition(definition({ sessions: holey })), invalid('sessions'));
+  // A session that is not a record cannot hold a flag, and is refused as a request when the scan is done.
+  assert.deepEqual(checkDefinition(definition({ sessions: [7, session({ label: 'second', schedule: 'x' })] })), interactive('schedule'));
+  assert.deepEqual(checkDefinition(definition({ sessions: [7] })), invalid('request'));
+});
+
+test('a secret is found in the title, the label, the folder, and the model, and not only in the task', () => {
+  const key = `sk-${'a1'.repeat(15)}`;
+  assert.deepEqual(checkDefinition(definition({ title: `Use ${key}` })), invalid('secret'));
+  assert.deepEqual(checkDefinition(definition({ sessions: [session({ label: 'sk-aaaaaaaaaaaaaaaaaaaaaaaa' })] })), invalid('secret'));
+  assert.deepEqual(checkDefinition(definition({ sessions: [session({ folder: `/work/${key}` })] })), invalid('secret'));
+  assert.deepEqual(checkDefinition(definition({ sessions: [session({ model: { provider: key, model: 'm' } })] })), invalid('secret'));
+  assert.deepEqual(checkDefinition(definition({ sessions: [session({ model: { provider: 'p', model: key } })] })), invalid('secret'));
+  assert.ok(checkDefinition(definition({ title: 'The key lives in the vault', sessions: [session({ folder: '/work/keys', model: { provider: 'local', model: 'llama-3' } })] })).ok);
+  // A field that is wrong is refused for that field first, and a secret is only looked for in a field that is otherwise good.
+  assert.deepEqual(checkDefinition(definition({ title: ` ${key}` })), invalid('title'));
+});
+
+test('a long mixed-case word is a false alarm of the scan, in any field, and the refusal says secret', () => {
+  assert.deepEqual(checkDefinition(definition({ title: 'a1B2'.repeat(8) })), invalid('secret'));
+  assert.ok(checkDefinition(definition({ title: 'a1B2'.repeat(7) })).ok, 'under 32 characters it is not');
+});
+
+test('a proxy whose trap throws is a request refusal and never a throw: its prototype, its list check, and a revoked proxy', () => {
+  const protoTrap = new Proxy({}, { getPrototypeOf() { throw new Error('trap'); } });
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  const listProxy = Proxy.revocable([], {});
+  listProxy.revoke();
+  for (const bad of [protoTrap, revoked.proxy, definition({ sessions: [protoTrap] }), definition({ sessions: [revoked.proxy] })]) {
+    let result: unknown;
+    assert.doesNotThrow(() => { result = checkDefinition(bad); });
+    assert.deepEqual(result, invalid('request'));
+  }
+  assert.doesNotThrow(() => checkDefinition(definition({ sessions: listProxy.proxy })));
+  assert.deepEqual(checkDefinition(definition({ sessions: listProxy.proxy })), invalid('sessions'));
+});

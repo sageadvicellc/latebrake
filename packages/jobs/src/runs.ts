@@ -1,8 +1,8 @@
 import { randomBytes } from 'node:crypto';
-import type { EngineHost, GroupRefusal, HostRefusal, StartPlanContent } from '../../engine-sessions/src/host.js';
+import type { BegunStart, EngineHost, GroupRefusal, StartPlanContent } from '../../engine-sessions/src/host.js';
 import type { ModelChoice } from '../../engine-sessions/src/request.js';
 import type { SessionState } from '../../engine-sessions/src/states.js';
-import type { Billing } from '../../engine-sessions/src/vocab.js';
+import type { Billing, StartFailedReason } from '../../engine-sessions/src/vocab.js';
 import { escapeText } from '../../engine-sessions/src/text.js';
 import { isRunId } from './ids.js';
 import type { Job } from './store.js';
@@ -61,18 +61,34 @@ export interface RunView {
   readonly sessions: readonly RunSessionView[];
 }
 
-/** How a run ended its start: every session started, or the first failure in the order of the plan (the others were stopped), or an undo that could not stop a session. */
+/** The session of a run that a refusal is about: its place in the plan (the first is 0) and its label. Both are closed values: a place of at most 7, and a label that the definition check accepted. */
+export interface RunMember {
+  readonly index: number;
+  readonly label: string;
+}
+
+/** A refusal of a plan or of a begin for one session: the refusal of the host, its `index`, and the label of that session. */
+export type RunRefusal = GroupRefusal & { readonly label: string };
+
+/**
+ * How a run ended its start. Every session said that it runs: `ok`. Or the first failure, in the order that things happened and not in the order of the plan, which is the cause of the others, and the sessions
+ * that had started were stopped: `ENGINE_START_FAILED` with its reason, the id of the run (the run stays recorded and reads as a group that ended), and the session that failed. Or an undo that could not stop a session:
+ * `GAUGE_RUN_ROLLBACK_FAILED`, with the same run, session, and the reason of the first failure as `cause`.
+ */
 export type RunOutcome =
   | { readonly ok: true; readonly run: string }
-  | HostRefusal
-  | { readonly ok: false; readonly code: 'GAUGE_RUN_ROLLBACK_FAILED'; readonly reason?: undefined };
+  | { readonly ok: false; readonly code: 'ENGINE_START_FAILED'; readonly reason: StartFailedReason; readonly run: string; readonly member: RunMember }
+  | { readonly ok: false; readonly code: 'GAUGE_RUN_ROLLBACK_FAILED'; readonly run: string; readonly member: RunMember; readonly cause: StartFailedReason };
 
 export interface BegunRun {
   readonly ok: true;
   readonly run: string;
   /** The session ids, in the order of the plan. */
   readonly sessions: readonly string[];
-  /** Resolves when every program has started, or when a start failed and the run was undone. */
+  /**
+   * Resolves when every session has left `starting`: all of them say that they run (a spawn is not enough), or the first one that fails, or times out, or is stopped, starts the undo of all of them at once, and the
+   * outcome comes when the undo is done. It is bounded by the start timeout of the host.
+   */
   readonly settled: Promise<RunOutcome>;
 }
 
@@ -85,13 +101,13 @@ export interface RunBookOptions {
 }
 
 export interface RunBook {
-  /** Plans a run of a job from live state. It changes nothing. A refusal is the refusal of the host for the first session that cannot start, with its `index`. */
-  plan(job: Job): ({ readonly ok: true } & PlannedRun) | GroupRefusal;
+  /** Plans a run of a job from live state. It changes nothing. A refusal is the refusal of the host for the first session that cannot start, with its `index` and its label. */
+  plan(job: Job): ({ readonly ok: true } & PlannedRun) | RunRefusal;
   /**
    * Begins a run: every session starts before this returns, and the run is recorded at once. `sharedApproved` is the second approval, and only the value `true` counts. A refusal starts nothing and records nothing.
    * The plan must be the one `plan` gave in this tick: one that no longer matches the state is a bug of the caller, and throws.
    */
-  begin(planned: PlannedRun, approvals: { readonly sharedApproved: boolean }): BegunRun | GroupRefusal;
+  begin(planned: PlannedRun, approvals: { readonly sharedApproved: boolean }): BegunRun | RunRefusal;
   /** The runs, oldest first. A run whose sessions the host has all dropped is no longer listed. */
   list(): readonly RunView[];
   /** One run, or `undefined`. */
@@ -163,19 +179,45 @@ export function createRunBook(options: RunBookOptions): RunBook {
     return false;
   }
 
-  async function settle(run: string, members: readonly { readonly session: string; readonly settled: Promise<{ readonly ok: true } | HostRefusal> }[]): Promise<RunOutcome> {
-    const results = await Promise.all(members.map(member => member.settled));
-    const failed = results.find((result): result is HostRefusal => !result.ok);
-    if (failed === undefined) return { ok: true, run };
-    // One session did not start, so no session of the run is left running: the person approved a run, and a part of it is not one.
-    const undone = await Promise.all(members.map(member => undo(run, member.session)));
-    return undone.every(done => done) ? failed : { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED' };
+  /**
+   * Waits until every session has left `starting`. The first session that does not run (it failed, timed out, was stopped, or its program ended before it said it runs) starts the stop of every session of the run at once,
+   * and the wait goes on for the others, which the stop brings out of `starting` too. Only that first failure is the answer, and it is logged with its session: the others are its consequence.
+   */
+  async function settle(run: string, plan: RunPlanContent, members: readonly BegunStart[]): Promise<RunOutcome> {
+    let first: { readonly member: RunMember; readonly reason: StartFailedReason } | undefined;
+    let undoing: Promise<boolean[]> | undefined;
+    await Promise.all(members.map((begun, index) => begun.started.then(result => {
+      if (result.ok || first !== undefined) return;
+      const label = plan.sessions[index]?.label;
+      if (label === undefined) throw new Error('run book: a member has no session in the plan');
+      const reason = result.code === 'ENGINE_START_FAILED' ? result.reason : 'other';
+      first = { member: { index, label }, reason };
+      say(`run book: the start of session ${escapeText(begun.session)} (${escapeText(label)}) of the run ${escapeText(run)} failed: ${escapeText(result.code)} ${escapeText(reason)}`);
+      // One session did not start, so no session of the run is left running: the person approved a run, and a part of it is not one.
+      undoing = Promise.all(members.map(other => undo(run, other.session)));
+    })));
+    if (first === undefined || undoing === undefined) return { ok: true, run };
+    const undone = await undoing;
+    return undone.every(done => done)
+      ? { ok: false, code: 'ENGINE_START_FAILED', reason: first.reason, run, member: first.member }
+      : { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run, member: first.member, cause: first.reason };
   }
+
+  /** The label of the session at a place of the plan. */
+  const labelAt = (plan: RunPlanContent, index: number): string => {
+    const label = plan.sessions[index]?.label;
+    if (label === undefined) throw new Error('run book: a refusal names a session that the plan does not hold');
+    return label;
+  };
 
   return {
     plan(job) {
       const grouped = host.planStartGroup(job.definition.sessions.map(session => ({ engine: session.engine, folder: session.folder, model: session.model })));
-      if (!grouped.ok) return grouped;
+      if (!grouped.ok) {
+        const named = job.definition.sessions[grouped.index];
+        if (named === undefined) throw new Error('run book: a refusal names a session that the job does not hold');
+        return { ...grouped, label: named.label };
+      }
       const sessions = grouped.plans.map((start, index): RunSessionPlan => {
         const defined = job.definition.sessions[index];
         if (defined === undefined) throw new Error('run book: the host planned more sessions than the job holds');
@@ -191,17 +233,23 @@ export function createRunBook(options: RunBookOptions): RunBook {
     },
     begin(planned, approvals) {
       if (planned.start.length !== planned.plan.sessions.length) throw new Error('run book: the plan holds a different number of sessions than the host plans');
+      // The plans of the host and the sessions of the plan go by position, so they must be the same engines in the same order.
+      if (planned.start.some((start, index) => start.engine !== planned.plan.sessions[index]?.engine)) throw new Error('run book: the engine of a plan of the host is not the engine of the plan in that place');
       prune();
       // The id is made before any session starts, so an id that throws or is bad leaves nothing running.
       const id = newId();
       if (!isRunId(id) || runs.has(id)) throw new Error('run book: newId gave a run id that is malformed or already used');
       const group = host.beginStartGroup(planned.start, approvals);
-      if (!group.ok) return group;
+      if (!group.ok) return { ...group, label: labelAt(planned.plan, group.index) };
       runs.set(id, {
         job: planned.plan.job, title: planned.plan.title,
-        members: planned.plan.sessions.map((session, index) => ({ label: session.label, engine: session.engine, session: group.members[index]?.session ?? '' })),
+        members: planned.plan.sessions.map((session, index) => {
+          const begun = group.members[index];
+          if (begun === undefined) throw new Error('run book: the host began fewer sessions than the plan holds');
+          return { label: session.label, engine: session.engine, session: begun.session };
+        }),
       });
-      return { ok: true, run: id, sessions: group.members.map(member => member.session), settled: settle(id, group.members) };
+      return { ok: true, run: id, sessions: group.members.map(member => member.session), settled: settle(id, planned.plan, group.members) };
     },
     list() {
       prune();

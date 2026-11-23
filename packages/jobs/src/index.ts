@@ -6,4 +6,4 @@ export type { DefinitionRefusal, JobDefinition, JobReason, JobSession, NotIntera
 export { MAX_JOBS, checkJobId, createJobStore } from './store.js';
 export type { Job, JobListing, JobStore, JobStoreOptions } from './store.js';
 export { createRunBook, isRunId } from './runs.js';
-export type { BegunRun, PlannedRun, RunBook, RunBookOptions, RunOutcome, RunPlanContent, RunSessionPlan, RunSessionState, RunSessionView, RunView } from './runs.js';
+export type { BegunRun, PlannedRun, RunBook, RunBookOptions, RunMember, RunOutcome, RunRefusal, RunPlanContent, RunSessionPlan, RunSessionState, RunSessionView, RunView } from './runs.js';
