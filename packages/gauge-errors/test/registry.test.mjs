@@ -127,13 +127,13 @@ test('the word ENGINE is the other scope word: the Engine Host spec names ENGINE
 });
 
 test('the engine codes name what they refuse, in one line each', () => {
-  assert.equal(GAUGE_MEANINGS.ENGINE_NOT_FOUND, 'No engine has that id, or the program of the engine is not on this computer.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_NOT_FOUND, 'No engine has that id, or its program is missing or cannot run. The reason says which.');
   assert.equal(GAUGE_MEANINGS.ENGINE_REQUEST_INVALID, 'The request for a session is malformed, so no plan was made. The reason says which field.');
   assert.equal(GAUGE_MEANINGS.MODEL_NOT_FOR_ENGINE, 'The engine cannot take a main-model choice, and the core never picks another model on its own.');
   assert.equal(GAUGE_MEANINGS.ENGINE_LIMIT, 'The cap on sessions is reached, so no session can start until one ends.');
   assert.equal(GAUGE_MEANINGS.ENGINE_PAIR_BUSY, 'This engine already has a session in this folder.');
   assert.equal(GAUGE_MEANINGS.ENGINE_FOLDER_SHARED, 'Another engine runs in this folder, so the start needs a second approval from the person.');
-  assert.equal(GAUGE_MEANINGS.ENGINE_START_FAILED, 'The program of the engine could not be started, so the session failed.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_START_FAILED, 'The program of the engine could not be started, so the session failed. The reason says why.');
   assert.equal(GAUGE_MEANINGS.ENGINE_SESSION_UNKNOWN, 'No session has that id, or none that this Gauge may use.');
   assert.equal(GAUGE_MEANINGS.ENGINE_SESSION_ENDED, 'The session has stopped or failed already, so there is nothing to stop.');
   assert.equal(GAUGE_MEANINGS.ENGINE_STOP_TIMEOUT, 'The engine did not stop in time, so the session stays stopping.');

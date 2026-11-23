@@ -7,6 +7,7 @@ import path from 'node:path';
 import { createEngineHost, type EngineHost, type HostOptions } from '../src/host.js';
 import { fakeEngine, type FakeStep } from '../src/fixtures.js';
 import { createProcessLauncher } from '../src/process-launcher.js';
+import type { Launcher } from '../src/launcher.js';
 import { assertNoDescendants, assertNoLeaks, killWithTag, liveWithTag } from './leaks.js';
 import { newTag, recording, waitFor } from './support.js';
 
@@ -19,17 +20,24 @@ async function withHost(engines: readonly (readonly [string, readonly FakeStep[]
   const tag = newTag();
   const launcher = recording(createProcessLauncher());
   const host = createEngineHost({ engines: engines.map(([id, steps, extra]) => fakeEngine({ id, tag, steps, ...(extra ?? {}) })), launcher, ...options });
+  let failure: unknown;
+  let failed = false;
   try {
     await body(host, tag, launcher);
     // Before anything is killed: a process that lives behind a session that has ended is a leak of the host, and it must fail the test, not be hidden by the clean-up below.
     const live = host.list().filter(item => item.state !== 'stopped' && item.state !== 'failed').length;
     if (live === 0) await assertNoLeaks(tag, 1000);
-  } finally {
-    const survivors = await host.killAll();
-    await assertNoLeaks(tag);
-    await assertNoDescendants();
-    assert.equal(survivors, 0, 'a program survived the kill signal');
+  } catch (error) {
+    failed = true;
+    failure = error;
   }
+  // The clean-up always runs. An error of the clean-up never replaces the error of the body: the first failure is the one that is thrown.
+  const cleanup: unknown[] = [];
+  try { if ((await host.killAll()) !== 0) cleanup.push(new Error('a program survived the kill signal')); } catch (error) { cleanup.push(error); }
+  try { await assertNoLeaks(tag); } catch (error) { cleanup.push(error); }
+  try { await assertNoDescendants(); } catch (error) { cleanup.push(error); }
+  if (failed) throw failure;
+  if (cleanup.length > 0) throw cleanup[0];
 }
 async function begin(host: EngineHost, engine: string, dir: string, extra: Record<string, unknown> = {}, sharedApproved = false): Promise<string> {
   const planned = host.planStart({ engine, folder: dir, ...extra });
@@ -41,6 +49,19 @@ async function begin(host: EngineHost, engine: string, dir: string, extra: Recor
   return begun.session;
 }
 const state = (host: EngineHost, id: string) => host.get(id)?.state;
+
+/** A launcher that holds back the exit events of its programs until the test releases them, so a test can look at the host between the kill and the exit. */
+function gate(inner: Launcher): Launcher & { release(): void } {
+  const held: (() => void)[] = [];
+  let open = false;
+  return {
+    release() { open = true; for (const run of held.splice(0)) run(); },
+    launch(spec) {
+      const handle = inner.launch(spec);
+      return { ...handle, onExit: listener => handle.onExit((code, signal, tail) => { if (open) listener(code, signal, tail); else held.push(() => listener(code, signal, tail)); }) };
+    },
+  };
+}
 
 test('a real engine starts in its folder, the session reads running from its own line, and the engine got a clean environment', async () => {
   const dir = folder('alpha');
@@ -176,7 +197,7 @@ test('a program that is not there fails the start with ENGINE_START_FAILED', asy
     assert.ok(planned.ok);
     const begun = host.beginStart(planned.plan, { sharedApproved: false });
     assert.ok(begun.ok);
-    assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED' });
+    assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'program_missing' });
     assert.deepEqual(host.list().map(item => [item.state, item.failure]), [['failed', 'start_failed']]);
   } finally {
     await host.killAll();
@@ -215,9 +236,9 @@ test('the default locate refuses a program that is not an executable file, and f
   const tag = newTag();
   const make = (program: string) => createEngineHost({ engines: [{ ...fakeEngine({ id: 'alpha', tag, steps: [] }), program }], launcher: createProcessLauncher() });
   const dir = folder('locate');
-  assert.deepEqual(make(plain).planStart({ engine: 'alpha', folder: dir }), { ok: false, code: 'ENGINE_NOT_FOUND' });
-  assert.deepEqual(make(root).planStart({ engine: 'alpha', folder: dir }), { ok: false, code: 'ENGINE_NOT_FOUND' }, 'a folder is not a program');
-  assert.deepEqual(make('no-such-program-anywhere-on-path').planStart({ engine: 'alpha', folder: dir }), { ok: false, code: 'ENGINE_NOT_FOUND' });
+  assert.deepEqual(make(plain).planStart({ engine: 'alpha', folder: dir }), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_not_executable' }, 'a file that cannot run is not a missing file');
+  assert.deepEqual(make(root).planStart({ engine: 'alpha', folder: dir }), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' }, 'a folder is not a program');
+  assert.deepEqual(make('no-such-program-anywhere-on-path').planStart({ engine: 'alpha', folder: dir }), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
   const found = make('node').planStart({ engine: 'alpha', folder: dir });
   assert.ok(found.ok, JSON.stringify(found));
   assert.equal(path.basename(found.plan.program).startsWith('node'), true);
@@ -249,24 +270,32 @@ test('a real engine that claims it has stopped, while its process lives, is fail
   }
 });
 
-test('a pair stays busy while the process of a failed session lives, and is free once it has gone', async () => {
+test('a pair stays busy while the exit of a failed session has not been seen, and is free once it has', async () => {
   const dir = folder('pair-claim');
-  await withHost([['alpha', [{ say: 'state:running' }, { ignoreTerm: true }, { say: 'state:stopped' }, { hold: true }]]], { cap: 1 }, async (host, tag) => {
+  const tag = newTag();
+  const gated = gate(createProcessLauncher());
+  const host = createEngineHost({ engines: [fakeEngine({ id: 'alpha', tag, steps: [{ say: 'state:running' }, { say: 'state:stopped' }, { hold: true }] })], launcher: gated, cap: 1 });
+  try {
     const id = await begin(host, 'alpha', dir);
-    await waitFor(() => state(host, id) === 'failed', 'failed');
-    await assertNoLeaks(tag);
+    await waitFor(() => state(host, id) === 'failed', 'failed by the claim');
+    assert.deepEqual(host.planStart({ engine: 'alpha', folder: dir }), { ok: false, code: 'ENGINE_PAIR_BUSY' }, 'the program has been killed, but its exit has not been seen');
+    gated.release();
     await waitFor(() => host.planStart({ engine: 'alpha', folder: dir }).ok, 'the slot to free once the exit is seen');
-  });
+  } finally {
+    gated.release();
+    await host.killAll();
+    await assertNoLeaks(tag);
+  }
 });
 
 test('a session that never says it runs fails after the start timeout, and its process is killed', async () => {
   const faults: string[] = [];
-  await withHost([['alpha', [{ hold: true }]]], { startTimeoutMs: 250, log: entry => faults.push(entry.message) }, async (host, tag) => {
+  await withHost([['alpha', [{ hold: true }]]], { startTimeoutMs: 1000, log: entry => faults.push(entry.message) }, async (host, tag) => {
     const id = await begin(host, 'alpha', folder('never-runs'));
     assert.equal(state(host, id), 'starting');
     await waitFor(() => state(host, id) === 'failed', 'the start timeout');
     assert.equal(host.get(id)?.failure, 'start_failed');
-    assert.deepEqual(faults, [`engine session ${id}: the program did not say it runs within 250 ms`]);
+    assert.deepEqual(faults, [`engine session ${id}: the program did not say it runs within 1000 ms`]);
     await assertNoLeaks(tag);
   });
 });
@@ -337,4 +366,38 @@ test('two folders that only share a prefix, or a name in different places, are t
     assert.ok(nested.ok, 'a folder inside another is not the same folder');
     assert.deepEqual(nested.plan.sharedWith, []);
   });
+});
+
+test('a program in a folder that cannot be searched is not a missing program: the default locate says it cannot run', async t => {
+  if (process.getuid?.() === 0) { t.skip('the superuser can search every folder'); return; }
+  const locked = folder('locked-bin');
+  const program = path.join(locked, 'tool');
+  fs.writeFileSync(program, '#!/bin/sh\n', { mode: 0o755 });
+  fs.chmodSync(locked, 0o000);
+  try {
+    const tag = newTag();
+    const host = createEngineHost({ engines: [{ ...fakeEngine({ id: 'alpha', tag, steps: [] }), program }], launcher: createProcessLauncher() });
+    assert.deepEqual(host.planStart({ engine: 'alpha', folder: folder('locked-work') }), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_not_executable' });
+  } finally {
+    fs.chmodSync(locked, 0o755);
+  }
+});
+
+test('a launch problem with a real program is described by the code of the operating system, and the answer given is the same word for a path with a secret in it', async () => {
+  const tag = newTag();
+  const faults: string[] = [];
+  const spec = { ...fakeEngine({ id: 'alpha', tag, steps: [] }), program: path.join(root, 'plain-file-not-run') };
+  fs.writeFileSync(spec.program, 'x', { mode: 0o644 });
+  const host = createEngineHost({ engines: [spec], launcher: createProcessLauncher(), locate: program => program, log: entry => faults.push(entry.message) });
+  try {
+    const planned = host.planStart({ engine: 'alpha', folder: folder('eacces') });
+    assert.ok(planned.ok);
+    const begun = host.beginStart(planned.plan, { sharedApproved: false });
+    assert.ok(begun.ok);
+    assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'not_executable' });
+    assert.match(faults[0] ?? '', /EACCES/);
+  } finally {
+    await host.killAll();
+    await assertNoLeaks(tag);
+  }
 });

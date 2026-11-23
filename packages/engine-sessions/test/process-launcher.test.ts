@@ -209,6 +209,20 @@ test('the last 2,048 characters of standard error come with the exit, and a shor
   }
 });
 
+test('the end of standard error never starts in the middle of a character: a lone half of a pair is dropped, and a character cut off at the end is not lost silently', async () => {
+  const tag = newTag();
+  try {
+    const cut = await run([{ stderr: `\u{1F600}${'y'.repeat(2047)}` }], tag);
+    assert.equal(cut.tail, 'y'.repeat(2047), 'the cut falls inside the pair, so the low half is dropped');
+    const whole = await run([{ stderr: `${'x'.repeat(5)}\u{1F600}` }], tag);
+    assert.equal(whole.tail, `${'x'.repeat(5)}\u{1F600}`);
+    const truncated = await run([{ stderrHex: '6f6bf09f98' }], tag);
+    assert.equal(truncated.tail, 'ok\ufffd', 'a character cut off at the end of the stream is flushed as the replacement character');
+  } finally {
+    await assertNoLeaks(tag);
+  }
+});
+
 test('standard error is drained: a program that writes two megabytes to it still ends', async () => {
   const tag = newTag();
   try {
@@ -285,4 +299,29 @@ test('the orphan detector finds a leaked process by its parent links alone, with
     for (const { pid } of liveDescendants(process.pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
   }
   await assertNoDescendants(2000);
+});
+
+test('a kill that fails for a reason other than the group being gone goes to the log channel, and a group that is gone does not', async () => {
+  const tag = newTag();
+  const messages: string[] = [];
+  const kill = process.kill;
+  const launcher = createProcessLauncher({ log: message => messages.push(message) });
+  const handle = launcher.launch({ program: process.execPath, args: [FAKE_ENGINE_PROGRAM, '--tag', tag, '--script', JSON.stringify([{ hold: true }])], cwd: process.cwd(), env: {} });
+  let ended = false;
+  handle.onExit(() => { ended = true; });
+  try {
+    await waitFor(() => liveWithTag(tag).length === 1, 'the program');
+    for (const code of ['EPERM', 'ESRCH']) {
+      process.kill = ((pid: number, signal?: string | number) => { if (pid < 0) throw Object.assign(new Error(`kill ${code}`), { code }); return kill(pid, signal); }) as typeof process.kill;
+      handle.signal('term');
+    }
+    process.kill = kill;
+    assert.equal(messages.length, 1);
+    assert.match(messages[0] ?? '', /could not send SIGTERM to the group of the program: EPERM/);
+  } finally {
+    process.kill = kill;
+    handle.signal('kill');
+    await waitFor(() => ended, 'the exit');
+    await assertNoLeaks(tag);
+  }
 });

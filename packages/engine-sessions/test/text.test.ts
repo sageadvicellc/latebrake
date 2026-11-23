@@ -31,3 +31,9 @@ test('an escaped text holds no unsafe character, and escaping twice escapes the 
   assert.equal(hasPlanUnsafeChar(once), false);
   assert.equal(escapeText(once), once.replace(/\\/g, '\\\\'));
 });
+
+test('the wide class also holds unassigned code points, private use, and lone surrogates, which a font may draw as nothing', () => {
+  for (const text of ['\u2065', '\ufff0', '\ufff8', '\ue000', '\uf8ff', '\ud800', '\udfff', 'a\ud800b']) assert.equal(hasPlanUnsafeChar(text), true, JSON.stringify(text));
+  for (const text of ['\u{1F680}', '\ud83d\ude80', 'caf\u00e9']) assert.equal(hasPlanUnsafeChar(text), false, `${JSON.stringify(text)}: a whole pair is one letter`);
+  assert.equal(escapeText('a\u2065b\ufff0\ue000\ud800'), 'a\\u{2065}b\\u{fff0}\\u{e000}\\u{d800}');
+});

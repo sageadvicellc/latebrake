@@ -11,7 +11,7 @@ export const FAKE_ENGINE_PROGRAM: string = fileURLToPath(new URL('./fake-engine-
  * `say` prints a line. `sleep` waits that many milliseconds. `exit` ends with that code. `ignoreTerm` makes it ignore SIGTERM, as a stuck engine does. `spawnChild` starts a helper in
  * its own process group, which lives until a signal ends it. `printEnv`, `printArgs`, and `printCwd` print what the engine got. `readStdin` prints how many bytes it could read from its input.
  * `hold` waits for ever. `crash` ends the engine with a signal. `spawnEscaped` starts a helper in a process group of its own, which no signal to the engine's group reaches. `spawnEscapedHolding` is the same helper, and it also
- * holds the output pipe of the engine open. `stderr` writes the text to standard error, and `stderrBytes` writes that many bytes to it.
+ * holds the output pipe of the engine open. `stderr` writes the text to standard error, `stderrBytes` writes that many bytes to it, and `stderrHex` writes the bytes of a hex text, for a character that is cut in two.
  */
 export type FakeStep =
   | { readonly say: string }
@@ -28,7 +28,8 @@ export type FakeStep =
   | { readonly spawnEscaped: true }
   | { readonly spawnEscapedHolding: true }
   | { readonly stderr: string }
-  | { readonly stderrBytes: number };
+  | { readonly stderrBytes: number }
+  | { readonly stderrHex: string };
 
 /** The adapter of the fake engine: a line `state:<name>` claims that state, and any other line claims none. A name that is not a state is passed on, so the machine can refuse it. */
 export const fakeSignal = (line: string): string | null => (line.startsWith('state:') ? line.slice('state:'.length) : null);

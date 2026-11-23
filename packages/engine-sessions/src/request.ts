@@ -79,9 +79,9 @@ function ownData(record: object, key: string): unknown {
   return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
 }
 
-/** A provider or a model: 1 to 128 characters of the plain charset, never starting with a dash (a flag) or an equals sign. */
+/** A provider or a model: 1 to 128 characters of the plain charset, never starting with a dash (a flag), an equals sign, an at sign, or a plus sign (each of which a tool may read as an option or a file). */
 const choiceText = (value: unknown): value is string =>
-  typeof value === 'string' && value.length >= 1 && value.length <= MAX_CHOICE_LENGTH && CHOICE_CHARS.test(value) && !value.startsWith('-') && !value.startsWith('=');
+  typeof value === 'string' && value.length >= 1 && value.length <= MAX_CHOICE_LENGTH && CHOICE_CHARS.test(value) && !/^[-=@+]/.test(value);
 
 /** A model choice: `null` (the engine's own default), or exactly a provider and a model, each a short plain text. `undefined` reads as `null`. */
 export function checkModel(value: unknown): Checked<ModelChoice | null> {

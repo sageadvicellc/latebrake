@@ -45,7 +45,7 @@ test('a model choice is null, or exactly a provider and a model, each a short pl
 
 test('a model choice uses a plain charset: letters, digits, and . _ : / @ + - only, and it never starts with a dash or an equals sign', () => {
   for (const model of ['gpt-4.1', 'claude-sonnet-4-5', 'org/model:tag@v1+x', 'A_b.c', 'a'.repeat(128), '9']) assert.deepEqual(checkModel({ provider: 'p', model }), ok({ provider: 'p', model }), model);
-  for (const bad of ['-x', '=x', '--model', ' x', 'x ', 'a b', "a'b", 'a#b', 'a%b', 'a&b', 'a*b', 'a?b', 'a~b', 'a<b', 'a>b', 'a(b', 'a,b', 'a!b', 'a{b', 'a[b']) {
+  for (const bad of ['-x', '=x', '@x', '+x', '@org/model', '+1', '--model', ' x', 'x ', 'a b', "a'b", 'a#b', 'a%b', 'a&b', 'a*b', 'a?b', 'a~b', 'a<b', 'a>b', 'a(b', 'a,b', 'a!b', 'a{b', 'a[b']) {
     assert.deepEqual(checkModel({ provider: 'p', model: bad }), bad_('model'), bad);
     assert.deepEqual(checkModel({ provider: bad, model: 'm' }), bad_('model'), `provider ${bad}`);
   }

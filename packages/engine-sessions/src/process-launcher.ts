@@ -26,18 +26,31 @@ export function killLiveGroups(): void {
   }
 }
 
-let handlersInstalled = false;
-/** Installs, once, the handlers that kill the groups when this process exits, and when it gets SIGINT or SIGTERM. A signal handler is removed after it runs, and the signal is sent again when no other listener is left, so the process ends as it would have without it. */
+const COVERED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
+const signalHandlers = new Map<NodeJS.Signals, () => void>();
+let exitHandlerInstalled = false;
+
+/**
+ * Installs the handlers that kill the groups when this process exits, and when it gets SIGINT, SIGTERM, SIGHUP, or SIGQUIT. It is called at every launch and installs whatever is missing, so the cover is there for every engine.
+ * A signal handler stays installed when something else listens for the signal: the process lives on, and an engine that starts later needs the cover too. When it is the only listener, it removes itself and sends the signal
+ * again, so the process ends as it would have without it, and the next launch installs it again.
+ */
 function installHandlers(): void {
-  if (handlersInstalled) return;
-  handlersInstalled = true;
-  process.on('exit', killLiveGroups);
-  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  if (!exitHandlerInstalled) {
+    exitHandlerInstalled = true;
+    process.on('exit', killLiveGroups);
+  }
+  for (const signal of COVERED_SIGNALS) {
+    const existing = signalHandlers.get(signal);
+    if (existing !== undefined && process.listeners(signal).includes(existing)) continue;
     const handler = (): void => {
       killLiveGroups();
-      process.removeListener(signal, handler);
-      if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+      if (process.listenerCount(signal) === 1) {
+        process.removeListener(signal, handler);
+        process.kill(process.pid, signal);
+      }
     };
+    signalHandlers.set(signal, handler);
     process.on(signal, handler);
   }
 }
@@ -82,50 +95,73 @@ export function lineSplitter(onLine: (line: string) => void): { push(chunk: Buff
 
 const NAMES: Readonly<Record<StopSignal, NodeJS.Signals>> = { term: 'SIGTERM', kill: 'SIGKILL' };
 
+export interface ProcessLauncherOptions {
+  /** Receives a line when a signal could not be sent for a reason other than that the group is gone, or when a pipe or a program reports an error. Standard error by default. */
+  readonly log?: (message: string) => void;
+}
+
+const toStandardError = (message: string): void => { process.stderr.write(`engine launcher: ${message}\n`); };
+
+/** The last `STDERR_TAIL_CHARS` characters of a text, never starting with the low half of a surrogate pair. */
+function endOf(text: string): string {
+  const tail = text.slice(-STDERR_TAIL_CHARS);
+  const first = tail.charCodeAt(0);
+  return first >= 0xdc00 && first <= 0xdfff ? tail.slice(1) : tail;
+}
+
 /**
  * Starts real programs. The program is started with an argument list and never through a shell, in the folder, with exactly the environment it is given, and with no standard input
- * (`/dev/null`), so the host can never answer a prompt of the engine. It leads its own process group, so one signal reaches it and everything it started. When it has gone, whatever it left
- * behind in the group is killed, so a session never leaves an orphan.
+ * (`/dev/null`), so the host can never answer a prompt of the engine. It leads its own process group, so one signal reaches it and everything it started in that group. When it has gone, whatever it left
+ * behind in the group is killed. A helper that left the group is out of reach, and so is everything when this process is killed with SIGKILL: those are known limits.
  */
-export function createProcessLauncher(): Launcher {
+export function createProcessLauncher(options: ProcessLauncherOptions = {}): Launcher {
+  const log = options.log ?? toStandardError;
   return {
     launch(spec: LaunchSpec): Launched {
       installHandlers();
       const spawnListeners: (() => void)[] = [], errorListeners: ((error: Error) => void)[] = [], lineListeners: ((line: string) => void)[] = [];
       const exitListeners: ((code: number | null, signal: string | null, stderrTail: string) => void)[] = [];
       const child = spawn(spec.program, [...spec.args], { cwd: spec.cwd, env: { ...spec.env }, shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      // The group exists from the moment the program is made, and not from the later spawn event, so a process that exits in the same tick still takes the engine with it.
+      if (child.pid !== undefined) liveGroups.add(child.pid);
       let spawned = false, groupGone = false, finished = false;
       const killGroup = (signal: NodeJS.Signals): void => {
         if (child.pid === undefined || groupGone) return;
         try {
           process.kill(-child.pid, signal);
-        } catch {
-          // The group is gone (ESRCH), or the platform has no groups: there is nothing left to signal.
+        } catch (error) {
+          // ESRCH is the group being gone, and there is nothing left to signal. Any other error means a program may still run, so it is reported.
+          const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : '';
+          if (code !== 'ESRCH') log(`could not send ${signal} to the group of the program: ${code === '' ? String(error) : code}`);
         }
       };
       const stdout = lineSplitter(line => { for (const listener of lineListeners) listener(line); });
       child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
-      child.stdout?.on('error', () => undefined);
+      child.stdout?.on('error', error => log(`the output of the program failed: ${error.message}`));
       // Standard error is read so that the pipe never fills. No state is read from it. Its last characters are kept for the log of a failed session.
       let stderrTail = '';
       const stderrDecoder = new StringDecoder('utf8');
-      child.stderr?.on('data', (chunk: Buffer) => { stderrTail = (stderrTail + stderrDecoder.write(chunk)).slice(-STDERR_TAIL_CHARS); });
-      child.stderr?.on('error', () => undefined);
-      child.on('spawn', () => { spawned = true; if (child.pid !== undefined) liveGroups.add(child.pid); for (const listener of spawnListeners) listener(); });
-      child.on('error', error => { if (!spawned && !finished) { finished = true; for (const listener of errorListeners) listener(error); } });
+      child.stderr?.on('data', (chunk: Buffer) => { stderrTail = endOf(stderrTail + stderrDecoder.write(chunk)); });
+      child.stderr?.on('error', error => log(`the standard error of the program failed: ${error.message}`));
+      child.on('spawn', () => { spawned = true; for (const listener of spawnListeners) listener(); });
+      child.on('error', error => {
+        if (!spawned && !finished) { finished = true; if (child.pid !== undefined) liveGroups.delete(child.pid); for (const listener of errorListeners) listener(error); return; }
+        log(`the program reported an error: ${error.message}`);
+      });
       let result: { code: number | null; signal: string | null } | undefined;
       const finish = (): void => {
         if (finished || result === undefined) return;
         finished = true;
-        groupGone = true;
-        if (child.pid !== undefined) liveGroups.delete(child.pid);
         stdout.end();
+        stderrTail = endOf(stderrTail + stderrDecoder.end());
         for (const listener of exitListeners) listener(result.code, result.signal, stderrTail);
       };
       child.on('exit', (code, signal) => {
         result = { code, signal };
-        // Whatever the program left in its group is killed now: the pipes close, and no process is left behind.
+        // Whatever the program left in its group is killed now: the pipes close, and no process is left behind. The group is gone from this moment, so no later signal can reach a group id that was reused.
         killGroup('SIGKILL');
+        groupGone = true;
+        if (child.pid !== undefined) liveGroups.delete(child.pid);
         const timer = setTimeout(() => { child.stdout?.destroy(); child.stderr?.destroy(); finish(); }, CLOSE_GRACE_MS);
         timer.unref();
         child.once('close', () => { clearTimeout(timer); finish(); });

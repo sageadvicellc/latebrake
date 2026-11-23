@@ -8,7 +8,7 @@ import {
 import { createSession, report, type FaultEntry, type Session, type SessionFailure } from './session.js';
 import { isTerminal, type SessionState } from './states.js';
 import { escapeText, hasUnsafeChar } from './text.js';
-import { BILLING_SOURCES, type Billing } from './vocab.js';
+import { BILLING_SOURCES, KEEP_ENDED_SESSIONS, type Billing, type NotFoundReason, type StartFailedReason } from './vocab.js';
 
 export { BILLING_SOURCES };
 export type { Billing };
@@ -23,6 +23,7 @@ export const DEFAULT_START_TIMEOUT_MS = 30_000;
 export const DEFAULT_KILL_WAIT_MS = 5000;
 const MAX_CAP = 64;
 const MAX_STOP_TIMEOUT_MS = 600_000;
+const MAX_START_TIMEOUT_MS = 600_000;
 const MAX_KILL_WAIT_MS = 60_000;
 const MAX_ENGINES = 16;
 
@@ -53,8 +54,11 @@ export interface HostOptions {
   readonly stopTimeoutMs?: number;
   /** The environment the core passes variables from. The environment of this process by default. */
   readonly environment?: () => Readonly<Record<string, string | undefined>>;
-  /** Finds the real path of a program, or `undefined` when it is not on this computer. The default reads the path, and the folders of PATH for a bare name. */
-  readonly locate?: (program: string) => string | undefined;
+  /**
+   * Finds the real path of a program. It gives `undefined` or `{ error: 'missing' }` when the program is not on this computer, and `{ error: 'not_executable' }` when it is there and cannot run (or a folder on the way
+   * cannot be searched). The default reads the path, and the folders of PATH for a bare name, and it tells a permission problem from a missing file.
+   */
+  readonly locate?: (program: string) => string | undefined | { readonly error: 'missing' | 'not_executable' };
   /**
    * Gives the real path of a folder for display, and a key that names the folder itself, or `undefined` when it is not a folder. The pair rule and the shared folder rule compare keys, so two spellings of one folder
    * are one folder. The default key is the device and the inode of the real directory, which no spelling, link, case, or normal form changes.
@@ -62,7 +66,7 @@ export interface HostOptions {
   readonly canonical?: (folder: string) => { readonly path: string; readonly key: string } | undefined;
   /** How long a session may stay `starting`, in milliseconds: a whole number from 1 to 600,000. 30,000 by default. */
   readonly startTimeoutMs?: number;
-  /** Runs a callback after a delay and gives the function that cancels it. A timer by default. A test passes a clock that it moves by hand. It times the start only. */
+  /** Runs a callback after a delay and gives the function that cancels it. An unref-ed timer by default, so a pending start timeout never holds the process open. A test passes a clock that it moves by hand. It times the start only. */
   readonly schedule?: (run: () => void, ms: number) => () => void;
   /** How long `killAll` waits for the programs to go after the kill signal, in milliseconds: a whole number from 1 to 60,000. 5,000 by default. */
   readonly killWaitMs?: number;
@@ -105,9 +109,11 @@ export interface SessionInfo {
 
 export type HostRefusal =
   | { readonly ok: false; readonly code: 'ENGINE_REQUEST_INVALID'; readonly reason: RequestReason }
+  | { readonly ok: false; readonly code: 'ENGINE_NOT_FOUND'; readonly reason: NotFoundReason }
+  | { readonly ok: false; readonly code: 'ENGINE_START_FAILED'; readonly reason: StartFailedReason }
   | {
     readonly ok: false;
-    readonly code: 'ENGINE_NOT_FOUND' | 'MODEL_NOT_FOR_ENGINE' | 'ENGINE_LIMIT' | 'ENGINE_PAIR_BUSY' | 'ENGINE_FOLDER_SHARED' | 'ENGINE_START_FAILED' | 'ENGINE_SESSION_UNKNOWN' | 'ENGINE_SESSION_ENDED' | 'ENGINE_STOP_TIMEOUT';
+    readonly code: 'MODEL_NOT_FOR_ENGINE' | 'ENGINE_LIMIT' | 'ENGINE_PAIR_BUSY' | 'ENGINE_FOLDER_SHARED' | 'ENGINE_SESSION_UNKNOWN' | 'ENGINE_SESSION_ENDED' | 'ENGINE_STOP_TIMEOUT';
     readonly reason?: undefined;
   };
 
@@ -138,13 +144,13 @@ export interface EngineHost {
   beginStop(sessionId: unknown): BegunStop | HostRefusal;
   /** Begins a stop and waits for it. The app uses it for "Stop all". */
   stop(sessionId: unknown): Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal>;
-  /** The sessions, oldest first, as new frozen copies. With an engine id, the sessions of that engine. */
+  /** The sessions, oldest first, as new frozen copies: every live session and the newest 256 that have ended. With an engine id, the sessions of that engine. */
   list(engine?: string): readonly SessionInfo[];
   /** One session as a new frozen copy, or `undefined`. */
   get(sessionId: string): SessionInfo | undefined;
   /**
    * Kills every process that is still running and waits for it to go. This is the end of the app, and the clean-up of a test. It changes no state by itself: the exits move the sessions.
-   * It gives the number of programs that were still alive when the wait ended, so a caller can tell that a kill did not work.
+   * It gives the number of programs that were still alive when the wait ended, so a caller can tell that a kill did not work. After it, the host is shutting down: no further start is planned or begun.
    */
   killAll(): Promise<number>;
   /** The number of processes the host has asked the launcher to start since it was made. */
@@ -164,13 +170,23 @@ interface Tracked {
   exited: boolean;
   /** Cancels the start timeout. Safe to call again. */
   cancelStart: () => void;
+  /** The values of the variables that the program was given, 6 characters or more, longest first. They are cut out of any text of the program before it is logged. */
+  readonly secrets: readonly string[];
+  /** True once the host has sent the kill signal to a session that it failed itself, so the end of its standard error is worth a log line. */
+  killedByHost: boolean;
   readonly endWaiters: (() => void)[];
 }
 
 const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const sorted = (names: Iterable<string>): string[] => [...new Set(names)].sort();
-const refusal = (code: Exclude<HostRefusal['code'], 'ENGINE_REQUEST_INVALID'>): HostRefusal => ({ ok: false, code });
+const refusal = (code: Extract<HostRefusal, { readonly reason?: undefined }>['code']): HostRefusal => ({ ok: false, code });
+const notFound = (reason: NotFoundReason): HostRefusal => ({ ok: false, code: 'ENGINE_NOT_FOUND', reason });
+const startFailed = (reason: StartFailedReason): HostRefusal => ({ ok: false, code: 'ENGINE_START_FAILED', reason });
+/** The code of an error of the operating system, when it has one. */
+const errorCode = (error: unknown): string | undefined => (typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' ? error.code : undefined);
+const REDACTED = '[redacted]';
+const MIN_SECRET_LENGTH = 6;
 const invalid = (reason: RequestReason): HostRefusal => ({ ok: false, code: 'ENGINE_REQUEST_INVALID', reason });
 
 /** Reads one own data property of a request without running a getter. */
@@ -179,26 +195,35 @@ function field(request: object, key: string): unknown {
   return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
 }
 
-/** The default `locate`: a path must be an executable file, and a bare name is searched in the folders of PATH. The answer is the real path. */
-function locateProgram(program: string): string | undefined {
+/**
+ * The default `locate`: a path must be an executable file, and a bare name is searched in the folders of PATH. The answer is the real path. A file that is not there, or that is not a file, is missing.
+ * A file that is there and cannot run, a file that cannot be read for lack of permission, and a folder that cannot be searched are `not_executable`, and never missing.
+ */
+function locateProgram(program: string): string | { readonly error: 'missing' | 'not_executable' } {
   const candidates = path.isAbsolute(program) ? [program] : (process.env['PATH'] ?? '').split(path.delimiter).filter(dir => dir !== '').map(dir => path.join(dir, program));
+  let blocked = false;
   for (const candidate of candidates) {
     try {
       if (!fs.statSync(candidate).isFile()) continue;
       fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.realpathSync(candidate);
-    } catch {
-      // Not here: try the next folder.
+      return fs.realpathSync.native(candidate);
+    } catch (error) {
+      const code = errorCode(error);
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') blocked = true;
     }
   }
-  return undefined;
+  return { error: blocked ? 'not_executable' : 'missing' };
 }
 
-/** The default `canonical`: the real path of a folder that exists, and its device and inode as the key. The key is read from the real directory, so no spelling of the path changes it. */
+/**
+ * The default `canonical`: the real path of a folder that exists, and its device and inode as the key. The key is read from the real directory, so no spelling of the path changes it. The numbers are read as big integers,
+ * so an inode above 2^53 is not rounded into another folder's number. There is a window between `realpath` and `stat`, in which the folder can be replaced: the plan is made again when the start begins, which reads both again,
+ * and a folder that changed in between gives another key and so a changed plan. The window cannot be closed without opening the folder, which a core with no right to read it must not do.
+ */
 function canonicalFolder(folder: string): { readonly path: string; readonly key: string } | undefined {
   try {
-    const real = fs.realpathSync(folder);
-    const stat = fs.statSync(real);
+    const real = fs.realpathSync.native(folder);
+    const stat = fs.statSync(real, { bigint: true });
     return stat.isDirectory() ? { path: real, key: `${stat.dev}:${stat.ino}` } : undefined;
   } catch {
     return undefined;
@@ -213,6 +238,7 @@ function checkSpec(spec: EngineSpec): EngineSpec {
   if (!Array.isArray(spec.args) || !spec.args.every(arg => typeof arg === 'string')) throw new RangeError(`the arguments of the engine ${id.value} are a list of text`);
   if (!Array.isArray(spec.env) || !spec.env.every(name => typeof name === 'string' && VARIABLE_NAME.test(name) && !isLoaderVariable(name)) || spec.env.length > MAX_VARIABLES) throw new RangeError(`the variables of the engine ${id.value} are a list of plain names`);
   if (!(BILLING_SOURCES as readonly string[]).includes(spec.billing)) throw new RangeError(`the billing source of the engine ${id.value} is engine-plan or local: a provider key waits for the keys and spend work`);
+  // The adapter is code of the app: `signalOf` and `modelArgs` are plain functions that do not use `this`, and the host keeps them as given.
   if (typeof spec.signalOf !== 'function') throw new RangeError(`the engine ${id.value} needs a signalOf function`);
   if (spec.modelArgs !== undefined && typeof spec.modelArgs !== 'function') throw new RangeError(`the modelArgs of the engine ${id.value} is a function`);
   return Object.freeze({
@@ -228,7 +254,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
   const stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   if (!Number.isSafeInteger(stopTimeoutMs) || stopTimeoutMs < 1 || stopTimeoutMs > MAX_STOP_TIMEOUT_MS) throw new RangeError(`the stop timeout is a whole number of milliseconds from 1 to ${MAX_STOP_TIMEOUT_MS}`);
   const startTimeoutMs = options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
-  if (!Number.isSafeInteger(startTimeoutMs) || startTimeoutMs < 1 || startTimeoutMs > MAX_STOP_TIMEOUT_MS) throw new RangeError(`the start timeout is a whole number of milliseconds from 1 to ${MAX_STOP_TIMEOUT_MS}`);
+  if (!Number.isSafeInteger(startTimeoutMs) || startTimeoutMs < 1 || startTimeoutMs > MAX_START_TIMEOUT_MS) throw new RangeError(`the start timeout is a whole number of milliseconds from 1 to ${MAX_START_TIMEOUT_MS}`);
   const killWaitMs = options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
   if (!Number.isSafeInteger(killWaitMs) || killWaitMs < 1 || killWaitMs > MAX_KILL_WAIT_MS) throw new RangeError(`the kill wait is a whole number of milliseconds from 1 to ${MAX_KILL_WAIT_MS}`);
   if (!Array.isArray(options.engines) || options.engines.length > MAX_ENGINES) throw new RangeError(`the host holds at most ${MAX_ENGINES} engines`);
@@ -243,11 +269,13 @@ export function createEngineHost(options: HostOptions): EngineHost {
   const locate = options.locate ?? locateProgram;
   const canonical = options.canonical ?? canonicalFolder;
   const log = options.log;
-  const schedule = options.schedule ?? ((run: () => void, ms: number): (() => void) => { const timer = setTimeout(run, ms); return () => clearTimeout(timer); });
+  const schedule = options.schedule ?? ((run: () => void, ms: number): (() => void) => { const timer = setTimeout(run, ms); timer.unref(); return () => clearTimeout(timer); });
   const newId = options.newId ?? ((): string => `s-${randomBytes(8).toString('hex')}`);
   /** Every session ever made, in the order they were made. A Map, so an id such as `__proto__` is only a key. */
   const records = new Map<string, Tracked>();
   let launched = 0;
+  /** True once `killAll` has run: the host is shutting down, so no start is planned or begun. */
+  let closed = false;
 
   const info = (record: Tracked): SessionInfo => Object.freeze({
     id: record.session.id, engine: record.engine.id, folder: record.folder, state: record.session.state, billing: record.engine.billing,
@@ -256,20 +284,39 @@ export function createEngineHost(options: HostOptions): EngineHost {
   /** The sessions that hold a place: those that have not ended, and those that have ended in state while their process still lives, because a process that lives is a process that runs. */
   const active = (): Tracked[] => [...records.values()].filter(record => !isTerminal(record.session.state) || !record.exited);
 
+  /**
+   * The host keeps every session that is live and the newest 256 that have ended, so its memory and the list that a read gives stay bounded. A session that has ended but whose program has not been seen to go is not ended
+   * for this purpose. The oldest ended session is dropped first.
+   */
+  const prune = (): void => {
+    const ended = [...records.values()].filter(record => isTerminal(record.session.state) && record.exited);
+    for (const record of ended.slice(0, Math.max(0, ended.length - KEEP_ENDED_SESSIONS))) records.delete(record.session.id);
+  };
+
   const endOf = (record: Tracked): void => {
     record.exited = true;
     for (const resolve of record.endWaiters.splice(0)) resolve();
+    prune();
   };
   /** Resolves true when the program has gone, and false when `ms` milliseconds pass first. */
   const waitForEnd = (record: Tracked, ms: number): Promise<boolean> => new Promise(resolve => {
     if (record.exited) { resolve(true); return; }
     const timer = setTimeout(() => { const at = record.endWaiters.indexOf(done); if (at !== -1) record.endWaiters.splice(at, 1); resolve(false); }, ms);
+    // A wait that is pending never holds the process open: the programs themselves do that for as long as they live.
+    timer.unref();
     function done(): void { clearTimeout(timer); resolve(true); }
     record.endWaiters.push(done);
   });
 
   /** A session marked failed while its program still runs gets the signal that cannot be ignored, so a failed session never has a live process. */
-  const killIfRunning = (record: Tracked): void => { if (!record.exited) record.handle?.signal('kill'); };
+  const killIfRunning = (record: Tracked): void => {
+    if (record.exited) return;
+    record.killedByHost = true;
+    record.handle?.signal('kill');
+  };
+
+  /** Cuts the value of every variable that was passed to the program out of a text of the program, before it is logged. */
+  const redact = (record: Tracked, text: string): string => record.secrets.reduce((cleaned, secret) => cleaned.split(secret).join(REDACTED), text);
 
   const say = (record: Tracked, from: SessionState, message: string): void => {
     report(log, { session: record.session.id, from, to: record.session.state, message: `engine session ${record.session.id}: ${message}` });
@@ -301,8 +348,9 @@ export function createEngineHost(options: HostOptions): EngineHost {
     }
     if (claimed === null || claimed === undefined || claimed === state) return;
     if (claimed === 'running' || claimed === 'waiting') {
-      record.session.move(claimed);
       record.cancelStart();
+      // The move is legal from every state that a claim can reach. If it is ever refused, the machine has failed the session, so the process is killed all the same.
+      if (!record.session.move(claimed).ok) killIfRunning(record);
       return;
     }
     record.cancelStart();
@@ -317,7 +365,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
   function onExited(record: Tracked, code: number | null, signal: string | null, stderrTail: string): void {
     const before = record.session.state;
     record.cancelStart();
-    const tail = stderrTail === '' ? '' : `; the end of its standard error: "${escapeText(stderrTail)}"`;
+    const tail = stderrTail === '' ? '' : `; the end of its standard error: "${escapeText(redact(record, stderrTail))}"`;
     if (before === 'starting') record.session.fail('start_failed');
     else if (before === 'running' || before === 'waiting') {
       if (code === 0 && signal === null) record.session.move('stopped');
@@ -328,10 +376,13 @@ export function createEngineHost(options: HostOptions): EngineHost {
       if (!(code === 0 && signal === null) && signal !== 'SIGTERM' && signal !== 'SIGKILL') say(record, before, `${describeEnd(code, signal)} while it was stopping${tail}`);
     }
     if (record.session.state === 'failed' && (before === 'starting' || before === 'running' || before === 'waiting')) say(record, before, `${describeEnd(code, signal)}${tail}`);
+    // A session that the host failed or killed itself has its end logged too, with what the program last wrote, so the cause is not lost.
+    else if (before === 'failed' && record.killedByHost && tail !== '') say(record, before, `${describeEnd(code, signal)} after the host killed it${tail}`);
     endOf(record);
   }
 
   function planWithKey(request: unknown): { readonly ok: true; readonly plan: StartPlanContent; readonly key: string } | HostRefusal {
+    if (closed) return startFailed('shutting_down');
     if (typeof request !== 'object' || request === null || Array.isArray(request)) return invalid('engine');
     const id = checkEngineId(field(request, 'engine'));
     if (!id.ok) return invalid(id.reason);
@@ -342,12 +393,19 @@ export function createEngineHost(options: HostOptions): EngineHost {
     const allowed = checkVariables(field(request, 'variables'), { denylist: false });
     if (!allowed.ok) return invalid(allowed.reason);
     const spec = engines.get(id.value);
-    if (!spec) return refusal('ENGINE_NOT_FOUND');
+    if (!spec) return notFound('engine');
     // The denylist is for the names that a caller asks for. A name that the engine declares itself passes, since the plan lists it and a plan that is planned again must be accepted.
     if (allowed.value.some(name => isRefusedVariable(name) && !spec.env.includes(name))) return invalid('variables');
-    const program = locate(spec.program);
+    const located = locate(spec.program);
+    if (located === undefined) return notFound('program_missing');
+    if (typeof located !== 'string') {
+      if (located.error === 'missing') return notFound('program_missing');
+      if (located.error === 'not_executable') return notFound('program_not_executable');
+      throw new Error('engine host: locate gave an answer that is neither a path nor a known error');
+    }
+    const program = located;
     // A program whose path holds a control or separator character is not offered to the person: the plan shows the real path as it is.
-    if (program === undefined || hasUnsafeChar(program)) return refusal('ENGINE_NOT_FOUND');
+    if (hasUnsafeChar(program)) return notFound('program_missing');
     const real = canonical(folder.value);
     if (real === undefined || !checkFolder(real.path).ok) return invalid('folder');
     if (typeof real.key !== 'string' || real.key === '') throw new Error('engine host: canonical gave a folder with no key');
@@ -387,49 +445,68 @@ export function createEngineHost(options: HostOptions): EngineHost {
   }
 
   function beginStart(plan: StartPlanContent, approvals: { readonly sharedApproved: boolean }): BegunStart | HostRefusal {
+    // The caller's objects are read once. Everything below runs from the plan that the host made itself and checked, and never from a second read of the caller's plan.
+    const sharedApproved = approvals.sharedApproved;
     const fresh = planWithKey({ engine: plan.engine, folder: plan.folder, model: plan.model, variables: plan.variables });
     if (!fresh.ok) return fresh;
+    const verified = fresh.plan;
     // The core plans again from live state, in the same tick, before it calls this. A plan that differs here is a bug in the caller, so it throws.
-    if (JSON.stringify(fresh.plan) !== JSON.stringify(plan)) throw new Error('engine host: the plan does not match the state now, so the core must plan again before it begins a start');
+    if (JSON.stringify(verified) !== JSON.stringify(plan)) throw new Error('engine host: the plan does not match the state now, so the core must plan again before it begins a start');
     // Only the value true is the second approval: a truthy value of another kind is not.
-    if (plan.sharedWith.length > 0 && approvals.sharedApproved !== true) return refusal('ENGINE_FOLDER_SHARED');
-    const spec = engines.get(plan.engine);
+    if (verified.sharedWith.length > 0 && sharedApproved !== true) return refusal('ENGINE_FOLDER_SHARED');
+    const spec = engines.get(verified.engine);
     if (!spec) throw new Error('engine host: an engine that was planned is gone');
     const id = newId();
     if (!checkSessionId(id).ok || records.has(id)) throw new Error('engine host: newId gave a session id that is malformed or already used');
-    const record: Tracked = { session: createSession(id, log), engine: spec, folder: plan.folder, key: fresh.key, model: plan.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [] };
+    const env = environmentOf(verified.variables);
+    const secrets = [...new Set(Object.values(env).filter(value => value.length >= MIN_SECRET_LENGTH))].sort((a, b) => b.length - a.length);
+    const record: Tracked = {
+      session: createSession(id, log), engine: spec, folder: verified.folder, key: fresh.key, model: verified.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [], secrets, killedByHost: false,
+    };
     records.set(id, record);
     // The program was found when the start was planned, and the session is checked ready, so the session walks detected, ready, starting before the program runs.
     record.session.move('ready');
     record.session.move('starting');
     const settled = new Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal>(resolve => {
-      /** The program could not be started. The cause goes to the log with the session id, and the person sees only the bare code. A handle that was made before a throw is killed. */
-      const failed = (error: unknown): void => {
-        const code = typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string' ? `${escapeText((error as { code: string }).code)} ` : '';
+      /**
+       * The program could not be started, or a step after it was made threw. The cause goes to the log with the session id and the real state, and the person sees a closed reason. A session that is stopping stays stopped,
+       * since the person asked for that. When no program was made, nothing can live and the place is freed. When one was made, it is killed, and the place is held until its exit is seen.
+       */
+      const failed = (error: unknown, programMade: boolean): void => {
+        const from = record.session.state;
+        const code = errorCode(error);
         record.cancelStart();
-        record.session.fail('start_failed');
-        say(record, 'starting', `the program could not be started: ${code}${escapeText(error instanceof Error ? error.message : String(error))}`);
+        if (from === 'stopping') record.session.move('stopped');
+        else record.session.fail('start_failed');
+        say(record, from, `the program could not be started: ${code === undefined ? '' : `${escapeText(code)} `}${escapeText(error instanceof Error ? error.message : String(error))}`);
         killIfRunning(record);
-        endOf(record);
-        resolve(refusal('ENGINE_START_FAILED'));
+        if (!programMade) endOf(record);
+        const folderThere = ((): boolean => { try { return canonical(verified.folder) !== undefined; } catch { return false; } })();
+        const reason: StartFailedReason = code === 'ENOENT' ? (folderThere ? 'program_missing' : 'folder_unusable')
+          : code === 'ENOTDIR' ? 'folder_unusable'
+          : code === 'EACCES' || code === 'EPERM' || code === 'ENOEXEC' ? 'not_executable'
+          : 'other';
+        resolve(startFailed(reason));
       };
       try {
-        const args = [...spec.args, ...(plan.model !== null && spec.modelArgs !== undefined ? spec.modelArgs(plan.model) : [])];
+        const args = [...spec.args, ...(verified.model !== null && spec.modelArgs !== undefined ? spec.modelArgs(verified.model) : [])];
         launched += 1;
-        const handle = launcher.launch({ program: plan.program, args, cwd: plan.folder, env: environmentOf(plan.variables) });
+        const handle = launcher.launch({ program: verified.program, args, cwd: verified.folder, env });
         record.handle = handle;
+        // The exit is registered first, so that whatever throws after this, the exit of the program is seen and its place is freed only then.
+        handle.onExit((code, signal, stderrTail) => onExited(record, code, signal, stderrTail));
+        handle.onSpawn(() => resolve({ ok: true, info: info(record) }));
+        handle.onError(error => failed(error, false));
         record.cancelStart = schedule(() => {
           if (record.session.state !== 'starting') return;
           record.session.fail('start_failed');
           say(record, 'starting', `the program did not say it runs within ${startTimeoutMs} ms`);
           killIfRunning(record);
+          resolve(startFailed('timed_out'));
         }, startTimeoutMs);
-        handle.onSpawn(() => resolve({ ok: true, info: info(record) }));
-        handle.onError(failed);
         handle.onLine(line => claim(record, line));
-        handle.onExit((code, signal, stderrTail) => onExited(record, code, signal, stderrTail));
       } catch (error) {
-        failed(error);
+        failed(error, record.handle !== undefined);
       }
     });
     return { ok: true, session: id, settled };
@@ -476,6 +553,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     list: engine => Object.freeze([...records.values()].filter(record => engine === undefined || record.engine.id === engine).map(info)),
     get: sessionId => { const record = records.get(sessionId); return record ? info(record) : undefined; },
     async killAll() {
+      closed = true;
       const running = [...records.values()].filter(record => !record.exited);
       for (const record of running) record.handle?.signal('kill');
       const gone = await Promise.all(running.map(record => waitForEnd(record, killWaitMs)));

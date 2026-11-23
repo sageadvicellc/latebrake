@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULT_SESSION_CAP, DEFAULT_STOP_TIMEOUT_MS, createEngineHost, type EngineHost, type EngineSpec, type HostOptions } from '../src/host.js';
+import { KEEP_ENDED_SESSIONS, MAX_SESSIONS_LISTED } from '../src/vocab.js';
 import { fakeSignal } from '../src/fixtures.js';
 import type { FaultEntry } from '../src/session.js';
 import { manualLauncher } from './support.js';
@@ -18,7 +19,8 @@ function rig(options: Partial<HostOptions> = {}, engines: readonly EngineSpec[] 
   const launcher = manualLauncher();
   const faults: FaultEntry[] = [];
   let counter = 0;
-  const host = createEngineHost({ engines, launcher, locate: program => program, canonical: folder => ({ path: folder, key: folder }), log: entry => faults.push(entry), newId: () => `s-${(counter += 1)}`, ...options });
+  // The start timeout is timed by a schedule that runs nothing, so no test holds a real timer for 30 s. The tests of the timeout pass their own schedule.
+  const host = createEngineHost({ engines, launcher, locate: program => program, canonical: folder => ({ path: folder, key: folder }), log: entry => faults.push(entry), newId: () => `s-${(counter += 1)}`, schedule: () => () => undefined, ...options });
   return { host, launcher, faults };
 }
 const request = (engine: string, folder: unknown, extra: Record<string, unknown> = {}) => ({ engine, folder, ...extra });
@@ -95,15 +97,15 @@ test('a request that is malformed is refused with the field that is wrong, befor
 
 test('an engine that the host does not hold, or whose program is not on this computer, is ENGINE_NOT_FOUND', () => {
   const missing = rig({ locate: () => undefined });
-  assert.deepEqual(missing.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND' });
+  assert.deepEqual(missing.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
   const r = rig();
-  for (const id of ['nothing', 'constructor', 'proto', 'a'.repeat(64)]) assert.deepEqual(r.host.planStart(request(id, '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND' }, id);
+  for (const id of ['nothing', 'constructor', 'proto', 'a'.repeat(64)]) assert.deepEqual(r.host.planStart(request(id, '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'engine' }, id);
 });
 
 test('a program whose real path holds a line break or another control character is not offered: it is ENGINE_NOT_FOUND', () => {
   for (const program of ['/bin/evil\nprogram', '/bin/evil\u2028program', '/bin/evil\u202eprogram', '/bin/evil\u0000program']) {
     const r = rig({ locate: () => program });
-    assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND' }, JSON.stringify(program));
+    assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' }, JSON.stringify(program));
   }
 });
 
@@ -339,8 +341,8 @@ test('a program that cannot be started fails the session, and the start is refus
   assert.ok(planned.ok);
   const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
   assert.ok(begun.ok);
-  programOf(r, 0).fail('spawn ENOENT');
-  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED' });
+  programOf(r, 0).fail('spawn ENOENT', 'ENOENT');
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'program_missing' });
   assert.deepEqual(r.host.list().map(item => [item.id, item.state, item.failure]), [[begun.session, 'failed', 'start_failed']]);
   assert.equal(r.host.launched, 1);
   assert.ok(r.host.planStart(request('alpha', '/work/one')).ok, 'the failed session frees its pair and its place');
@@ -353,7 +355,7 @@ test('a launcher that throws fails the session in the same way', async () => {
   assert.ok(planned.ok);
   const begun = host.beginStart(planned.plan, { sharedApproved: false });
   assert.ok(begun.ok);
-  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED' });
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'other' });
   assert.deepEqual(host.list().map(item => [item.state, item.failure]), [['failed', 'start_failed']]);
 });
 
@@ -780,7 +782,7 @@ test('a program that cannot be started logs the cause with the session id, and t
   assert.ok(begun.ok);
   const error = Object.assign(new Error('spawn /bin/alpha ENOENT'), { code: 'ENOENT' });
   programOf(r, 0).fail(error.message, error.code);
-  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED' });
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'program_missing' });
   assert.deepEqual(r.faults, [{ session: begun.session, from: 'starting', to: 'failed', message: `engine session ${begun.session}: the program could not be started: ENOENT spawn /bin/alpha ENOENT` }]);
 });
 
@@ -795,15 +797,33 @@ test('a launcher that throws logs the cause too', async () => {
   assert.deepEqual(faults.map(entry => entry.message), ['engine session s-1: the program could not be started: the launcher broke']);
 });
 
-test('a handle that was made before a throw is killed, so a failed start never leaves a live process', async () => {
+test('a handle that was made before a throw is killed, and its place is held until its process has been seen to go', async () => {
   const launcher = manualLauncher({ throwOnListen: true });
-  const host = createEngineHost({ engines: [spec('alpha')], launcher, locate: p => p, canonical: f => ({ path: f, key: f }), newId: () => 's-1', log: () => undefined });
+  const host = createEngineHost({ engines: [spec('alpha')], launcher, locate: p => p, canonical: f => ({ path: f, key: f }), newId: () => 's-1', log: () => undefined, schedule: () => () => undefined });
   const planned = host.planStart(request('alpha', '/work/one'));
   assert.ok(planned.ok);
   const begun = host.beginStart(planned.plan, { sharedApproved: false });
   assert.ok(begun.ok);
-  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED' });
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'other' });
   assert.deepEqual(launcher.programs[0]?.signals, ['kill']);
+  assert.deepEqual(host.list().map(item => [item.state, item.failure]), [['failed', 'start_failed']]);
+  assert.deepEqual(host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_PAIR_BUSY' }, 'the process may still live, so the pair is busy');
+  launcher.programs[0]?.exit(null, 'SIGKILL');
+  assert.ok(host.planStart(request('alpha', '/work/one')).ok, 'the exit was seen, so the place is free');
+});
+
+test('killAll does not skip a program that was only believed gone after a failed start', async () => {
+  const launcher = manualLauncher({ throwOnListen: true });
+  const host = createEngineHost({ engines: [spec('alpha')], launcher, locate: p => p, canonical: f => ({ path: f, key: f }), newId: () => 's-1', log: () => undefined, schedule: () => () => undefined, killWaitMs: 20 });
+  const planned = host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  const begun = host.beginStart(planned.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  await begun.settled;
+  const killing = host.killAll();
+  assert.deepEqual(launcher.programs[0]?.signals, ['kill', 'kill']);
+  launcher.programs[0]?.exit(null, 'SIGKILL');
+  assert.equal(await killing, 0);
 });
 
 test('launched counts a program only when the launcher is asked: a modelArgs that throws asks for none', async () => {
@@ -812,7 +832,7 @@ test('launched counts a program only when the launcher is asked: a modelArgs tha
   assert.ok(planned.ok);
   const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
   assert.ok(begun.ok);
-  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED' });
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'other' });
   assert.equal(r.host.launched, 0);
   assert.equal(r.launcher.programs.length, 0);
 });
@@ -877,4 +897,225 @@ test('killAll gives the number of programs that are still alive after the kill s
 test('the kill wait is a whole number of milliseconds from 1 to 60,000', () => {
   for (const killWaitMs of [1, 5000, 60_000]) assert.doesNotThrow(() => rig({ killWaitMs }), String(killWaitMs));
   for (const killWaitMs of [0, -1, 60_001, 1.5]) assert.throws(() => rig({ killWaitMs }), RangeError, String(killWaitMs));
+});
+
+// Round two
+
+test('a failed start frees its place at once only when no program was made', async () => {
+  const launcher = manualLauncher({ throwOnLaunch: true });
+  const host = createEngineHost({ engines: [spec('alpha')], launcher, locate: p => p, canonical: f => ({ path: f, key: f }), log: () => undefined, schedule: () => () => undefined, newId: () => 's-1' });
+  const planned = host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  const begun = host.beginStart(planned.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  await begun.settled;
+  assert.ok(host.planStart(request('alpha', '/work/one')).ok, 'the launcher made no program, so nothing can live');
+});
+
+test('a start that throws after the launcher made a program, in the schedule, also keeps its place until the exit', async () => {
+  const r = rig({ schedule: () => { throw new Error('the schedule broke'); } });
+  const planned = r.host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'other' });
+  assert.deepEqual(programOf(r, 0).signals, ['kill']);
+  assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_PAIR_BUSY' });
+  programOf(r, 0).exit(null, 'SIGKILL');
+  assert.ok(r.host.planStart(request('alpha', '/work/one')).ok);
+});
+
+test('the program is the one of the verified fresh plan: a plan object that changes after it was checked cannot change what runs', async () => {
+  const r = rig();
+  const good = r.host.planStart(request('alpha', '/work/one'));
+  assert.ok(good.ok);
+  // The honest reads are the ones that the check makes: the program is read once, and the folder and the variables twice. Every read after that gives another value.
+  const seen: Record<string, number> = {};
+  const shifting = { ...good.plan } as Record<string, unknown>;
+  for (const key of ['program', 'folder', 'variables']) {
+    const value = shifting[key];
+    Object.defineProperty(shifting, key, { get() { seen[key] = (seen[key] ?? 0) + 1; return (seen[key] ?? 0) <= (key === 'program' ? 1 : 2) ? value : key === 'variables' ? ['EVIL'] : '/evil'; }, enumerable: true });
+  }
+  const begun = r.host.beginStart(shifting as unknown as typeof good.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  assert.deepEqual(programOf(r, 0).spec.program, '/bin/alpha');
+  assert.deepEqual(programOf(r, 0).spec.cwd, '/work/one');
+  assert.deepEqual(programOf(r, 0).spec.env, {});
+});
+
+test('a stop that lands between the start and the spawn event ends stopped, never failed, when the start then fails', async () => {
+  const r = rig();
+  const planned = r.host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  const stopping = r.host.beginStop(begun.session);
+  assert.ok(stopping.ok);
+  programOf(r, 0).fail('spawn ENOENT', 'ENOENT');
+  const settled = await stopping.settled;
+  assert.ok(settled.ok);
+  assert.equal(settled.info.state, 'stopped');
+  assert.equal(settled.info.failure, null);
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'program_missing' });
+});
+
+test('a failed start logs the state the session was in', async () => {
+  const r = rig();
+  const planned = r.host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  assert.ok(r.host.beginStop(begun.session).ok);
+  programOf(r, 0).fail('boom');
+  assert.deepEqual(r.faults.map(entry => [entry.from, entry.to]), [['stopping', 'stopped']]);
+});
+
+test('the start timeout also settles the start, with a refusal and the reason timed_out', async () => {
+  const clock = manualSchedule();
+  const r = rig({ schedule: clock.schedule });
+  const planned = r.host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  clock.timers[0]?.run();
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'timed_out' });
+});
+
+test('the ENGINE_NOT_FOUND reasons tell an unknown engine, a missing program, and a program that cannot run apart', () => {
+  const none = rig({ locate: () => undefined });
+  assert.deepEqual(none.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
+  const missing = rig({ locate: () => ({ error: 'missing' }) });
+  assert.deepEqual(missing.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
+  const denied = rig({ locate: () => ({ error: 'not_executable' }) });
+  assert.deepEqual(denied.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_not_executable' });
+  assert.deepEqual(none.host.planStart(request('nothing', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'engine' });
+  const odd = rig({ locate: () => ({ error: 'something else' }) as never });
+  assert.throws(() => odd.host.planStart(request('alpha', '/work/one')), /locate gave an answer/);
+});
+
+test('a start that fails with an error code gives the reason that the code means, and the free text stays in the log', async () => {
+  const cases: readonly (readonly [string | undefined, string])[] = [
+    ['ENOENT', 'program_missing'], ['EACCES', 'not_executable'], ['EPERM', 'not_executable'], ['ENOEXEC', 'not_executable'], ['ENOTDIR', 'folder_unusable'], ['EMFILE', 'other'], ['E2BIG', 'other'], [undefined, 'other'],
+  ];
+  for (const [code, reason] of cases) {
+    const r = rig();
+    const planned = r.host.planStart(request('alpha', '/work/one'));
+    assert.ok(planned.ok);
+    const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
+    assert.ok(begun.ok);
+    programOf(r, 0).fail('secret path /home/x', code);
+    assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason }, String(code));
+    assert.match(r.faults[0]?.message ?? '', /secret path \/home\/x/);
+  }
+});
+
+test('an ENOENT is a folder problem when the folder has gone, and a program problem when it has not', async () => {
+  let folderThere = true;
+  const r = rig({ canonical: folder => (folderThere ? { path: folder, key: folder } : undefined) });
+  const planned = r.host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  folderThere = false;
+  programOf(r, 0).fail('spawn ENOENT', 'ENOENT');
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'folder_unusable' });
+});
+
+test('after killAll no further start is planned or begun: the host is shutting down', async () => {
+  const r = rig();
+  const planned = r.host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  assert.equal(await r.host.killAll(), 0);
+  assert.deepEqual(r.host.planStart(request('alpha', '/work/two')), { ok: false, code: 'ENGINE_START_FAILED', reason: 'shutting_down' });
+  assert.deepEqual(r.host.beginStart(planned.plan, { sharedApproved: false }), { ok: false, code: 'ENGINE_START_FAILED', reason: 'shutting_down' });
+  assert.equal(r.host.launched, 0);
+});
+
+test('the variables passed to a program are redacted from the end of its standard error before it is logged, when the value is 6 characters or more', async () => {
+  const env = { LONG_TOKEN: 'sk-live-abcdef123456', SHORT: 'abc', SIX: 'sixsix' };
+  const r = rig({ environment: () => env }, [spec('alpha', { env: ['LONG_TOKEN', 'SHORT', 'SIX'] })]);
+  const id = await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:running');
+  programOf(r, 0).exit(1, null, 'auth failed for sk-live-abcdef123456 and sk-live-abcdef123456 abc sixsix');
+  assert.equal(r.faults[0]?.message, `engine session ${id}: the program ended with code 1 and no signal; the end of its standard error: "auth failed for [redacted] and [redacted] abc [redacted]"`);
+});
+
+test('a longer value is redacted before a shorter one that it contains', async () => {
+  const r = rig({ environment: () => ({ A_LONG: 'secretsecret', B_PART: 'secret' }) }, [spec('alpha', { env: ['A_LONG', 'B_PART'] })]);
+  await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:running');
+  programOf(r, 0).exit(1, null, 'x secretsecret y secret z');
+  assert.match(r.faults[0]?.message ?? '', /"x \[redacted\] y \[redacted\] z"/);
+});
+
+test('the end of the standard error is logged, redacted, when the host itself failed or killed the session', async () => {
+  const token = 'tok-123456789';
+  const env = { API_TOKEN: token };
+  for (const how of ['claim', 'adapter', 'timeout'] as const) {
+    const clock = manualSchedule();
+    const r = rig({ environment: () => env, schedule: clock.schedule }, [spec('alpha', { env: ['API_TOKEN'], signalOf: line => { if (how === 'adapter' && line === 'boom') throw new Error('x'); return line.startsWith('state:') ? line.slice(6) : null; } })]);
+    const id = await startOne(r, 'alpha', '/work/one');
+    if (how === 'claim') programOf(r, 0).line('state:stopped');
+    if (how === 'adapter') programOf(r, 0).line('boom');
+    if (how === 'timeout') clock.timers[0]?.run();
+    const before = r.faults.length;
+    programOf(r, 0).exit(null, 'SIGKILL', `last words ${token}`);
+    assert.equal(r.faults.length, before + 1, how);
+    assert.equal(r.faults[before]?.message, `engine session ${id}: the program ended with no code and the signal SIGKILL after the host killed it; the end of its standard error: "last words [redacted]"`, how);
+  }
+});
+
+test('the host keeps every live session and the newest 256 ended ones, so the history cannot grow for ever', async () => {
+  const r = rig({ cap: 4 });
+  const ids: string[] = [];
+  for (let index = 0; index < 300; index += 1) {
+    const id = await startOne(r, 'alpha', `/work/${index}`);
+    ids.push(id);
+    programOf(r, index).line('state:running');
+    programOf(r, index).exit(0);
+  }
+  const live = await startOne(r, 'alpha', '/work/live');
+  const all = r.host.list();
+  assert.equal(all.length, 257, '256 ended and 1 live');
+  assert.deepEqual(all.map(item => item.id), [...ids.slice(-256), live]);
+  assert.equal(r.host.get(ids[0] ?? ''), undefined);
+  assert.equal(r.host.get(ids[43] ?? ''), undefined);
+  assert.equal(r.host.get(ids[44] ?? '')?.state, 'stopped');
+  assert.deepEqual(r.host.planStop(ids[0] ?? ''), { ok: false, code: 'ENGINE_SESSION_UNKNOWN' });
+});
+
+test('an ended session whose process still lives is not pruned, and a live session never is', async () => {
+  const r = rig({ cap: 64 });
+  const ids: string[] = [];
+  for (let index = 0; index < 5; index += 1) ids.push(await startOne(r, 'alpha', `/work/keep${index}`));
+  programOf(r, 0).line('state:stopped');
+  for (let index = 0; index < 270; index += 1) {
+    await startOne(r, 'beta', `/work/${index}`);
+    programOf(r, 5 + index).line('state:running');
+    programOf(r, 5 + index).exit(0);
+  }
+  assert.equal(r.host.get(ids[0] ?? '')?.state, 'failed', 'its process has not been seen to go, so it stays');
+  for (const id of ids.slice(1)) assert.equal(r.host.get(id)?.state, 'starting');
+});
+
+test('the most sessions a read can give is the live cap plus the ended ones that are kept', () => {
+  assert.equal(MAX_SESSIONS_LISTED, 64 + 256);
+  assert.equal(KEEP_ENDED_SESSIONS, 256);
+});
+
+test('the default timers are unref-ed: a pending start timeout or stop wait never holds the process open', async () => {
+  const count = () => process.getActiveResourcesInfo().filter(name => name === 'Timeout').length;
+  const launcher = manualLauncher();
+  const host = createEngineHost({ engines: [spec('alpha')], launcher, locate: p => p, canonical: f => ({ path: f, key: f }), log: () => undefined, stopTimeoutMs: 600_000 });
+  const before = count();
+  const planned = host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  const begun = host.beginStart(planned.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  assert.equal(count(), before, 'the start timeout does not hold the loop');
+  const stopping = host.beginStop(begun.session);
+  assert.ok(stopping.ok);
+  assert.equal(count(), before, 'and neither does the stop wait');
+  launcher.programs[0]?.exit(0);
+  await stopping.settled;
 });

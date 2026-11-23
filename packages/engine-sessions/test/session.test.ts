@@ -165,3 +165,17 @@ test('fail gives a session a named failure once, and a session that ended keeps 
   assert.equal(stopped.state, 'stopped');
   assert.equal(stopped.failure, null);
 });
+
+test('the message of a log that threw is escaped before it is written to standard error', () => {
+  const lines: string[] = [];
+  const write = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => { lines.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try {
+    const session = at('running', () => { throw new Error('broke\nforged line\u202e'); });
+    session.move('ready');
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1], 'engine session s-1: the log sink threw: broke\\u{a}forged line\\u{202e}\n');
+});

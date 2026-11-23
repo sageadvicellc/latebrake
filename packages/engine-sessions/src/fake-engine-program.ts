@@ -18,7 +18,8 @@ type Step =
   | { readonly spawnEscaped: true }
   | { readonly spawnEscapedHolding: true }
   | { readonly stderr: string }
-  | { readonly stderrBytes: number };
+  | { readonly stderrBytes: number }
+  | { readonly stderrHex: string };
 
 const argv = process.argv.slice(2);
 const flag = (name: string): string | undefined => { const at = argv.indexOf(name); return at === -1 ? undefined : argv[at + 1]; };
@@ -51,6 +52,8 @@ async function run(): Promise<void> {
     } else if ('stderrBytes' in step) {
       const chunk = 'e'.repeat(65_536);
       for (let sent = 0; sent < step.stderrBytes; sent += chunk.length) await new Promise<void>(resolve => { process.stderr.write(chunk.slice(0, Math.min(chunk.length, step.stderrBytes - sent)), () => resolve()); });
+    } else if ('stderrHex' in step) {
+      await new Promise<void>(resolve => { process.stderr.write(Buffer.from(step.stderrHex, 'hex'), () => resolve()); });
     } else if ('printEnv' in step) {
       // macOS adds `__CF_USER_TEXT_ENCODING` to every process it starts, so the program leaves it out: it is not a variable that the host passed.
       const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== '__CF_USER_TEXT_ENCODING').sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));

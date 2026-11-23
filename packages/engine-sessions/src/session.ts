@@ -28,7 +28,7 @@ export function report(log: ((entry: FaultEntry) => void) | undefined, entry: Fa
     (log ?? toStandardError)(entry);
   } catch (error) {
     process.stderr.write(`${entry.message}\n`);
-    process.stderr.write(`engine session ${entry.session}: the log sink threw: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`engine session ${entry.session}: the log sink threw: ${escapeText(error instanceof Error ? error.message : String(error))}\n`);
   }
 }
 
