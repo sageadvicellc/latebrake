@@ -66,7 +66,7 @@ export interface RelayOptions {
   readonly deliverTimeoutMs?: number;
   /** How long the core waits, after a timeout, for the adapter to settle its promise, from 1 to 600,000 milliseconds. 30,000 by default. After it the engine reads as stuck, and what waits for it fails. */
   readonly abandonMs?: number;
-  /** The most accepted `auto` messages in the run since the last act of the person (an approval or a resume), from 1 to 10,000. 200 by default. */
+  /** The most accepted `auto` messages in the run since the last act of the person (a resume of a run-cap stop), from 1 to 10,000. 200 by default. */
   readonly runCap?: number;
   /** The most messages of a route that the person may decline before the route is paused until the person resumes it, from 1 to 100. 8 by default. */
   readonly declineCap?: number;
@@ -134,7 +134,7 @@ export type SendRefusal = Invalid | SecretFound | QueueFull | NotAccepted | Stop
 export type SendReply = { readonly ok: true; readonly id: string; readonly state: MessageState | 'evicted'; readonly reason: FailureReason | null; readonly duplicate: boolean } | SendRefusal;
 export type ConfirmReply = { readonly ok: true; readonly state: 'delivered' } | Invalid | NotAccepted | Unknown | Fail<'GAUGE_RELAY_CLOSED' | 'GAUGE_RELAY_UNAUTHENTICATED' | 'GAUGE_RELAY_SESSION_ENDED' | 'GAUGE_RELAY_RECEIPT_INVALID'>;
 /** A control reply that worked: the state of the message after the call, and the reason when it failed in the same call (a message that could not be made for the engine fails at once). */
-export type ControlReply = { readonly ok: true; readonly state: MessageState; readonly reason: FailureReason | null } | NotAccepted | Stopped | Fail<'GAUGE_RELAY_CLOSED' | 'GAUGE_MESSAGE_UNKNOWN' | 'GAUGE_RELAY_RECEIVER_GONE'>;
+export type ControlReply = { readonly ok: true; readonly state: MessageState; readonly reason: FailureReason | null } | NotAccepted | Stopped | QueueFull | Fail<'GAUGE_RELAY_CLOSED' | 'GAUGE_MESSAGE_UNKNOWN' | 'GAUGE_RELAY_RECEIVER_GONE'>;
 /** `reopened` lists the routes that the resume opened. */
 export type ResumeReply = { readonly ok: true; readonly reopened: readonly string[] } | Fail<'GAUGE_RELAY_CLOSED' | 'GAUGE_ROUTE_UNKNOWN'>;
 
@@ -150,13 +150,13 @@ export interface RelayWrites {
 export interface RelayControl {
   /** Makes the secret of a session and gives it, once. Throws (`TypeError`) for a session that is not a member, one that has its secret already, one that has ended, a secret that another session holds, and a closed relay. */
   issueSecret(session: string): string;
-  /** The person approves a message that waits on an `accepted-output` route. It is accepted now, and moves when the receiver runs. An approval starts the counts of the loop caps again. */
+  /** The person approves a message that waits on an `accepted-output` route. It is accepted now, and moves when the receiver runs. An approval starts again the count of its own pair, and not the run count. It is refused with `GAUGE_RELAY_QUEUE_FULL` (`receiver_stuck`) while the engine of the receiver is stuck, and the message stays pending. */
   approve(id: unknown): ControlReply;
   /** The person declines a message that waits, or that is accepted and has not reached the engine. A decline is final: the same body is refused on the route until the person resumes it. */
   decline(id: unknown): ControlReply;
   /**
    * The person resumes a route. A route that a message cap stopped starts its count again from zero. A route that a loop cap stopped opens, with every other route that a loop cap stopped. A route that declines paused opens.
-   * On any route, stopped or open, a resume is an act of the person: the counts of the loop caps start again, and the declines and the declined bodies of the route are forgotten.
+   * On any route, stopped or open, a resume is an act of the person: the count of the pair of the route starts again (also when nothing was stopped), and the declines and the declined bodies of the route are forgotten.
    */
   resume(route: unknown): ResumeReply;
   /** The core tells the relay that a session changed its state: a session that runs gets what waits for it, and a session that ended fails what waits for it. A value that is no member, and a closed relay, do nothing and give nothing back. */
@@ -902,6 +902,11 @@ export function createRelay(options: RelayOptions): Relay {
     if (rec.state !== 'pending') return { ok: false, code: 'GAUGE_MESSAGE_NOT_ACCEPTED', reason: rec.state };
     // The end of the receiver has failed this message already, when it is seen here.
     if (refresh(rec.envelope.receiver)) return { ok: false, code: 'GAUGE_RELAY_RECEIVER_GONE' };
+    // An engine that never settled an earlier delivery takes nothing: the message stays pending, with no count taken, as a send to it is refused.
+    if (busy.get(rec.envelope.receiver)?.stuck === true) {
+      log.counted(`stuck:${rec.envelope.receiver}`, `an approval for ${rec.envelope.receiver} was refused, because its engine never settled an earlier delivery`);
+      return { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'receiver_stuck' };
+    }
     // An approval is an act of the person on the pair of its route: the count of the pair starts again, once the message is taken. A refused approval changes no count.
     const refused = accept(rec, time(), true);
     if (refused !== undefined) return refused;

@@ -35,10 +35,10 @@ export type EnvelopeRefusal =
 
 /**
  * A control, format, line separator, or paragraph separator character, a lone surrogate, and what can hide text from a person who approves it: a code point that has no assigned character or is for private use, a variation selector,
- * and the fillers that draw as nothing (U+034F, U+115F, U+1160, U+2800, U+3164, U+FFA0). A body may hold a line feed and a tab, which are set aside before this is read. A combining mark is not refused, since written text needs it.
+ * and the fillers that draw as nothing (U+034F, U+115F, U+1160, U+17B4, U+17B5, U+180B to U+180D, U+180F, U+2800, U+3164, U+FFA0). A body may hold a line feed and a tab, which are set aside before this is read. A combining mark is not refused, since written text needs it.
  * `\p{Cn}` follows the Unicode version of the runtime, so a character that is newer than the runtime is refused.
  */
-const BODY_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}\p{Cn}\p{Co}\u034f\u115f\u1160\u2800\u3164\uffa0\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/u;
+const BODY_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}\p{Cn}\p{Co}\u034f\u115f\u1160\u2800\u3164\uffa0\u17b4\u17b5\u180b-\u180d\u180f\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/u;
 /** A hidden value shorter than this is never searched for, so a short or empty value cannot refuse every text. */
 const MIN_HIDDEN_LENGTH = 8;
 

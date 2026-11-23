@@ -354,7 +354,7 @@ test('a message that is counted after a resume of the run gives its place back t
   assert.equal(send('sess-a', 'route-1', 'k6', 'six').ok, true, 'the declined message gave its place back to the run');
 });
 
-test('a message that the person approves for a stuck engine fails at once with receiver_stuck, and the reply says so', async () => {
+test('an approval for a stuck engine is refused with receiver_stuck: the message stays pending, no count is taken, and the engine is not asked', async () => {
   const { relay, engines, send, timers } = build({ sessions: ['sess-a', 'sess-b', 'sess-c'], routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 100, 50), route('route-2', 'sess-c', 'sess-b')] });
   const proposal = send('sess-c', 'route-2', 'p1', 'a proposal that waits for the person');
   assert.ok(proposal.ok);
@@ -363,6 +363,32 @@ test('a message that the person approves for a stuck engine fails at once with r
   await tick();
   timers.fireAll();
   timers.fireAll();
-  assert.deepEqual(relay.control.approve(proposal.id), { ok: true, state: 'failed', reason: 'receiver_stuck' });
-  assert.equal(relay.control.routes()[1]?.accepted, 0, 'the count is given back');
+  const before = relay.control.routes();
+  assert.deepEqual(relay.control.approve(proposal.id), { ok: false, code: 'GAUGE_RELAY_QUEUE_FULL', reason: 'receiver_stuck' });
+  assert.equal(relay.control.message(proposal.id)?.state, 'pending');
+  assert.deepEqual(relay.control.routes(), before, 'no count moved, and the person may approve again later');
+  engines['sess-b']?.failHung('the engine settled at last');
+  await tick();
+  assert.equal(relay.control.approve(proposal.id).ok, true, 'the same message is accepted once the engine has settled');
+});
+
+test('a body that holds any default-ignorable code point is refused, and an ordinary space and a no-break space are not', () => {
+  const refused: string[] = [];
+  for (let cp = 0; cp <= 0x10ffff; cp += 1) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const char = String.fromCodePoint(cp);
+    if (/\p{Default_Ignorable_Code_Point}/u.test(char) && checkBody(`a${char}b`).ok) refused.push(`U+${cp.toString(16)}`);
+  }
+  assert.deepEqual(refused, [], 'each of these draws as nothing and is accepted');
+  for (const cp of [0x17b4, 0x17b5, 0x180b, 0x180c, 0x180d, 0x180f]) assert.equal(checkBody(`a${String.fromCodePoint(cp)}b`).ok, false, `U+${cp.toString(16)}`);
+  assert.equal(checkBody('a b\u00a0c').ok, true);
+});
+
+test('a resume of a route that is open resets the count of its own pair and forgets its declines, and it reopens nothing', () => {
+  const { relay, send } = build({ routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 100, 10), route('route-2', 'sess-b', 'sess-a', 'auto', 100, 10)] });
+  send('sess-a', 'route-1', 'k1', 'one');
+  send('sess-b', 'route-2', 'k2', 'two');
+  assert.equal(relay.control.routes()[0]?.exchanged, 2);
+  assert.deepEqual(relay.control.resume('route-1'), { ok: true, reopened: [] });
+  assert.equal(relay.control.routes()[0]?.exchanged, 0);
 });

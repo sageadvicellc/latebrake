@@ -16,7 +16,7 @@ export const MAX_MESSAGE_CAP = 1000;
 /** The loop cap of a route that does not name one, and the highest cap a person may set. */
 export const DEFAULT_LOOP_CAP = 6;
 export const MAX_LOOP_CAP = 100;
-/** The most accepted `auto` messages in one run since the last act of the person (an approval or a resume), and the range of the option. It stops a ring of three sessions or more, which no pair count sees. */
+/** The most accepted `auto` messages in one run since the last resume of a run-cap stop by the person, and the range of the option. It stops a ring of three sessions or more, which no pair count sees. */
 export const DEFAULT_RUN_CAP = 200;
 export const MAX_RUN_CAP = 10_000;
 /** The most messages of a route that the person declines before the core pauses the route until the person resumes it, and the range of the option. */
