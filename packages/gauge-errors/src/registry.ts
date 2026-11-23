@@ -49,6 +49,13 @@ const ENTRIES = [
   { code: 'ENGINE_SESSION_UNKNOWN', meaning: 'No session has that id, or none that this Gauge may use.' },
   { code: 'ENGINE_SESSION_ENDED', meaning: 'The session has stopped or failed already, so there is nothing to stop.' },
   { code: 'ENGINE_STOP_TIMEOUT', meaning: 'The engine did not stop in time, so the session stays stopping.' },
+  // Jobs and runs
+  { code: 'GAUGE_JOB_INVALID', meaning: 'The job definition is malformed, so no plan was made. The reason says which field.' },
+  { code: 'GAUGE_JOB_UNKNOWN', meaning: 'No job has that id.' },
+  { code: 'GAUGE_JOB_LIMIT', meaning: 'The core holds as many jobs as it may, so no job can be created until one is deleted.' },
+  { code: 'GAUGE_JOB_NOT_INTERACTIVE', meaning: 'A schedule or an unattended run is refused, because runs are interactive in this version. The reason says which.' },
+  { code: 'GAUGE_RUN_UNKNOWN', meaning: 'No run has that id.' },
+  { code: 'GAUGE_RUN_ROLLBACK_FAILED', meaning: 'A session of the run failed to start, and a session that had started could not be stopped.' },
 ] as const;
 
 /** A Gauge refusal code. */

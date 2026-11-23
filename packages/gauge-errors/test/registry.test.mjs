@@ -20,6 +20,7 @@ const STABLE = [
   'GAUGE_PLAN_NOT_APPROVED', 'GAUGE_PLAN_CHANGED',
   'ENGINE_NOT_FOUND', 'ENGINE_REQUEST_INVALID', 'MODEL_NOT_FOR_ENGINE', 'ENGINE_LIMIT', 'ENGINE_PAIR_BUSY', 'ENGINE_FOLDER_SHARED',
   'ENGINE_START_FAILED', 'ENGINE_SESSION_UNKNOWN', 'ENGINE_SESSION_ENDED', 'ENGINE_STOP_TIMEOUT',
+  'GAUGE_JOB_INVALID', 'GAUGE_JOB_UNKNOWN', 'GAUGE_JOB_LIMIT', 'GAUGE_JOB_NOT_INTERACTIVE', 'GAUGE_RUN_UNKNOWN', 'GAUGE_RUN_ROLLBACK_FAILED',
 ];
 
 test('the registry lists the stable codes, each once, in a fixed order', () => {
@@ -160,4 +161,13 @@ test('the code for a mixed traces grant says that traces permissions have their 
 
 test('the code for a grant that could not be recorded names both causes: the file failed, or the clock gave no usable time', () => {
   assert.equal(GAUGE_MEANINGS.GAUGE_AUDIT_FAILED, 'A grant was refused because its audit record could not be made: the file failed, or the clock gave no usable time.');
+});
+
+test('the job and run codes name what they refuse, in one line each', () => {
+  assert.equal(GAUGE_MEANINGS.GAUGE_JOB_INVALID, 'The job definition is malformed, so no plan was made. The reason says which field.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_JOB_UNKNOWN, 'No job has that id.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_JOB_LIMIT, 'The core holds as many jobs as it may, so no job can be created until one is deleted.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_JOB_NOT_INTERACTIVE, 'A schedule or an unattended run is refused, because runs are interactive in this version. The reason says which.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_RUN_UNKNOWN, 'No run has that id.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_RUN_ROLLBACK_FAILED, 'A session of the run failed to start, and a session that had started could not be stopped.');
 });
