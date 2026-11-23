@@ -39,7 +39,7 @@ test('each closed set lists its words in a fixed order, and is frozen', () => {
   assert.deepEqual([...STOP_CAUSES], ['loop_cap', 'message_cap', 'declines']);
   assert.deepEqual([...SECRET_REASONS], ['pattern', 'relay_value']);
   assert.deepEqual([...QUEUE_REASONS], ['pending_approval', 'receiver_busy', 'receiver_stuck']);
-  assert.deepEqual([...WAITING_CAUSES], ['pending_approval', 'receiver_busy', 'receiver_stuck', 'receiver_not_running']);
+  assert.deepEqual([...WAITING_CAUSES], ['pending_approval', 'receiver_busy', 'receiver_not_running']);
   for (const set of [ROUTE_RULES, ROUTE_REASONS, MESSAGE_INVALID_REASONS, MESSAGE_STATES, FAILURE_REASONS, FIDELITIES, ADAPTER_FIDELITIES, STOP_CAUSES, SECRET_REASONS, QUEUE_REASONS, WAITING_CAUSES]) assert.equal(Object.isFrozen(set), true);
 });
 

@@ -111,8 +111,8 @@ export type SecretReason = (typeof SECRET_REASONS)[number];
  */
 export const QUEUE_REASONS = Object.freeze(['pending_approval', 'receiver_busy', 'receiver_stuck'] as const);
 export type QueueReason = (typeof QUEUE_REASONS)[number];
-/** What the person is told that the waiting messages of a route wait for: the reasons above, and `receiver_not_running`. */
-export const WAITING_CAUSES = Object.freeze([...QUEUE_REASONS, 'receiver_not_running'] as const);
+/** What the person is told that the waiting messages of a route wait for: the person, the receiver that is busy, or the receiver that does not run. A stuck engine has nothing waiting for it. */
+export const WAITING_CAUSES = Object.freeze(['pending_approval', 'receiver_busy', 'receiver_not_running'] as const);
 export type WaitingCause = (typeof WAITING_CAUSES)[number];
 
 /** What stopped a route. `loop_cap`: the messages between two sessions, or of the whole run, reached a cap that no act of the person broke. `message_cap`: the route reached its cap on messages. `declines`: the person declined too many of its messages. */

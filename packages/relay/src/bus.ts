@@ -418,7 +418,7 @@ export function createRelay(options: RelayOptions): Relay {
     return undefined;
   }
 
-  /** What the waiting messages of a route wait for, in the detail that the person sees: the person when most of them are pending, else the receiver (stuck, not running or unreadable, or busy with an earlier delivery). */
+  /** What the waiting messages of a route wait for, in the detail that the person sees: the person when most of them are pending, else the receiver (not running or unreadable, or busy with an earlier delivery). A stuck engine has nothing waiting for it, since what waited failed. */
   function waitingCause(state: RouteState): WaitingCause {
     let pending = 0, accepted = 0;
     for (const rec of records.values()) {
@@ -427,7 +427,6 @@ export function createRelay(options: RelayOptions): Relay {
       else if (rec.state === 'queued' || rec.state === 'sending') accepted += 1;
     }
     if (pending >= accepted) return 'pending_approval';
-    if (busy.get(state.route.to)?.stuck === true) return 'receiver_stuck';
     return readState(state.route.to) === 'running' ? 'receiver_busy' : 'receiver_not_running';
   }
   /** The same cause as the writer of the route is told: a receiver that does not run is a receiver that does not take the messages now, and the writer is not told which. */

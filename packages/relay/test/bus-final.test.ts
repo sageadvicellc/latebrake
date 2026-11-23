@@ -277,3 +277,79 @@ test('the state of the receiver is read once for each look: a message that waits
   relay.control.sessionChanged('sess-b');
   assert.equal(reads, 3);
 });
+
+test('a message that was counted before an approval holds no place in the pair after it: giving it back does not take a place from the message that was approved', () => {
+  const { relay, send } = build({ states: { 'sess-b': 'waiting' }, routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 100, 10), route('route-2', 'sess-b', 'sess-a', 'accepted-output', 100, 10)], options: { runCap: 50 } });
+  send('sess-a', 'route-1', 'k1', 'queued early');
+  send('sess-b', 'route-2', 'k2', 'proposal');
+  assert.equal(relay.control.approve('msg-2').ok, true);
+  assert.equal(relay.control.routes()[0]?.exchanged, 1);
+  relay.control.decline('msg-1');
+  assert.equal(relay.control.routes()[0]?.exchanged, 1);
+});
+
+test('a resume of an open route does not start the run count again, and a resume of a pair does not either', () => {
+  const { relay, send } = build({
+    sessions: ['sess-a', 'sess-b', 'sess-c'],
+    routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 1000, 100), route('route-2', 'sess-b', 'sess-c', 'auto', 1000, 100), route('route-3', 'sess-c', 'sess-a', 'auto', 1000, 100)],
+    options: { runCap: 2 },
+  });
+  send('sess-a', 'route-1', 'k1', 'one');
+  send('sess-b', 'route-2', 'k2', 'two');
+  assert.deepEqual(relay.control.resume('route-3'), { ok: true, reopened: [] });
+  assert.deepEqual(send('sess-c', 'route-3', 'k3', 'three'), { ok: false, code: 'GAUGE_RELAY_LOOP_CAP' });
+});
+
+test('a resume of a run stop starts again the count of every pair that it reopens, and the run count', async () => {
+  const { relay, send } = build({
+    sessions: ['sess-a', 'sess-b', 'sess-c'],
+    routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 1000, 100), route('route-2', 'sess-b', 'sess-c', 'auto', 1000, 100), route('route-3', 'sess-c', 'sess-a', 'auto', 1000, 100)],
+    options: { runCap: 3 },
+  });
+  send('sess-a', 'route-1', 'k1', 'one');
+  send('sess-b', 'route-2', 'k2', 'two');
+  send('sess-c', 'route-3', 'k3', 'three');
+  assert.equal(send('sess-a', 'route-1', 'k4', 'four').ok, false);
+  assert.deepEqual(relay.control.routes().map(view => view.exchanged), [1, 1, 1]);
+  assert.deepEqual(relay.control.resume('route-2'), { ok: true, reopened: ['route-1', 'route-2', 'route-3'] });
+  assert.deepEqual(relay.control.routes().map(view => view.exchanged), [0, 0, 0]);
+  assert.equal(send('sess-a', 'route-1', 'k5', 'five').ok, true);
+  await tick();
+});
+
+test('a message that was counted in the run before a resume holds no place in the run count after it', () => {
+  const { relay, send } = build({ states: { 'sess-b': 'waiting' }, routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 1000, 100), route('route-2', 'sess-b', 'sess-a', 'auto', 1000, 100)], options: { runCap: 2 } });
+  send('sess-a', 'route-1', 'k1', 'one');
+  send('sess-a', 'route-1', 'k2', 'two');
+  assert.equal(send('sess-a', 'route-1', 'k3', 'three').ok, false);
+  relay.control.resume('route-1');
+  assert.equal(send('sess-a', 'route-1', 'k4', 'four').ok, true);
+  relay.control.decline('msg-1');
+  assert.equal(send('sess-a', 'route-1', 'k5', 'five').ok, true);
+  assert.equal(send('sess-a', 'route-1', 'k6', 'six').ok, false, 'the give-back of a message of the earlier count did not open a place');
+});
+
+test('a stuck engine refuses the writes to it only: another receiver goes on', async () => {
+  const { relay, engines, send, timers } = build({ sessions: ['sess-a', 'sess-b', 'sess-c'], routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 1000, 100), route('route-2', 'sess-a', 'sess-c', 'auto', 1000, 100)] });
+  if (engines['sess-b']) engines['sess-b'].mode = 'hang';
+  send('sess-a', 'route-1', 'k1', 'first');
+  await tick();
+  timers.fireAll();
+  timers.fireAll();
+  assert.equal(send('sess-a', 'route-1', 'k2', 'second').ok, false);
+  assert.equal(send('sess-a', 'route-2', 'k3', 'third').ok, true);
+  await tick();
+  assert.equal(relay.control.message('msg-2')?.state, 'sent');
+});
+
+test('a message that is counted after a resume of the run gives its place back to the run when it fails before the engine', () => {
+  const { relay, send } = build({ states: { 'sess-b': 'waiting' }, routes: [route('route-1', 'sess-a', 'sess-b', 'auto', 1000, 100), route('route-2', 'sess-b', 'sess-a', 'auto', 1000, 100)], options: { runCap: 2 } });
+  send('sess-a', 'route-1', 'k1', 'one');
+  send('sess-a', 'route-1', 'k2', 'two');
+  assert.equal(send('sess-a', 'route-1', 'k3', 'three').ok, false);
+  relay.control.resume('route-1');
+  send('sess-a', 'route-1', 'k4', 'four');
+  send('sess-a', 'route-1', 'k5', 'five');
+  assert.equal(relay.control.decline('msg-5').ok, true);
+  assert.equal(send('sess-a', 'route-1', 'k6', 'six').ok, true, 'the declined message gave its place back to the run');
+});
