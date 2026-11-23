@@ -345,11 +345,11 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   /** What the person is told that a Gauge is not. */
   const notices: PersonNotice[] = [];
   /**
-   * Tells the person. A repeat of the same notice (the same Gauge, call, plan, and cause) is one notice, so a Gauge that asks again and again fills nothing. A Gauge keeps its newest `MAX_NOTICES_PER_GAUGE`, and the core keeps
+   * Tells the person. A repeat of the same notice (the same Gauge, call, plan, cause, and engines) is one notice, so a Gauge that asks again and again fills nothing. A Gauge keeps its newest `MAX_NOTICES_PER_GAUGE`, and the core keeps
    * the newest `MAX_NOTICES`, so one Gauge cannot push the notices of another out.
    */
   const notify = (notice: PersonNotice): void => {
-    if (notices.some(held => held.gauge === notice.gauge && held.action === notice.action && held.nonce === notice.nonce && held.cause === notice.cause)) return;
+    if (notices.some(held => held.gauge === notice.gauge && held.action === notice.action && held.nonce === notice.nonce && held.cause === notice.cause && held.engines.join(',') === notice.engines.join(','))) return;
     notices.push(notice);
     const mine = notices.filter(held => held.gauge === notice.gauge);
     for (const oldest of mine.slice(0, Math.max(0, mine.length - MAX_NOTICES_PER_GAUGE))) notices.splice(notices.indexOf(oldest), 1);
@@ -1142,6 +1142,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (!fresh.ok) return reply(fresh);
     if (sessionDigest(fresh.person, plan.nonce) !== approval.digest) {
       // The plan changed. If the plan that a Gauge would read now is the plan that it read, the cause is one that it cannot read (an engine that began or ended in the folder, or a link that moved): the person is told.
+      // Only a start can reach this: the plan of a stop holds nothing that a Gauge cannot read, so its view changes when its plan does. That is why the notice says `start`.
       if (issued.get(plan.nonce)?.view === sessionViewHash(sessionPlanObject(fresh.seen, plan.digest, plan.nonce))) {
         notify({ action: 'start', gauge: plan.gauge, nonce: plan.nonce, shown: 'GAUGE_PLAN_CHANGED', cause: 'plan_changed_hidden', engines: [...fresh.person.allSharedWith], member: null });
       }
