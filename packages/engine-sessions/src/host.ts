@@ -19,6 +19,7 @@ export class StalePlanError extends Error {
     super(message);
     this.name = 'StalePlanError';
     // The mark does not show when the error is listed or copied. With the name, it tells a stale plan of another copy of this module, which `instanceof` does not.
+    // It protects against accidents (a second copy of the module), and not against code in this process that means to forge it: such code can set a name and a mark too.
     Object.defineProperty(this, 'stalePlan', { value: true, enumerable: false });
   }
 }
