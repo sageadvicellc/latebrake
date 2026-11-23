@@ -344,7 +344,7 @@ test('a request reason goes with no other code', async () => {
 test('ENGINE_NOT_FOUND and ENGINE_START_FAILED always carry a reason of their own closed set, and no other', async () => {
   const refused = (reply: unknown) => createCoreClient(scripted(reply)).planSessionStop('g', 's-1');
   for (const reason of ['engine', 'program_missing', 'program_not_executable']) assert.deepEqual(await refused({ ok: false, code: 'ENGINE_NOT_FOUND', reason }), { ok: false, code: 'ENGINE_NOT_FOUND', reason }, reason);
-  for (const reason of ['program_missing', 'not_executable', 'folder_unusable', 'shutting_down', 'timed_out', 'other']) {
+  for (const reason of ['program_missing', 'not_executable', 'folder_unusable', 'resource_limit', 'adapter_error', 'shutting_down', 'timed_out', 'other']) {
     assert.deepEqual(await refused({ ok: false, code: 'ENGINE_START_FAILED', reason }), { ok: false, code: 'ENGINE_START_FAILED', reason }, reason);
   }
   for (const bad of [undefined, '', 'folder', 'Engine', 5, null, 'not_executable', 'duplicate_key']) {
@@ -403,8 +403,34 @@ test('the lists of an outgoing call are copied from the caller by index too: a h
     await assert.rejects(client.planSessionStart('g', { engine: 'e', folder: '/f', variables: [item] as unknown as string[] }), TypeError);
   }
   assert.equal(core.calls.length, 0, 'nothing was sent');
-  const hostile = { ...START, steps: accessor } as unknown as SessionPlan;
-  await client.applySession(hostile, 'approval');
-  const sent = (core.calls[0]?.params as { plan: Record<string, unknown> }).plan;
-  assert.equal(Object.hasOwn(sent, 'steps'), false, 'a list that cannot be read is not sent');
+});
+
+test('a list of a plan that cannot be read is a TypeError of the caller, like any other list: nothing is sent, and no accessor or iterator runs', async () => {
+  class Sub extends Array {}
+  const core = scripted({ ok: false, code: 'UNKNOWN_GAUGE' });
+  const client = createCoreClient(core);
+  let ran = false;
+  const accessor = ['a'];
+  Object.defineProperty(accessor, 0, { get() { ran = true; return 'a'; }, enumerable: true });
+  const hole = new Array<string>(2);
+  const tooLong = new Array<string>(4097).fill('a');
+  for (const [label, steps] of [['an accessor', accessor], ['a subclass', Sub.from(['a'])], ['a hole', hole], ['more than 4,096 items', tooLong]] as const) {
+    await assert.rejects(client.applySession({ ...START, steps } as unknown as SessionPlan, 'approval'), TypeError, label);
+    // The calls of the lifecycle, the grants, and the layout throw at once when a plan is `null`, and so do they here. `applySession` is asynchronous, so it rejects.
+    assert.throws(() => client.applyPlan({ action: 'install', id: 'a', steps } as never, 'approval'), TypeError, label);
+    assert.throws(() => client.applyGrant({ action: 'grant', id: 'a', permissions: steps, steps: [] } as never, 'approval'), TypeError, label);
+    assert.throws(() => client.applyLayout({ action: 'layout', steps } as never, 'approval'), TypeError, label);
+  }
+  assert.equal(ran, false);
+  assert.equal(core.calls.length, 0, 'nothing was sent');
+  await client.applySession({ ...START }, 'approval');
+  assert.equal(core.calls.length, 1, 'a plan with readable lists is sent');
+});
+
+test('a forced stop may give failed, the kill of a failed session that had not gone, and any other stop must give stopped', async () => {
+  const stopped = { action: 'stop', session: 's-1', engine: 'fixture-engine', state: 'failed' };
+  assert.deepEqual(await applying(stopped, { ...STOP, force: true }), { ok: true, value: { action: 'stop', session: 's-1', engine: 'fixture-engine', state: 'failed' } });
+  await assert.rejects(applying(stopped, { ...STOP, force: false }), CoreProtocolError);
+  await assert.rejects(applying({ ...stopped, state: 'running' }, { ...STOP, force: true }), CoreProtocolError);
+  await assert.rejects(applying({ ...stopped, action: 'start', state: 'failed' }, { ...STOP, force: true }), CoreProtocolError);
 });

@@ -129,6 +129,11 @@ export interface AuditEntry {
 }
 
 /**
+ * The most records that an audit read may hold. The file has a size cap of at most 1 MiB (`MAX_AUDIT_MAX_BYTES` in `grants.ts`) and a record is at least 64 bytes, so a file never holds more. A longer list is a protocol error.
+ */
+export const MAX_AUDIT_RECORDS = 16_384;
+
+/**
  * What a read of the audit file gives. The file is not a complete history: when it is full, the oldest records are dropped. `firstSeq` is the `seq` of the oldest record
  * held, or `null` when the file is empty, and `droppedCount` is how many records were dropped, so a reader can tell that records were lost (`droppedCount` is `firstSeq - 1` when the file
  * is not empty). `auditFailed` is true once a record could not be written at all, because the clock gave no usable time or the file could not be written.

@@ -11,7 +11,7 @@ import {
 import { BILLING_SOURCES, checkModel, checkSessionId, createEngineHost, readList, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
 import { FIXTURE_GAUGES, HOME_STOCK } from './fixtures.js';
 import { layoutChangeSteps, layoutSteps } from './layout-plan.js';
-import { DEFAULT_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES, appendAuditStep, auditLine, grantSteps } from './grants.js';
+import { DEFAULT_AUDIT_MAX_BYTES, MAX_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES, appendAuditStep, auditLine, grantSteps } from './grants.js';
 import { escapeForPlan } from './plan-text.js';
 import { startSteps, stopSteps } from './session-plan.js';
 import {
@@ -49,7 +49,7 @@ export interface FakeCoreOptions {
   readonly folders?: readonly GaugeFolder[];
   /** The clock, in milliseconds. A monotonic clock by default (`monotonicNow`). A test passes its own, to move time. */
   readonly now?: () => number;
-  /** The size cap of the audit file, in bytes: a whole number of at least `MIN_AUDIT_MAX_BYTES` (5,970). 64 KiB by default. A smaller or a non-integer cap is refused when the core is made. */
+  /** The size cap of the audit file, in bytes: a whole number from `MIN_AUDIT_MAX_BYTES` (5,970) to `MAX_AUDIT_MAX_BYTES` (1 MiB). 64 KiB by default. Any other cap is refused when the core is made. */
   readonly auditMaxBytes?: number;
   /** The wall clock for the time of an audit record, in milliseconds since 1970. The system clock by default. An audit record is a time, so it is not the monotonic clock. A test passes its own. */
   readonly wall?: () => number;
@@ -217,12 +217,9 @@ const auditRefusal = (reason: AuditReason): Refusal => ({ ok: false, code: 'GAUG
 /** A refusal because of a grant: the code `GAUGE_GRANT_MISSING` with a reason of the closed set, or with none when the permission is plainly not granted. */
 const deny = (reason?: GrantReason): Refusal => (reason === undefined ? { ok: false, code: 'GAUGE_GRANT_MISSING' } : { ok: false, code: 'GAUGE_GRANT_MISSING', reason });
 /** A refusal of the Engine Host, as the core gives it. `ENGINE_REQUEST_INVALID`, `ENGINE_NOT_FOUND`, and `ENGINE_START_FAILED` keep their reason, and every other engine code has none. */
-const engineRefusal = (refusal: HostRefusal): Refusal => {
-  if (refusal.code === 'ENGINE_REQUEST_INVALID') return { ok: false, code: refusal.code, reason: refusal.reason };
-  if (refusal.code === 'ENGINE_NOT_FOUND') return { ok: false, code: refusal.code, reason: refusal.reason };
-  if (refusal.code === 'ENGINE_START_FAILED') return { ok: false, code: refusal.code, reason: refusal.reason };
-  return { ok: false, code: refusal.code };
-};
+const engineRefusal = (refusal: HostRefusal): Refusal => (
+  refusal.code === 'ENGINE_REQUEST_INVALID' || refusal.code === 'ENGINE_NOT_FOUND' || refusal.code === 'ENGINE_START_FAILED' ? { ok: false, code: refusal.code, reason: refusal.reason } as Refusal : { ok: false, code: refusal.code }
+);
 const reply = (refusal: Refusal): CoreReply => (refusal.reason === undefined ? { ok: false, code: refusal.code } : { ok: false, code: refusal.code, reason: refusal.reason });
 /** True when the value is a list of text with no hole. A hole is not a line of text. */
 /** Reads a list of text by index, once (see `readList`). A list with a hole, an accessor, or an item that is not text reads as `undefined`. */
@@ -256,7 +253,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   const now = options.now ?? monotonicNow;
   const wall = options.wall ?? Date.now;
   const auditMaxBytes = options.auditMaxBytes ?? DEFAULT_AUDIT_MAX_BYTES;
-  if (!Number.isSafeInteger(auditMaxBytes) || auditMaxBytes < MIN_AUDIT_MAX_BYTES) throw new RangeError(`the audit size cap is a whole number of at least ${MIN_AUDIT_MAX_BYTES} bytes`);
+  if (!Number.isSafeInteger(auditMaxBytes) || auditMaxBytes < MIN_AUDIT_MAX_BYTES || auditMaxBytes > MAX_AUDIT_MAX_BYTES) throw new RangeError(`the audit size cap is a whole number of bytes from ${MIN_AUDIT_MAX_BYTES} to ${MAX_AUDIT_MAX_BYTES}`);
   const folders = new Map<string, GaugeFolder>((options.folders ?? []).map(folder => [folder.name, copyFolder(folder)]));
   const started: readonly { readonly summary: GaugeSummary; readonly tile: TileInfo | null }[] = [
     ...FIXTURE_GAUGES.map(summary => ({ summary, tile: null })), ...(options.home === true ? HOME_STOCK : []),

@@ -1,13 +1,13 @@
 import { isGaugeCode, type GaugeCode } from '../../gauge-errors/src/index.js';
-import { isAuditReason, isGrantReason, isManifestReason, isPermission, isTracesPermission, type PermissionName } from '../../gauge-manifest/src/index.js';
+import { PERMISSION_NAMES, isAuditReason, isGrantReason, isManifestReason, isPermission, isTracesPermission, type PermissionName } from '../../gauge-manifest/src/index.js';
 import { MAX_LAYOUT_BYTES, MAX_REVISIONS, canonicalText, isLayoutReason, isProtectedReason, layoutOf, parseLayoutText, sha256Hex, type Layout } from '../../gauge-layout/src/index.js';
-import { MAX_NAME_LENGTH, checkEngineId, checkFolder, checkModel, checkSessionId, isRequestReason, readList } from '../../engine-sessions/src/request.js';
+import { MAX_LIST_LENGTH, MAX_NAME_LENGTH, checkEngineId, checkFolder, checkModel, checkSessionId, isRequestReason, readList } from '../../engine-sessions/src/request.js';
 import { SESSION_FAILURES, type SessionFailure } from '../../engine-sessions/src/session.js';
 import { SESSION_STATES, type SessionState } from '../../engine-sessions/src/states.js';
 import { hasPlanUnsafeChar, hasUnsafeChar } from '../../engine-sessions/src/text.js';
 import { BILLING_SOURCES, MAX_SESSIONS_LISTED, isNotFoundReason, isStartFailedReason, type Billing } from '../../engine-sessions/src/vocab.js';
 import {
-  ENGINE_CODES, LAYOUT_KINDS, PLAN_ACTIONS, SESSION_ACTIONS,
+  ENGINE_CODES, LAYOUT_KINDS, MAX_AUDIT_RECORDS, PLAN_ACTIONS, SESSION_ACTIONS,
   type AuditEntry, type AuditRead, type Core, type CoreMethod, type CoreResult, type GaugeApplied, type GaugePlan, type GaugeSummary, type GrantApplied, type GrantEntry, type GrantPlan, type GrantRevoked,
   type LayoutApplied, type LayoutKind, type LayoutPlan, type LayoutRevisionEntry, type LayoutSafe, type LayoutState, type PermissionCheck, type PlanAction,
   type SessionAction, type SessionApplied, type SessionModel, type SessionPlan, type SessionSummary,
@@ -204,6 +204,18 @@ function appliedOf(value: unknown): GaugeApplied | undefined {
 
 const sameList = (left: readonly string[], right: readonly string[]): boolean => left.length === right.length && left.every((item, index) => item === right[index]);
 const isText = (value: unknown): value is string => typeof value === 'string';
+/** The most Gauges a list of Gauges or of routes may hold. The shelf and the hidden list of a layout hold 100 each, and the core pages are few, so this is generous, and it is the cap of `readList` by name. */
+const MAX_GAUGES_LISTED = MAX_LIST_LENGTH;
+/** True when the value is a plain array whose length is above the cap. It reads the own length once, and never runs code of the value. */
+function isTooLong(value: unknown, max: number): boolean {
+  try {
+    if (!Array.isArray(value)) return false;
+    const length: unknown = Object.getOwnPropertyDescriptor(value, 'length')?.value;
+    return typeof length === 'number' && length > max;
+  } catch {
+    return false;
+  }
+}
 /** Reads a list of text once, by index, from own data properties, with no hole, no accessor, no subclass, and no iterator (see `readList`). Gives a new list. */
 const denseTexts = (value: unknown): string[] | undefined => { const items = readList(value); return items !== undefined && items.every(isText) ? items : undefined; };
 /** True when the list is in strict order, so sorted with no repeat. Names compare by code unit, and permission names are plain ASCII. */
@@ -346,7 +358,7 @@ function layoutPlanOf(value: unknown): LayoutPlan | undefined {
 
 /**
  * A copy of a plan to send: each own enumerable data property of the plan (`Object.keys`), read once through its descriptor, with each named list copied. A property that is an accessor, or that is not enumerable,
- * or that the plan only inherits, is not sent and is not read, so the core refuses the plan as incomplete. A plan that is `null` or `undefined` throws, as it always did.
+ * or that the plan only inherits, is not sent and is not read, so the core refuses the plan as incomplete. A plan that is `null` or `undefined` throws, as it always did, and so does a named list that cannot be read.
  */
 function ownLists(plan: object, keys: readonly string[]): Record<string, unknown> {
   const copy: Record<string, unknown> = {};
@@ -356,9 +368,9 @@ function ownLists(plan: object, keys: readonly string[]): Record<string, unknown
     if (!descriptor || !('value' in descriptor)) continue;
     const value: unknown = descriptor.value;
     // A key such as `__proto__` stays an own data property of the copy: it is defined, and not assigned, so it never changes the prototype of the copy.
-    // A list is copied by index, once (see `readList`). A list that cannot be read is not sent, so the core refuses the plan as incomplete, and no accessor or iterator of the caller ever runs.
+    // A list is copied by index, once (see `readList`). A list that cannot be read (a hole, an accessor, a subclass, or more than 4,096 items) is a bug of the caller: it throws, nothing is sent, and no accessor or iterator of the caller ever runs.
     const copied = keys.includes(key) ? readList(value) : value;
-    if (keys.includes(key) && copied === undefined) continue;
+    if (keys.includes(key) && copied === undefined) throw new TypeError(`the list ${shown(key)} of a plan is a plain list that holds at most ${MAX_LIST_LENGTH} items`);
     Object.defineProperty(copy, key, { value: copied, enumerable: true, writable: true, configurable: true });
   }
   return copy;
@@ -426,8 +438,8 @@ export function createCoreClient(core: Core): CoreClient {
     return code;
   }
   function gaugeList(method: CoreMethod, result: unknown): readonly GaugeSummary[] {
-    const items = readList(result);
-    if (items === undefined) throw new CoreProtocolError(method, 'result is not a list');
+    const items = readList(result, MAX_GAUGES_LISTED);
+    if (items === undefined) throw new CoreProtocolError(method, 'result is not a list, or holds more Gauges than a core lists');
     const gauges: GaugeSummary[] = [];
     for (let index = 0; index < items.length; index += 1) {
       const gauge = summaryOf(items[index]);
@@ -556,8 +568,10 @@ export function createCoreClient(core: Core): CoreClient {
           throw new CoreProtocolError(method, 'result is not an applied session plan');
         }
         if (gotAction !== action || gotEngine !== engine || (action === 'stop' && gotSession !== session)) throw new CoreProtocolError(method, 'result is for another plan');
-        // A stop that succeeded is stopped. A start is past `ready`, since the program may have moved on already.
-        if (action === 'stop' ? state !== 'stopped' : !STARTED_STATES.includes(state)) throw new CoreProtocolError(method, `result does not fit a ${action}`);
+        // A stop that succeeded is stopped, or failed when it was the forced stop of a failed session. A start is past `ready`, since the program may have moved on already.
+        // A forced stop of a session that failed and whose program had not gone is the kill again. The session keeps its cause, so it ends as failed, and the place is free when the program is gone.
+        const forced = ownData(sent, 'force') === true;
+        if (action === 'stop' ? state !== 'stopped' && !(forced && state === 'failed') : !STARTED_STATES.includes(state)) throw new CoreProtocolError(method, `result does not fit a ${action}`);
         return Object.freeze({ action: action as SessionAction, session: gotSession, engine: gotEngine, state: state as SessionState });
       });
     },
@@ -609,11 +623,11 @@ export function createCoreClient(core: Core): CoreClient {
     planGrant: async (id, permissions) => {
       const asked = askedNames('planGrant', permissions);
       return ask('bowerloom.grants.plan', { id, permissions: [...asked] }, (method, result) => {
-      const plan = grantPlanOf(result);
-      if (!plan) throw new CoreProtocolError(method, 'result is not a grant plan');
-      if (plan.id !== id) throw new CoreProtocolError(method, `result is a plan for another Gauge: ${shown(plan.id)}`);
-      if (!sameList(plan.permissions, [...asked].sort())) throw new CoreProtocolError(method, 'result is a plan for other permissions than were asked');
-      return plan;
+        const plan = grantPlanOf(result);
+        if (!plan) throw new CoreProtocolError(method, 'result is not a grant plan');
+        if (plan.id !== id) throw new CoreProtocolError(method, `result is a plan for another Gauge: ${shown(plan.id)}`);
+        if (!sameList(plan.permissions, [...asked].sort())) throw new CoreProtocolError(method, 'result is a plan for other permissions than were asked');
+        return plan;
       });
     },
     applyGrant: (plan, approval) => ask('bowerloom.grants.apply', { plan: ownLists(plan, ['permissions', 'steps']), ...(approval === undefined ? {} : { approval }) }, (method, result) => {
@@ -638,8 +652,9 @@ export function createCoreClient(core: Core): CoreClient {
       return revoked;
     }),
     listGrants: id => ask('bowerloom.grants.list', { id }, (method, result) => {
-      const items = readList(result);
-      if (items === undefined) throw new CoreProtocolError(method, 'result is not a list');
+      // One entry for each permission at most, so the list is never longer than the list of permissions.
+      const items = readList(result, PERMISSION_NAMES.length);
+      if (items === undefined) throw new CoreProtocolError(method, 'result is not a list, or holds more entries than there are permissions');
       const entries: GrantEntry[] = [];
       for (let index = 0; index < items.length; index += 1) {
         const entry = grantEntryOf(items[index]);
@@ -659,7 +674,8 @@ export function createCoreClient(core: Core): CoreClient {
     readAudit: () => ask('bowerloom.audit.read', {}, (method, result) => {
       if (!isRecord(result)) throw new CoreProtocolError(method, 'result is not an audit read');
       const list = own(result, 'entries'), firstSeq = own(result, 'firstSeq'), droppedCount = own(result, 'droppedCount'), failed = own(result, 'auditFailed');
-      const items = readList(list);
+      const items = readList(list, MAX_AUDIT_RECORDS);
+      if (items === undefined && isTooLong(list, MAX_AUDIT_RECORDS)) throw new CoreProtocolError(method, `result is too long: an audit file holds at most ${MAX_AUDIT_RECORDS} records`);
       if (items === undefined || typeof failed !== 'boolean') throw new CoreProtocolError(method, 'result is not an audit read');
       const entries: AuditEntry[] = [];
       for (let index = 0; index < items.length; index += 1) {
@@ -675,7 +691,7 @@ export function createCoreClient(core: Core): CoreClient {
       return Object.freeze({ entries: Object.freeze(entries), firstSeq: first, droppedCount, auditFailed: failed });
     }),
     listRoutes: () => ask('bowerloom.gauges.routes', {}, (method, result) => {
-      const routes = readList(result);
+      const routes = readList(result, MAX_GAUGES_LISTED);
       if (routes === undefined || !routes.every((route): route is string => typeof route === 'string' && route.length <= '/gauges/'.length + MAX_ID_LENGTH && ROUTE.test(route))) {
         throw new CoreProtocolError(method, 'result is not a list of routes of the form /gauges/<id>');
       }

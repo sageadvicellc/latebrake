@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCoreClient, CoreProtocolError } from '../src/client.js';
-import type { Core, CoreReply, GrantPlan } from '../src/types.js';
+import { MAX_AUDIT_RECORDS, type Core, type CoreReply, type GrantPlan } from '../src/types.js';
 
 function scripted(reply: unknown): Core & { readonly calls: { method: string; params: unknown }[] } {
   const calls: { method: string; params: unknown }[] = [];
@@ -291,4 +291,16 @@ test('a core that throws from a grants call is not wrapped', async () => {
   const failure = new Error('transport down');
   const client = createCoreClient({ call: async () => { throw failure; } });
   await assert.rejects(client.readAudit(), error => error === failure);
+});
+
+test('an audit read may hold more than 4,096 records, up to what the largest file can hold, and a longer list says it is too long', async () => {
+  const records = (count: number) => Array.from({ length: count }, (_unused, index) => ({ ...AUDIT, seq: index + 1 }));
+  const big = await reading(READ(records(5000)));
+  assert.ok(big.ok);
+  assert.equal(big.value.entries.length, 5000);
+  assert.equal(MAX_AUDIT_RECORDS >= 5000, true);
+  const most = await reading(READ(records(MAX_AUDIT_RECORDS)));
+  assert.ok(most.ok);
+  await assert.rejects(reading(READ(records(MAX_AUDIT_RECORDS + 1))), (error: unknown) => error instanceof CoreProtocolError && /too long/.test(error.message) && error.method === 'bowerloom.audit.read');
+  await assert.rejects(reading({ ...READ([]), entries: 'many' }), (error: unknown) => error instanceof CoreProtocolError && /not an audit read/.test(error.message));
 });
