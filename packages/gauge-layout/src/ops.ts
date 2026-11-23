@@ -3,7 +3,8 @@ import {
   LAYOUT_FORMAT, MAX_TILES, checkLayout, isProtectedId, layoutOf, type GaugeInfo, type GaugeTable, type Layout, type LayoutTile,
 } from './layout.js';
 import { GRID } from './grid.js';
-import { invalid, protectedRefusal, unknownGauge, type LayoutRefusal, type UnknownGaugeRefusal } from './reasons.js';
+import { invalid, protectedRefusal, unknownGauge, type LayoutReason, type LayoutRefusal, type UnknownGaugeRefusal } from './reasons.js';
+import type { TileSize } from '../../gauge-manifest/src/index.js';
 
 /** What a change gives: the new layout, or a refusal. A refusal changes nothing: every operation builds a new layout and never edits the one it was given. */
 export type OpResult = { readonly ok: true; readonly layout: Layout } | LayoutRefusal | UnknownGaugeRefusal;
@@ -24,10 +25,19 @@ function tiled(table: GaugeTable, gauge: unknown): { readonly ok: true; readonly
   return { ok: true, id: gauge, info: { ...info, tile: info.tile } };
 }
 
+/** The sizes to try for a Gauge in a place: the size the place has when the Gauge allows it, then the sizes it allows in the order its manifest gives. */
+export const sizesToTry = (preferred: TileSize, allowed: readonly TileSize[]): readonly TileSize[] => [...(allowed.includes(preferred) ? [preferred] : []), ...allowed.filter(size => size !== preferred)];
+
+/** The reasons that say a size does not fit the grid. Any other refusal is final, whatever the size. */
+const GEOMETRY: readonly LayoutReason[] = ['out_of_grid', 'overlap'];
+const isGeometry = (result: OpResult): boolean => !result.ok && result.code === 'GAUGE_LAYOUT_INVALID' && GEOMETRY.includes(result.reason);
+
 /**
- * A person swaps which Gauge fills a place. The place keeps its position and its default Gauge. The new Gauge keeps the size of the place when its tile allows it, and takes its first
- * allowed size when it does not. The Gauge that was in the place goes to the shelf, and the new Gauge leaves the shelf or the hidden list. A Gauge that already fills another place is refused
- * (`duplicate_gauge`), and so is a swap that would replace a protected Gauge (`GAUGE_PROTECTED`, `replaced`). A swap to the Gauge that is already there changes nothing.
+ * A person swaps which Gauge fills a place. The place keeps its position and its default Gauge. The new Gauge keeps the size of the place when its tile allows it, and otherwise takes the
+ * sizes it allows in the order of its manifest. Each size is tried, and the first that fits the grid is taken. When none fits, the swap is refused with `no_room`, and when a refusal has
+ * another cause (a protected Gauge, a Gauge used twice) that refusal is given. The Gauge that was in the place goes to the shelf, and the new Gauge leaves the shelf or the hidden list.
+ * A Gauge that already fills another place is refused (`duplicate_gauge`), and so is a swap that would replace a protected Gauge (`GAUGE_PROTECTED`, `replaced`).
+ * A swap to the Gauge that is already there changes nothing.
  */
 export function swapPlace(layout: Layout, table: GaugeTable, place: unknown, gauge: unknown): OpResult {
   const tile = typeof place === 'string' ? layout.tiles.find(candidate => candidate.place === place) : undefined;
@@ -37,20 +47,41 @@ export function swapPlace(layout: Layout, table: GaugeTable, place: unknown, gau
   if (target.id === tile.gauge) return { ok: true, layout };
   if (isProtectedId(tile.gauge, table)) return protectedRefusal('replaced');
   if (layout.tiles.some(candidate => candidate.gauge === target.id)) return invalid('duplicate_gauge');
-  const size = target.info.tile.sizes.includes(tile.size) ? tile.size : target.info.tile.sizes[0] ?? tile.size;
-  return rebuild(layout, {
-    tiles: layout.tiles.map(candidate => (candidate === tile ? { ...candidate, gauge: target.id, size } : candidate)),
-    shelf: [...layout.shelf.filter(id => id !== target.id), tile.gauge],
-    hidden: layout.hidden.filter(id => id !== target.id),
-  }, table);
+  for (const size of sizesToTry(tile.size, target.info.tile.sizes)) {
+    const result = rebuild(layout, {
+      tiles: layout.tiles.map(candidate => (candidate === tile ? { ...candidate, gauge: target.id, size } : candidate)),
+      shelf: [...layout.shelf.filter(id => id !== target.id), tile.gauge],
+      hidden: layout.hidden.filter(id => id !== target.id),
+    }, table);
+    if (!isGeometry(result)) return result;
+  }
+  return invalid('no_room');
 }
 
-/** The default Gauge of a place is one action away: this puts it back. It changes nothing when the place already holds it, and it is a swap to the default otherwise. */
+/**
+ * The default Gauge of a place is one action away: this puts it back. It changes nothing when the place already holds it. When the default Gauge is on the shelf or hidden it is a swap
+ * to the default. When it fills another place, the two places exchange their Gauges, so the default is back in its own place and the other place holds what was here. Each Gauge keeps the
+ * size of its place when it allows it, and otherwise takes the first size it allows that fits. The result is checked as a whole.
+ */
 export function defaultPlace(layout: Layout, table: GaugeTable, place: unknown): OpResult {
   const tile = typeof place === 'string' ? layout.tiles.find(candidate => candidate.place === place) : undefined;
   if (!tile) return invalid('unknown_place');
   if (tile.gauge === tile.default) return { ok: true, layout };
-  return swapPlace(layout, table, tile.place, tile.default);
+  const holder = layout.tiles.find(candidate => candidate.gauge === tile.default);
+  if (!holder) return swapPlace(layout, table, tile.place, tile.default);
+  const coming = tiled(table, tile.default);
+  if (!coming.ok) return coming;
+  const going = tiled(table, tile.gauge);
+  if (!going.ok) return going;
+  for (const size of sizesToTry(tile.size, coming.info.tile.sizes)) {
+    for (const otherSize of sizesToTry(holder.size, going.info.tile.sizes)) {
+      const result = rebuild(layout, {
+        tiles: layout.tiles.map(candidate => (candidate === tile ? { ...candidate, gauge: tile.default, size } : candidate === holder ? { ...candidate, gauge: tile.gauge, size: otherSize } : candidate)),
+      }, table);
+      if (!isGeometry(result)) return result;
+    }
+  }
+  return invalid('no_room');
 }
 
 /** The first cell, by row and then column, where a tile of this size fits among the tiles. */

@@ -43,7 +43,7 @@ Every name (a place, a Gauge id) is lower-case words joined by single hyphens, a
 
 ### Caps and the order of the checks
 
-The text is at most 32,768 bytes (`MAX_LAYOUT_BYTES`, exactly the cap passes), with at most 48 tiles (`MAX_TILES`) and at most 100 names on the shelf and 100 on the hidden list (`MAX_LISTED`). The longest layout that these caps allow is 26,050 bytes, which a test pins, so a core never refuses a layout it wrote. A layout of 10,000 tiles is refused by the size cap before any tile is read. A list over its cap is refused before any element is read.
+The text is at most 32,768 bytes (`MAX_LAYOUT_BYTES`, exactly the cap passes). A text that is longer than the cap in characters is refused before it is encoded, since every character takes at least one byte, so a huge text is never copied first. A layout has at most 48 tiles (`MAX_TILES`) and at most 100 names on the shelf and 100 on the hidden list (`MAX_LISTED`). The longest layout that these caps allow is 26,050 bytes, which a test pins, so a core never refuses a layout it wrote. A layout of 10,000 tiles is refused by the size cap before any tile is read. A list over its cap is refused before any element is read.
 
 The checks run in this order, and the first that fails refuses, with `GAUGE_LAYOUT_INVALID` and a reason, except the last stage:
 
@@ -61,8 +61,10 @@ The Gauge manager and Settings can never be hidden, removed, or replaced. Settin
 A layout is refused with `GAUGE_PROTECTED` and one of three reasons:
 
 - `hidden`: a protected Gauge, or `settings`, is on the hidden list.
-- `replaced`: a place whose default is a protected Gauge holds another Gauge.
+- `replaced`: a place holds another Gauge than the protected Gauge it is for. A place is for a protected Gauge when the file says so (`default`), and also when the place is one of the five places of the default home that the core holds for a protected Gauge (`DEFAULT_TILES`). The file cannot vouch for itself: a text that changes both the `gauge` and the `default` of the `harnesses` place is still `replaced`.
 - `removed`: an enabled protected Gauge, or `settings`, is on no tile and not on the shelf.
+
+The shelf counts as a reachable place, so a protected Gauge may sit on the shelf and not on the home. The default layout does this for the Gauge manager. A person may also take Harnesses off the home by dropping its tile, and it then sits on the shelf. Whether Harnesses must stay on the home is a decision that is still open.
 
 A change that would do the same is refused the same way. A swap that would take a protected Gauge out of its place is `replaced`. Settings has no place that a Gauge can fill, so there is nothing to replace: the ways to break its rule are to hide it and to drop it.
 
@@ -93,25 +95,41 @@ The saved file has the format `bowerloom/layout-file/1`:
 
 ## Safe mode
 
-A broken file, or a file whose current layout is invalid or no longer fits the Gauges, never blocks the start. The core starts in safe mode: the layout in use is the default layout, `revision` is 0, the revisions are empty, and the core reports why, with the exact code and reason that the file got. Nothing is written. The broken file stays on disk until the person makes a change. The first change saves the layout as revision 1 in a new file, and that leaves safe mode. A real core should keep a copy of the broken file. This package does not write files.
+A broken file, or a file whose current layout is invalid or no longer fits the Gauges, never blocks the start. The core starts in safe mode: the layout in use is the default layout, `revision` is 0, the revisions are empty, and the core reports why, with the exact code and reason that the file got. A value that is not text or bytes is not a file, and is `syntax`. Nothing is written. The broken file stays on disk until the person makes a change.
+
+The first change saves the layout as revision 1 in a new file, and that leaves safe mode. The plan says so: `leave safe mode, keep the saved file as a backup, and save the layout as revision 1`. The core keeps the raw bytes of the saved file as a backup, byte for byte, and not a decode of them. Revisions are not salvaged from a broken file, so the backup is the way to get them back. This package does not write files, and a real core must keep the backup on disk.
+
+A start that breaks inside the reader, and not in the file, is the reason `internal`. It could be a bug and not a broken file, so every change is refused with `GAUGE_LAYOUT_INVALID` and `internal` while it lasts, and nothing can overwrite the file.
 
 ## The changes a person can make
 
 Each is a pure function that builds a new layout and never edits the one it was given. A result is checked as a whole against the grid and the Gauges.
 
-- `swapPlace(layout, table, place, gauge)`: another Gauge fills a place. The place keeps its position and default. The new Gauge keeps the size of the place if its tile allows it, and takes its first allowed size if not. The displaced Gauge goes to the shelf. The new Gauge leaves the shelf or the hidden list. A Gauge that already fills a place is `duplicate_gauge`. A swap to the Gauge already there changes nothing. A place that is not there, or is not text, is `unknown_place`, and a Gauge that is not there, or an id that is not text, is `UNKNOWN_GAUGE`.
-- `defaultPlace(layout, table, place)`: the default Gauge of a place is one action away, and this puts it back. It changes nothing when the place already holds it.
+- `swapPlace(layout, table, place, gauge)`: another Gauge fills a place. The place keeps its position and default. The new Gauge keeps the size of the place if its tile allows it. Otherwise the sizes it allows are tried in the order of its manifest. Each size is tried against the grid, and the first that fits is taken. When none fits, the swap is refused with `no_room`, and any other cause (a protected Gauge, a Gauge used twice) is given as it is. The displaced Gauge goes to the shelf. The new Gauge leaves the shelf or the hidden list. A Gauge that already fills a place is `duplicate_gauge`. A swap to the Gauge already there changes nothing. A place that is not there, or is not text, is `unknown_place`, and a Gauge that is not there, or an id that is not text, is `UNKNOWN_GAUGE`.
+- `defaultPlace(layout, table, place)`: the default Gauge of a place is one action away, and this puts it back. It changes nothing when the place already holds it. When the default Gauge is on the shelf or hidden, it is a swap. When it fills another place, the two places exchange their Gauges, so the default is back in its own place and the other place holds what was here. Each Gauge keeps its place's size when it allows it, and otherwise takes the first size it allows that fits, else the action is refused with `no_room`.
 - `proposeTile(layout, table, gauge)`: a Gauge asks to add itself. It gets a tile of its first allowed size in the first free cell (by row, then column), in a place named `place-<n>` with the smallest free number. It is refused with `duplicate_gauge` when it already has a tile, `too_many_tiles` at the cap, and `no_room` when no cell is free.
+
+## A lifecycle step keeps the layout in line
+
+A step that changes the Gauges (disable, remove, update, enable) reconciles the layout inside the same approved plan, and saves the result as a normal revision, so the saved layout never goes stale and every later change still works. `reconcileLayout(layout, table)` does this, and never edits the layout it was given:
+
+- A Gauge that is disabled, removed, or has lost its tile leaves its tile. The place goes back to its default Gauge when that Gauge is enabled, has a tile, and is not on another tile. Otherwise the tile is dropped, since the format has no empty place. A Gauge that is enabled and only lost its tile goes to the shelf.
+- A tile whose Gauge no longer allows its size takes the first allowed size that is no bigger than the tile and that fits, in the same cell. A step never makes a tile grow. When none fits, the Gauge goes to the shelf.
+- A default Gauge that is gone becomes the Gauge in the place, and two places never share a default.
+- A Gauge that is disabled or removed leaves the shelf and the hidden list. `settings` stays.
+- A protected Gauge that is enabled and on no tile goes to the shelf, also from the hidden list, so a newly enabled protected Gauge appears there. A protected Gauge is never dropped.
+- An enabled Gauge that is not protected and that the layout does not hold is left alone. The person adds it.
+
+The result is valid for the Gauges. If a case that the rules do not foresee ever gave an invalid layout, the default layout is given instead, and a test holds every single-Gauge change to this. The plan of the step says what changes, in lines that start with `layout: `, and none when the layout does not change.
 
 ## Reasons
 
-`LAYOUT_REASONS` go with `GAUGE_LAYOUT_INVALID`, and `PROTECTED_REASONS` (`hidden`, `removed`, `replaced`) go with `GAUGE_PROTECTED`. Both are closed sets, and a reason never holds a value that a caller sent. This package adds no code to the registry in `packages/gauge-errors`.
+`sha256Hex` is a pure SHA-256, so that the client seam needs no platform module. `LAYOUT_REASONS` go with `GAUGE_LAYOUT_INVALID`, and `PROTECTED_REASONS` (`hidden`, `removed`, `replaced`) go with `GAUGE_PROTECTED`. Both are closed sets, and a reason never holds a value that a caller sent. This package adds no code to the registry in `packages/gauge-errors`.
 
 ## What is not covered
 
 - Who calls the change calls. The fake core trusts the Gauge id of a proposal. The per-Gauge channel and token belong to the call identity work.
 - A file on disk, and a crash while it is written. The fake core keeps the file text in memory. A real core must write the file in one step, and must keep a copy of a broken file.
-- A Gauge that is removed, disabled, or updated after the layout was saved. The saved layout is checked against the Gauges when the core starts, so such a change is found at the next start, as safe mode. A later ticket decides whether a lifecycle step also edits the layout.
 - Drag and drop, resize handles, and drawing. Those are the app's. This package says what is valid.
 - Fascia. A Fascia never changes the layout.
 

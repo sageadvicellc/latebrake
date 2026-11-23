@@ -20,17 +20,19 @@ export interface HomeGauge {
   readonly tile: { readonly resizable: boolean; readonly sizes: readonly TileSize[] };
 }
 
-const everySize = ['small', 'medium', 'large', 'full'] as const;
+const everySize: readonly TileSize[] = ['small', 'medium', 'large', 'full'];
+const gauge = (id: string, title: string, isProtected: boolean, resizable: boolean, sizes: readonly TileSize[]): HomeGauge =>
+  Object.freeze({ id, title, protected: isProtected, tile: Object.freeze({ resizable, sizes: Object.freeze([...sizes]) }) });
 
 /** The nine stock Gauges of v0.9.1, with what their tiles allow. A core holds all nine. The fake core holds them when it is made with `home: true`. */
 export const HOME_GAUGES: readonly HomeGauge[] = Object.freeze([
-  { id: 'engines-usage', title: 'Engines and usage', protected: false, tile: { resizable: true, sizes: ['large', 'medium', 'full'] } },
-  { id: 'jobs', title: 'Jobs', protected: false, tile: { resizable: true, sizes: ['large', 'medium', 'full'] } },
-  { id: 'harnesses', title: 'Harnesses', protected: true, tile: { resizable: true, sizes: ['medium', 'large', 'full'] } },
-  { id: 'local-models', title: 'Local models', protected: false, tile: { resizable: true, sizes: ['small', 'medium', 'large'] } },
-  { id: 'memory-explorer', title: 'Memory explorer', protected: false, tile: { resizable: true, sizes: ['small', 'medium', 'large'] } },
-  { id: 'projects', title: 'Projects', protected: false, tile: { resizable: true, sizes: everySize } },
-  { id: 'library', title: 'Library', protected: false, tile: { resizable: true, sizes: everySize } },
-  { id: 'tracing', title: 'Tracing', protected: false, tile: { resizable: true, sizes: everySize } },
-  { id: 'gauge-manager', title: 'Gauge manager', protected: true, tile: { resizable: false, sizes: ['medium'] } },
-].map(gauge => Object.freeze({ ...gauge, tile: Object.freeze({ ...gauge.tile, sizes: Object.freeze([...gauge.tile.sizes]) }) })) as readonly HomeGauge[]);
+  gauge('engines-usage', 'Engines and usage', false, true, ['large', 'medium', 'full']),
+  gauge('jobs', 'Jobs', false, true, ['large', 'medium', 'full']),
+  gauge('harnesses', 'Harnesses', true, true, ['medium', 'large', 'full']),
+  gauge('local-models', 'Local models', false, true, ['small', 'medium', 'large']),
+  gauge('memory-explorer', 'Memory explorer', false, true, ['small', 'medium', 'large']),
+  gauge('projects', 'Projects', false, true, everySize),
+  gauge('library', 'Library', false, true, everySize),
+  gauge('tracing', 'Tracing', false, true, everySize),
+  gauge('gauge-manager', 'Gauge manager', true, false, ['medium']),
+]);

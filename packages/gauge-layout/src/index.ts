@@ -3,12 +3,14 @@ export { COLUMNS, FULL_WIDTH_PX, GAP_PX, GRID, MAX_ROWS, UNIT_PX, columnsFor, si
 export { DEFAULT_TILES, HOME_GAUGES } from './home.js';
 export type { HomeGauge } from './home.js';
 export {
-  LAYOUT_FORMAT, MAX_LAYOUT_BYTES, MAX_LISTED, MAX_TILES, PAGE_IDS, canonicalText, checkLayout, defaultLayout, isProtectedId, layoutObject, layoutOf, parseLayout, parseLayoutText, readJsonText, tileInfoOf,
+  LAYOUT_FORMAT, MAX_LAYOUT_BYTES, MAX_LISTED, MAX_TILES, PAGE_IDS, canonicalText, checkLayout, defaultLayout, fitsAmong, isProtectedId, layoutObject, layoutOf, parseLayout, parseLayoutText, readJsonText, tileInfoOf,
 } from './layout.js';
 export type { GaugeInfo, GaugeTable, Layout, LayoutResult, LayoutTile, ReadOptions, TileInfo } from './layout.js';
-export { defaultPlace, proposeTile, swapPlace } from './ops.js';
+export { defaultPlace, proposeTile, sizesToTry, swapPlace } from './ops.js';
+export { reconcileLayout } from './reconcile.js';
+export { sha256Hex } from './sha256.js';
 export type { OpResult } from './ops.js';
-export { FILE_FORMAT, MAX_FILE_BYTES, MAX_REVISION, MAX_REVISIONS, newFile, parseLayoutFile, saveRevision, serializeLayoutFile } from './file.js';
+export { FILE_FORMAT, MAX_FILE_BYTES, droppedRevision, MAX_REVISION, MAX_REVISIONS, newFile, parseLayoutFile, saveRevision, serializeLayoutFile } from './file.js';
 export type { LayoutFile, LayoutFileResult, LayoutRevision } from './file.js';
 export { LAYOUT_REASONS, PROTECTED_REASONS, invalid, isLayoutReason, isProtectedReason, protectedRefusal, unknownGauge } from './reasons.js';
 export type { LayoutReason, LayoutRefusal, ProtectedReason, UnknownGaugeRefusal } from './reasons.js';

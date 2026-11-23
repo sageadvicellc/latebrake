@@ -101,6 +101,16 @@ function readTile(value: unknown): LayoutTile {
   if (size === undefined) return stop('unknown_size');
   return Object.freeze({ place, gauge, default: fallback, col, row, size });
 }
+const overlapping = (a: LayoutTile, b: LayoutTile): boolean => {
+  const sa = sizeUnits(a.size), sb = sizeUnits(b.size);
+  return a.col < b.col + sb.w && b.col < a.col + sa.w && a.row < b.row + sb.h && b.row < a.row + sa.h;
+};
+/** True when the tile is inside the grid and shares no cell with any tile of the list that has another place. */
+export function fitsAmong(tile: LayoutTile, others: readonly LayoutTile[]): boolean {
+  const { w, h } = sizeUnits(tile.size);
+  if (tile.col < 0 || tile.row < 0 || tile.col + w > COLUMNS || tile.row + h > MAX_ROWS) return false;
+  return others.every(other => other.place === tile.place || !overlapping(tile, other));
+}
 function checkGrid(value: unknown): void {
   const fields = fieldsOf(value, ['columns', 'unit', 'gap']);
   const columns = fields.get('columns'), unit = fields.get('unit'), gap = fields.get('gap');
@@ -144,8 +154,7 @@ function readLayout(value: unknown, options: ReadOptions): Layout {
   }
   for (const [index, a] of tiles.entries()) {
     for (const b of tiles.slice(index + 1)) {
-      const sa = sizeUnits(a.size), sb = sizeUnits(b.size);
-      if (a.col < b.col + sb.w && b.col < a.col + sa.w && a.row < b.row + sb.h && b.row < a.row + sa.h) stop('overlap');
+      if (overlapping(a, b)) stop('overlap');
     }
   }
   const sortedTiles = [...tiles].sort(compareTiles), sortedShelf = [...shelf].sort(compare), sortedHidden = [...hidden].sort(compare);
@@ -176,7 +185,9 @@ export const canonicalText = (layout: Layout): string => `${JSON.stringify(layou
 export function readJsonText(input: string | Uint8Array, maxBytes: number): { readonly ok: true; readonly value: unknown } | LayoutRefusal {
   try {
     if (typeof input !== 'string' && !(input instanceof Uint8Array)) throw new Error('input is not text or bytes');
-    const bytes = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
+    // A text has at least one byte for each UTF-16 unit, so a text longer than the cap in units is too large, and nothing is encoded for it.
+    if (typeof input === 'string' && input.length > maxBytes) return invalid('too_large');
+    const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
     if (bytes.byteLength > maxBytes) return invalid('too_large');
     let source: string;
     try {
@@ -219,7 +230,8 @@ function gaugeProblem(id: string, table: GaugeTable, needsTile: boolean): Layout
  * Checks a layout against the Gauges the core holds. The checks run in a fixed order, and the first that fails refuses:
  * 1. Every Gauge id exists and is enabled, and a place is filled by a Gauge that has a tile (`unknown_gauge`, `gauge_disabled`, `no_tile`). A page can only be on the shelf or hidden.
  * 2. Every tile has a size that its Gauge allows (`size_not_allowed`), and a Gauge that cannot be resized keeps its one size (`not_resizable`).
- * 3. The way back, with `GAUGE_PROTECTED`: a protected Gauge or a page is on the hidden list (`hidden`); a place whose default is a protected Gauge holds another Gauge (`replaced`);
+ * 3. The way back, with `GAUGE_PROTECTED`: a protected Gauge or a page is on the hidden list (`hidden`); a place whose default is a protected Gauge holds another Gauge, or a place of the
+ *    default home (`DEFAULT_TILES`) that the core holds for a protected Gauge holds another Gauge, whatever default the file gives it (`replaced`);
  *    a protected Gauge that is enabled, or a page, is on no tile and not on the shelf (`removed`).
  */
 export function checkLayout(layout: Layout, table: GaugeTable): LayoutRefusal | undefined {
@@ -238,6 +250,8 @@ export function checkLayout(layout: Layout, table: GaugeTable): LayoutRefusal | 
   }
   if (layout.hidden.some(id => isProtectedId(id, table))) return protectedRefusal('hidden');
   if (layout.tiles.some(tile => tile.gauge !== tile.default && isProtectedId(tile.default, table))) return protectedRefusal('replaced');
+  // The file cannot vouch for itself: a place of the default home keeps its protected Gauge, whatever `default` the file gives it.
+  if (DEFAULT_TILES.some(home => isProtectedId(home.gauge, table) && layout.tiles.some(tile => tile.place === home.place && tile.gauge !== home.gauge))) return protectedRefusal('replaced');
   const reachable = new Set([...layout.tiles.map(tile => tile.gauge), ...layout.shelf]);
   const required = [...PAGE_IDS, ...[...table].filter(([, info]) => info.enabled && info.protected).map(([id]) => id)];
   if (required.some(id => !reachable.has(id))) return protectedRefusal('removed');

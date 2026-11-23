@@ -89,6 +89,14 @@ test('a text over the size cap is refused with too_large, and exactly the cap pa
   assert.equal(parse(text + ' '.repeat(MAX_LAYOUT_BYTES - Buffer.byteLength(text))), undefined);
 });
 
+test('a text that is longer than the cap in characters is refused with too_large before it is encoded', () => {
+  const huge = ' '.repeat(MAX_LAYOUT_BYTES + 1);
+  assert.deepEqual(parse(huge), { code: 'GAUGE_LAYOUT_INVALID', reason: 'too_large' });
+  // Characters of more than one byte: the text is within the cap in characters and over it in bytes.
+  const wide = `${homeText().slice(0, -1)},"x":"${'\u00E9'.repeat(MAX_LAYOUT_BYTES / 2)}"}`;
+  assert.deepEqual(parse(wide), { code: 'GAUGE_LAYOUT_INVALID', reason: 'too_large' });
+});
+
 test('a layout of 10,000 tiles is refused by the size cap, before any tile is read', () => {
   const tiles = Array.from({ length: 10_000 }, (_, index) => ({ place: `p${index}`, gauge: 'jobs', default: 'jobs', col: 0, row: 0, size: 'small' }));
   assert.deepEqual(parse(homeText(home => ({ ...home, tiles }))), { code: 'GAUGE_LAYOUT_INVALID', reason: 'too_large' });
@@ -114,7 +122,8 @@ test('a layout with the most tiles and the longest names still fits under the si
   const layout = layoutOf({ ...HOME, tiles, shelf, hidden }, { requireCanonical: false });
   assert.ok(layout.ok, JSON.stringify(refusal(layout)));
   assert.equal(layout.layout.tiles.length, 48);
-  assert.ok(Buffer.byteLength(canonicalText(layout.layout)) < MAX_LAYOUT_BYTES, String(Buffer.byteLength(canonicalText(layout.layout))));
+  assert.equal(Buffer.byteLength(canonicalText(layout.layout)), 26050);
+  assert.ok(Buffer.byteLength(canonicalText(layout.layout)) < MAX_LAYOUT_BYTES);
 });
 
 test('bytes that are not UTF-8 are refused with not_utf8', () => {
@@ -298,6 +307,17 @@ test('a layout that removes the Gauge manager or Settings from the shelf is refu
 
 test('a layout that replaces a protected Gauge in its place is refused with GAUGE_PROTECTED and the reason replaced', () => {
   assert.deepEqual(parse(homeText(home => ({ ...home, tiles: home.tiles.map(tile => (tile.place === 'harnesses' ? { ...tile, gauge: 'library' } : tile)), shelf: [...home.shelf.filter(id => id !== 'library'), 'harnesses'] }))), { code: 'GAUGE_PROTECTED', reason: 'replaced' });
+});
+
+test('a place of the default home keeps its protected Gauge even when the file edits both the Gauge and the default of the place', () => {
+  const edited = homeText(home => ({
+    ...home, tiles: home.tiles.map(tile => (tile.place === 'harnesses' ? { ...tile, gauge: 'projects', default: 'projects' } : tile)),
+    shelf: [...home.shelf.filter(id => id !== 'projects'), 'harnesses'].sort(),
+  }));
+  assert.deepEqual(parse(edited), { code: 'GAUGE_PROTECTED', reason: 'replaced' });
+  // A protected Gauge may leave the place when the place goes too: it is then reachable from the shelf.
+  const without = homeText(home => ({ ...home, tiles: home.tiles.filter(tile => tile.place !== 'harnesses'), shelf: [...home.shelf, 'harnesses'].sort() }));
+  assert.equal(parse(without), undefined);
 });
 
 test('a protected Gauge may sit on the shelf or on the home, and a layout with the Gauge manager as a tile is valid', () => {

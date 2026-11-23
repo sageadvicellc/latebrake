@@ -38,6 +38,9 @@ export function saveRevision(file: LayoutFile, next: Layout): LayoutFile | undef
   return Object.freeze({ revision: file.revision + 1, current: next, revisions: Object.freeze(revisions) });
 }
 
+/** The number of the revision that a save would drop now, which is the oldest, or `null` while the file holds fewer than 10 earlier revisions. */
+export const droppedRevision = (file: LayoutFile): number | null => (file.revisions.length >= MAX_REVISIONS ? file.revisions[file.revisions.length - 1]?.revision ?? null : null);
+
 /** The text of the file: one line of compact JSON with the fields in a fixed order, and one line feed. */
 export const serializeLayoutFile = (file: LayoutFile): string => `${JSON.stringify({
   format: FILE_FORMAT,
