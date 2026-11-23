@@ -394,8 +394,8 @@ export interface PersonView {
   personView(nonce: string): PersonPlan;
 }
 
-/** Why the person is told something that a Gauge is not: the second approval that a plan needs was not given. */
-export type PersonNoticeCause = 'second_approval_missing';
+/** Why the person is told something that a Gauge is not: the second approval that a plan needs was not given, or the plan changed for a cause that the Gauge cannot read (an engine began or ended in the folder, or a link moved). */
+export type PersonNoticeCause = 'second_approval_missing' | 'plan_changed_hidden';
 
 /**
  * What the core tells the person when it gives a Gauge a refusal that holds back the cause. `shown` is the refusal that the Gauge got. `engines` are all the engines in the folder, those that the Gauge may read and those that it may not.
@@ -404,7 +404,9 @@ export type PersonNoticeCause = 'second_approval_missing';
 export interface PersonNotice {
   readonly action: 'start' | 'run';
   readonly gauge: string;
-  readonly shown: 'ENGINE_FOLDER_SHARED' | 'GAUGE_PLAN_NOT_APPROVED';
+  /** The nonce of the plan, so the person can tell which plan a notice is about, and a Gauge that asks again for the same plan makes one notice. */
+  readonly nonce: string;
+  readonly shown: 'ENGINE_FOLDER_SHARED' | 'GAUGE_PLAN_NOT_APPROVED' | 'GAUGE_PLAN_CHANGED';
   readonly cause: PersonNoticeCause;
   readonly engines: readonly string[];
   readonly member: RunMember | null;

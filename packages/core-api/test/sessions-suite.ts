@@ -639,6 +639,7 @@ export function runSessionsSuite(name: string, makeHarness: (folders: readonly G
     assert.deepEqual(outcome(await narrow.planSessionStart('fixture-narrow', { engine: ENGINE, folder: linked })), refused('ENGINE_PAIR_BUSY'));
     assert.deepEqual(outcome(await narrow.applySession({ ...planned, folder: w.harness.folder('leak-other') }, approval)), refused('GAUGE_PLAN_NOT_APPROVED'), 'the approval was used up');
     const text = seen.join('\n');
-    for (const secret of [real, 'fixture-other']) assert.equal(text.includes(secret), false, secret);
+    assert.notEqual(full.program, w.harness.program, 'the harness configures its program as a link, so the real program is another path');
+    for (const secret of [real, full.program ?? '', 'fixture-other']) assert.equal(text.includes(secret), false, secret);
   });
 }

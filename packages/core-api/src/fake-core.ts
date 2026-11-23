@@ -8,7 +8,7 @@ import {
   MAX_REVISION, PAGE_IDS, canonicalText, checkLayout, defaultLayout, droppedRevision, layoutObject, newFile, parseLayout, parseLayoutFile, proposeTile, reconcileLayout, saveRevision, serializeLayoutFile, swapPlace, defaultPlace, tileInfoOf, invalid as layoutInvalid,
   type GaugeInfo, type Layout, type LayoutFile, type LayoutRefusal, type TileInfo, type UnknownGaugeRefusal,
 } from '../../gauge-layout/src/index.js';
-import { StalePlanError, checkModel, checkSessionId, createEngineHost, isBilling, readList, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
+import { checkModel, checkSessionId, createEngineHost, isBilling, isStalePlanError, readList, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
 import { MAX_JOB_SESSIONS, checkDefinition, hashDefinition, type DefinitionRefusal, type JobDefinition } from '../../jobs/src/definition.js';
 import { checkJobId, createJobStore, type Job } from '../../jobs/src/store.js';
 import { createRunBook, type PlannedRun, type RunMember, type RunOutcome, type RunRefusal, type RunView } from '../../jobs/src/runs.js';
@@ -38,8 +38,9 @@ export const APPROVAL_TTL_MS = 15 * 60 * 1000;
 
 /** The most plans that one Gauge holds at one time. A plan past it makes the core drop the oldest plan of that Gauge, and an approval of the dropped plan is for a plan that is gone. */
 export const MAX_LIVE_PLANS_PER_GAUGE = 64;
-/** The most notices for the person that the core keeps. The oldest go first. */
+/** The most notices for the person that the core keeps in all, and for each Gauge. The oldest go first. */
 const MAX_NOTICES = 64;
+const MAX_NOTICES_PER_GAUGE = 16;
 
 type Content = string | Uint8Array;
 
@@ -81,7 +82,7 @@ export interface FakeCoreOptions {
   readonly reconcile?: typeof reconcileLayout;
   /**
    * Where the core gets its random bytes, for a nonce, an approval, and the key of the digest. The random bytes of the system by default. The first draw is the key of the digest. A test passes its own, to make
-   * two cores issue the same nonce and prove that their digests differ.
+   * two cores issue the same nonce and prove that their digests differ. For tests only: a draw that is not the size asked for, or that repeats a nonce that is held, throws a `RangeError`.
    */
   readonly entropy?: (size: number) => Uint8Array;
   /** The Engine Host that starts, watches, and stops sessions (`packages/engine-sessions`). A host with no engine by default, so every engine is `ENGINE_NOT_FOUND`. A test passes one over scripted fake engines. */
@@ -293,10 +294,20 @@ const denseTexts = (value: unknown): string[] | undefined => {
  */
 export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   /** The key of the digest of a session plan and of a run plan. It is the first draw of the core, and no reply holds it. */
-  const entropy = options.entropy ?? randomBytes;
-  const digestKey = Buffer.from(entropy(32));
+  /** Draws random bytes, and checks that a source of a test gave exactly the bytes that were asked for. */
+  const draw = (size: number): Buffer => {
+    const bytes = Buffer.from((options.entropy ?? randomBytes)(size));
+    if (bytes.length !== size) throw new RangeError(`the entropy gave ${bytes.length} bytes, and ${size} were asked for`);
+    return bytes;
+  };
+  const digestKey = draw(32);
   const keyed = (value: readonly Json[]): string => keyedHash(digestKey, value);
-  const newNonce = (): string => Buffer.from(entropy(32)).toString('hex');
+  /** A new nonce, or token. A source of a test that gives one that is held now is a mistake of the test, and throws: no plan or approval is replaced by another. */
+  const newNonce = (): string => {
+    const nonce = draw(32).toString('hex');
+    if (issued.has(nonce) || approvals.has(nonce)) throw new RangeError('the entropy gave a nonce that the core holds now');
+    return nonce;
+  };
   const now = options.now ?? monotonicNow;
   const wall = options.wall ?? Date.now;
   const auditMaxBytes = options.auditMaxBytes ?? DEFAULT_AUDIT_MAX_BYTES;
@@ -311,21 +322,37 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
   /** Ids that a user Gauge may never use. A stock id stays reserved after its Gauge is removed. */
   const stockIds = new Set<string>(started.filter(({ summary }) => summary.origin === 'stock').map(({ summary }) => summary.id));
   /**
-   * The nonce of each plan the core issued, with the digest of the plan and the count of applied steps at that time. A plan of a start, a stop, or a run also holds `view` (the SHA-256 of the plan that the Gauge read) and
-   * `person` (the plan that the person reads). A Gauge holds at most `MAX_LIVE_PLANS_PER_GAUGE` plans, and a step that is applied drops every plan (see `retire`), so the map never holds more than that and the plans of the epoch now.
+   * The nonce of each plan the core issued, with the digest of the plan, the count of applied steps at that time, and the bucket it fills. A plan of a start, a stop, or a run also holds `view` (the SHA-256 of the plan that the
+   * Gauge read) and `person` (the plan that the person reads). A bucket holds at most `MAX_LIVE_PLANS_PER_GAUGE` plans, and a step that is applied drops every plan (see `retire`), so the map holds at most that many for each bucket,
+   * and only the plans of the epoch now.
    */
-  const issued = new Map<string, { digest: string; epoch: number; gauge: string | null; shared: boolean; view?: string; person?: PersonPlan }>();
-  /** Keeps a plan that was issued. A Gauge that holds `MAX_LIVE_PLANS_PER_GAUGE` plans loses its oldest plan first: the approvals of that plan stay, and they are for a plan that is gone. */
-  const issue = (nonce: string, record: { digest: string; gauge: string | null; shared: boolean; view?: string; person?: PersonPlan }): void => {
-    const mine = [...issued].filter(([, held]) => held.gauge === record.gauge).map(([held]) => held);
-    for (const oldest of mine.slice(0, Math.max(0, mine.length - MAX_LIVE_PLANS_PER_GAUGE + 1))) issued.delete(oldest);
-    issued.set(nonce, { ...record, epoch });
+  const issued = new Map<string, { digest: string; epoch: number; bucket: string; gauge: string | null; shared: boolean; view?: string; person?: PersonPlan }>();
+  /**
+   * Keeps a plan that was issued. The plans that a caller can fill are kept in a bucket for that caller: a Gauge fills `gauge:<id>` (the Gauge that the call names, which the one enforcement point checked), and a call that names
+   * no Gauge fills the bucket of its kind (`person:lifecycle`, `person:grants`, `person:layout`). So a Gauge cannot drop a plan of another Gauge, or a plan of a kind that it does not make. A bucket that holds
+   * `MAX_LIVE_PLANS_PER_GAUGE` plans loses its oldest plan first, and the approvals of that plan go with it. The calls that name no Gauge cannot tell who made them until the call identity work is done, so a caller can still
+   * drop the plans of its own kind in the bucket of the person: a real core must key the buckets on the authenticated caller.
+   */
+  const issue = (nonce: string, bucket: string, record: { digest: string; gauge: string | null; shared: boolean; view?: string; person?: PersonPlan }): void => {
+    const mine = [...issued].filter(([, held]) => held.bucket === bucket).map(([held]) => held);
+    for (const oldest of mine.slice(0, Math.max(0, mine.length - MAX_LIVE_PLANS_PER_GAUGE + 1))) {
+      issued.delete(oldest);
+      for (const [token, approval] of approvals) if (approval.nonce === oldest) approvals.delete(token);
+    }
+    issued.set(nonce, { ...record, bucket, epoch });
   };
   const approvals = new Map<string, Approval>();
   /** What the person is told that a Gauge is not. */
   const notices: PersonNotice[] = [];
+  /**
+   * Tells the person. A repeat of the same notice (the same Gauge, call, plan, and cause) is one notice, so a Gauge that asks again and again fills nothing. A Gauge keeps its newest `MAX_NOTICES_PER_GAUGE`, and the core keeps
+   * the newest `MAX_NOTICES`, so one Gauge cannot push the notices of another out.
+   */
   const notify = (notice: PersonNotice): void => {
+    if (notices.some(held => held.gauge === notice.gauge && held.action === notice.action && held.nonce === notice.nonce && held.cause === notice.cause)) return;
     notices.push(notice);
+    const mine = notices.filter(held => held.gauge === notice.gauge);
+    for (const oldest of mine.slice(0, Math.max(0, mine.length - MAX_NOTICES_PER_GAUGE))) notices.splice(notices.indexOf(oldest), 1);
     if (notices.length > MAX_NOTICES) notices.splice(0, notices.length - MAX_NOTICES);
   };
   /** Counts the steps applied. An approval from an earlier count is stale. */
@@ -578,7 +605,8 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     const approval = typeof token === 'string' ? approvals.get(token) : undefined;
     // A token of the other kind is not an approval of this kind, and it is kept, since it may be good for its own use.
     if (typeof token !== 'string' || !approval || approval.purpose !== purpose) return undefined;
-    if (now() - approval.at >= APPROVAL_TTL_MS || approval.epoch !== epoch) {
+    // An approval is for a plan that the core holds: one that the cap dropped, or that a revoke ended, is gone, and its approval is no approval. This holds for every kind of plan.
+    if (now() - approval.at >= APPROVAL_TTL_MS || approval.epoch !== epoch || !issued.has(approval.nonce)) {
       approvals.delete(token);
       return undefined;
     }
@@ -1085,7 +1113,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     try {
       return begin();
     } catch (error) {
-      if (error instanceof StalePlanError) return undefined;
+      if (isStalePlanError(error)) return undefined;
       throw error;
     }
   }
@@ -1096,8 +1124,9 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
    * so a link that moved, or an engine that began or ended in the folder, is a changed plan. Everything is checked before the host is asked, and the host is asked before the approval is used up. The wait for the program
    * (to spawn, or to go) comes after the approval is used up and every older plan is retired, so a second call in the same tick finds the approval gone.
    *
-   * The checks of the plan are partly redundant, and are kept so that each holds without the others: the plan that a Gauge sends is the plan that the core issued (the hash of its text), it is for the nonce of the approval, the plan made
-   * again has the digest that was approved, and the second approval is for this nonce and this digest. The test `the digest holds a key of the core` is the one that catches a digest that loses the nonce or the key.
+   * The checks of the plan overlap, and are kept so that each holds without the others (defence in depth): the plan that a Gauge sends is the plan that the core issued (the hash of its text), it is for the nonce of the approval,
+   * the plan made again has the digest that was approved, and the second approval is for this nonce and this digest. The test `the digest holds a key of the core` catches a digest that loses its key, and the tests `the digest is the same in both views`
+   * and `the digest of a run plan is a keyed hash` catch a digest that loses its nonce. The check that the nonce of the plan is the nonce of the approval is covered by the digest check (a plan of another nonce has another digest), so no test pins it alone.
    */
   async function applySession(params: Readonly<Record<string, unknown>>): Promise<CoreReply> {
     const live = liveApproval(params);
@@ -1111,7 +1140,13 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
       ? { action: 'start', gauge: plan.gauge, engine: plan.engine, folder: plan.folder, model: plan.model, variables: plan.variables }
       : { action: 'stop', gauge: plan.gauge, session: plan.session });
     if (!fresh.ok) return reply(fresh);
-    if (sessionDigest(fresh.person, plan.nonce) !== approval.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    if (sessionDigest(fresh.person, plan.nonce) !== approval.digest) {
+      // The plan changed. If the plan that a Gauge would read now is the plan that it read, the cause is one that it cannot read (an engine that began or ended in the folder, or a link that moved): the person is told.
+      if (issued.get(plan.nonce)?.view === sessionViewHash(sessionPlanObject(fresh.seen, plan.digest, plan.nonce))) {
+        notify({ action: 'start', gauge: plan.gauge, nonce: plan.nonce, shown: 'GAUGE_PLAN_CHANGED', cause: 'plan_changed_hidden', engines: [...fresh.person.allSharedWith], member: null });
+      }
+      return reply(refuse('GAUGE_PLAN_CHANGED'));
+    }
     if (fresh.person.action === 'start') {
       if (fresh.start === null) throw new Error('a start plan holds the plan of the host');
       let second: { readonly token: string; readonly approval: Approval } | undefined;
@@ -1121,7 +1156,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           // A Gauge is told that the folder is shared only when it may read an engine that shares it. Otherwise the refusal is the one of a missing approval, so it learns nothing of an engine that it may not read.
           // The person is told the true cause.
           const shown = fresh.seen.sharedWith.length > 0 ? 'ENGINE_FOLDER_SHARED' : 'GAUGE_PLAN_NOT_APPROVED';
-          notify({ action: 'start', gauge: plan.gauge, shown, cause: 'second_approval_missing', engines: [...fresh.person.allSharedWith], member: null });
+          notify({ action: 'start', gauge: plan.gauge, nonce: plan.nonce, shown, cause: 'second_approval_missing', engines: [...fresh.person.allSharedWith], member: null });
           return reply(shown === 'ENGINE_FOLDER_SHARED' ? engineRefusal({ ok: false, code: 'ENGINE_FOLDER_SHARED' }) : refuse('GAUGE_PLAN_NOT_APPROVED'));
         }
       }
@@ -1417,7 +1452,12 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     if (!plan || plan.nonce !== approval.nonce || issued.get(plan.nonce)?.view !== runViewHash(plan)) return reply(refuse('GAUGE_PLAN_CHANGED'));
     const fresh = planRun({ gauge: plan.gauge, job: plan.job });
     if (!fresh.ok) return reply(fresh);
-    if (runDigest(fresh.person, plan.nonce) !== approval.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    if (runDigest(fresh.person, plan.nonce) !== approval.digest) {
+      if (issued.get(plan.nonce)?.view === runViewHash(runPlanObject(fresh.seen, plan.digest, plan.nonce))) {
+        notify({ action: 'run', gauge: plan.gauge, nonce: plan.nonce, shown: 'GAUGE_PLAN_CHANGED', cause: 'plan_changed_hidden', engines: [...new Set(fresh.person.sessions.flatMap(session => session.allSharedWith))].sort(), member: null });
+      }
+      return reply(refuse('GAUGE_PLAN_CHANGED'));
+    }
     let second: { readonly token: string; readonly approval: Approval } | undefined;
     if (fresh.person.shared) {
       second = liveApproval(params, 'sharedApproval', 'shared');
@@ -1430,7 +1470,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
         const trueLabel = fresh.person.sessions[trueIndex]?.label;
         const member: RunMember | null = trueLabel === undefined ? null : { index: trueIndex, label: trueLabel };
         notify({
-          action: 'run', gauge: plan.gauge, shown: label === undefined ? 'GAUGE_PLAN_NOT_APPROVED' : 'ENGINE_FOLDER_SHARED', cause: 'second_approval_missing',
+          action: 'run', gauge: plan.gauge, nonce: plan.nonce, shown: label === undefined ? 'GAUGE_PLAN_NOT_APPROVED' : 'ENGINE_FOLDER_SHARED', cause: 'second_approval_missing',
           engines: [...new Set(fresh.person.sessions.flatMap(session => session.allSharedWith))].sort(), member,
         });
         return reply(label === undefined ? refuse('GAUGE_PLAN_NOT_APPROVED') : memberRefusal({ ok: false, code: 'ENGINE_FOLDER_SHARED', index, label }));
@@ -1512,7 +1552,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const planned = planFor(action as PlanAction, params);
           if (!planned.ok) return reply(planned);
           const nonce = newNonce();
-          issue(nonce, { digest: planned.plan.digest, gauge: null, shared: false });
+          issue(nonce, 'person:lifecycle', { digest: planned.plan.digest, gauge: null, shared: false });
           return { ok: true, result: { ...planned.plan, steps: [...planned.plan.steps], nonce } };
         }
         case 'bowerloom.gauges.apply':
@@ -1521,7 +1561,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const planned = planGrant(params);
           if (!planned.ok) return reply(planned);
           const nonce = newNonce();
-          issue(nonce, { digest: planned.plan.digest, gauge: planned.plan.id, shared: false });
+          issue(nonce, 'person:grants', { digest: planned.plan.digest, gauge: planned.plan.id, shared: false });
           return { ok: true, result: { action: 'grant', ...planned.plan, permissions: [...planned.plan.permissions], steps: [...planned.plan.steps], nonce } };
         }
         case 'bowerloom.grants.apply':
@@ -1555,7 +1595,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const planned = planLayout(params);
           if (!planned.ok) return reply(planned);
           const nonce = newNonce();
-          issue(nonce, { digest: planned.digest, gauge: planned.owner, shared: false });
+          issue(nonce, planned.owner === null ? 'person:layout' : `gauge:${planned.owner}`, { digest: planned.digest, gauge: planned.owner, shared: false });
           const { kind, place, gauge, revision, text, steps, digest, baseHash, nextHash } = planned;
           return { ok: true, result: { action: 'layout', kind, place, gauge, revision, text, steps: [...steps], digest, baseHash, nextHash, nonce } };
         }
@@ -1568,7 +1608,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const nonce = newNonce();
           const digest = sessionDigest(planned.person, nonce);
           const result = sessionPlanObject(planned.seen, digest, nonce);
-          issue(nonce, { digest, gauge: planned.person.gauge, shared: planned.person.allSharedWith.length > 0, view: sessionViewHash(result), person: personSessionObject(planned.person, digest, nonce) });
+          issue(nonce, `gauge:${planned.person.gauge}`, { digest, gauge: planned.person.gauge, shared: planned.person.allSharedWith.length > 0, view: sessionViewHash(result), person: personSessionObject(planned.person, digest, nonce) });
           return { ok: true, result };
         }
         case 'bowerloom.sessions.apply':
@@ -1606,7 +1646,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const planned = planJob(params);
           if (!planned.ok) return reply(planned);
           const nonce = newNonce();
-          issue(nonce, { digest: planned.digest, gauge: planned.gauge, shared: false });
+          issue(nonce, `gauge:${planned.gauge}`, { digest: planned.digest, gauge: planned.gauge, shared: false });
           const { kind, gauge, job, definition, baseHash, nextHash, steps, digest } = planned;
           return { ok: true, result: { action: 'job', kind, gauge, job, definition: definition === null ? null : definitionObject(definition), baseHash, nextHash, steps: [...steps], digest, nonce } };
         }
@@ -1618,7 +1658,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const nonce = newNonce();
           const digest = runDigest(planned.person, nonce);
           const result = runPlanObject(planned.seen, digest, nonce);
-          issue(nonce, { digest, gauge: planned.person.gauge, shared: planned.person.shared, view: runViewHash(result), person: personRunObject(planned.person, digest, nonce) });
+          issue(nonce, `gauge:${planned.person.gauge}`, { digest, gauge: planned.person.gauge, shared: planned.person.shared, view: runViewHash(result), person: personRunObject(planned.person, digest, nonce) });
           return { ok: true, result };
         }
         case 'bowerloom.runs.apply':

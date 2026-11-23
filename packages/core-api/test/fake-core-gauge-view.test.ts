@@ -596,7 +596,7 @@ test('the second approval follows the person plan: it is given when the full pla
   assert.equal(flow.shared, undefined);
 });
 
-test('the person is told the true cause when a Gauge gets a restricted refusal, and the notices are bounded copies', async () => {
+test('the person is told the true cause when a Gauge gets a restricted refusal, and the notices are copies', async () => {
   const w = await world();
   w.occupy('fixture-other', REAL);
   w.occupy('fixture-third', REAL);
@@ -611,20 +611,16 @@ test('the person is told the true cause when a Gauge gets a restricted refusal, 
   const seer = must(await w.client.planRun('fixture-seer', job));
   assert.deepEqual(await applyRunNow(w.client, seer, w.fake.approve(seer.nonce)), { ok: false, code: 'ENGINE_FOLDER_SHARED', member: { index: 0, label: 'writer' } });
   assert.deepEqual(w.fake.personNotices(), [
-    { action: 'start', gauge: 'fixture-starter', shown: 'GAUGE_PLAN_NOT_APPROVED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: null },
-    { action: 'start', gauge: 'fixture-viewer', shown: 'ENGINE_FOLDER_SHARED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: null },
-    { action: 'run', gauge: 'fixture-blind', shown: 'GAUGE_PLAN_NOT_APPROVED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: { index: 0, label: 'writer' } },
-    { action: 'run', gauge: 'fixture-seer', shown: 'ENGINE_FOLDER_SHARED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: { index: 0, label: 'writer' } },
+    { action: 'start', gauge: 'fixture-starter', nonce: hidden.nonce, shown: 'GAUGE_PLAN_NOT_APPROVED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: null },
+    { action: 'start', gauge: 'fixture-viewer', nonce: visible.nonce, shown: 'ENGINE_FOLDER_SHARED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: null },
+    { action: 'run', gauge: 'fixture-blind', nonce: blind.nonce, shown: 'GAUGE_PLAN_NOT_APPROVED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: { index: 0, label: 'writer' } },
+    { action: 'run', gauge: 'fixture-seer', nonce: seer.nonce, shown: 'ENGINE_FOLDER_SHARED', cause: 'second_approval_missing', engines: ['fixture-other', 'fixture-third'], member: { index: 0, label: 'writer' } },
   ]);
   const copy = w.fake.personNotices() as unknown as { engines: string[] }[];
   copy[0]!.engines.push('changed');
   copy.length = 0;
   assert.equal(w.fake.personNotices().length, 4, 'a caller that changes the list changes nothing');
   assert.equal(JSON.stringify(await w.client.listRuns('fixture-blind')).includes('second_approval_missing'), false, 'no Gauge reply holds a notice');
-  // The list is bounded: the oldest notices go first.
-  const again = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
-  for (let index = 0; index < 100; index += 1) await applyNow(w.client, again, w.fake.approve(again.nonce));
-  assert.equal(w.fake.personNotices().length, 64);
 });
 
 test('a flood of plans from one Gauge is bounded, the oldest plan of that Gauge goes first, and the plans of another Gauge stay', async () => {
@@ -635,7 +631,7 @@ test('a flood of plans from one Gauge is bounded, the oldest plan of that Gauge 
   for (let index = 0; index < 2000; index += 1) must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/flood' }));
   assert.equal(w.fake.livePlans(), MAX_LIVE_PLANS_PER_GAUGE + 1, 'the starter holds at most 64 plans, and the viewer holds its one');
   assert.throws(() => w.fake.approve(first.nonce), TypeError, 'the person cannot approve a plan that the core no longer holds');
-  assert.deepEqual(await applyNow(w.client, first, approval), { ok: false, code: 'GAUGE_PLAN_CHANGED' }, 'an approval that was given before the plan went is for a plan that is gone');
+  assert.deepEqual(await applyNow(w.client, first, approval), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' }, 'an approval that was given before the plan went is no approval: the plan is gone');
   assert.ok(w.fake.approve(other.nonce).length > 0, 'the plan of another Gauge is still there');
   assert.equal(w.launcher.programs.length, 0);
 });
@@ -687,6 +683,146 @@ test('a failure of the host that is not a stale plan is not hidden as a changed 
   const job = await makeJob(w, [entry('writer', 'fixture-engine', LINK)]);
   const run = must(await w.client.planRun('fixture-blind', job));
   await assert.rejects(applyRunNow(w.client, run, w.fake.approve(run.nonce)), /the host broke/);
+});
+
+// The cap of plans, and who may evict whom
+
+/** The kinds of plan that the core issues: how to make one, and how to apply it. For the tests of the cap. */
+const KIND_NAMES = ['session', 'run', 'job', 'grant', 'layout', 'lifecycle'] as const;
+function kindOf(w: World, name: (typeof KIND_NAMES)[number]) {
+  let job: string | undefined;
+  const jobId = async (): Promise<string> => (job ??= await makeJob(w, [entry('writer', 'fixture-engine', '/work/free')]));
+  const text = async (): Promise<string> => must(await w.client.exportLayout());
+  switch (name) {
+    case 'session': return { plan: async () => must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/free' })), apply: (plan: { nonce: string }, approval: string) => applyNow(w.client, plan as SessionPlan, approval) };
+    case 'run': return { plan: async () => must(await w.client.planRun('fixture-blind', await jobId())), apply: (plan: { nonce: string }, approval: string) => applyRunNow(w.client, plan as RunPlan, approval) };
+    case 'job': return { plan: async () => must(await w.client.planJobCreate('fixture-blind', { title: 'Other', sessions: [entry('writer', 'fixture-engine', '/work/free')] })), apply: (plan: { nonce: string }, approval: string) => w.client.applyJob(plan as never, approval) };
+    case 'grant': return { plan: async () => must(await w.client.planGrant('fixture-starter', ['sessions.start'])), apply: (plan: { nonce: string }, approval: string) => w.client.applyGrant(plan as never, approval) };
+    case 'layout': return { plan: async () => must(await w.client.planLayoutSet(await text())), apply: (plan: { nonce: string }, approval: string) => w.client.applyLayout(plan as never, approval) };
+    default: return { plan: async () => must(await w.client.planDisable('fixture-viewer')), apply: (plan: { nonce: string }, approval: string) => w.client.applyPlan(plan as never, approval) };
+  }
+}
+
+test('an approval of a plan that the cap dropped is no approval, for every kind of plan, and a plan that was kept applies', async () => {
+  for (const name of KIND_NAMES) {
+    const w = await world();
+    const kind = kindOf(w, name);
+    const kept = await kind.plan();
+    const answer = await kind.apply(kept, w.fake.approve(kept.nonce));
+    // A start and a run wait for their programs, which a test makes: a call that is still waiting was not refused.
+    assert.ok(answer === 'still waiting' || ('ok' in answer && answer.ok), `${name}: a plan that was kept applies: ${JSON.stringify(answer)}`);
+  }
+  for (const name of KIND_NAMES) {
+    const w = await world();
+    const kind = kindOf(w, name);
+    const first = await kind.plan();
+    const approval = w.fake.approve(first.nonce);
+    for (let count = 0; count < MAX_LIVE_PLANS_PER_GAUGE; count += 1) await kind.plan();
+    assert.throws(() => w.fake.approve(first.nonce), TypeError, `${name}: the person cannot approve a plan that is gone`);
+    const answer = await kind.apply(first, approval);
+    assert.deepEqual(answer, { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' }, `${name}: the approval of a dropped plan is no approval`);
+  }
+});
+
+test('a revoke ends the approval of a grant plan that the cap dropped: the grant does not come back', async () => {
+  const w = await world();
+  const old = must(await w.client.planGrant('fixture-starter', ['sessions.start']));
+  const approval = w.fake.approve(old.nonce);
+  for (let count = 0; count < MAX_LIVE_PLANS_PER_GAUGE; count += 1) must(await w.client.planGrant('fixture-starter', ['sessions.start']));
+  must(await w.client.revoke('fixture-starter', ['sessions.start']));
+  assert.deepEqual(await w.client.applyGrant(old, approval), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
+  assert.deepEqual(must(await w.client.listGrants('fixture-starter')), [], 'the Gauge holds no grant');
+});
+
+test('plans fill a bucket for who may fill it: a Gauge fills only its own, and the layout, the grants, and the lifecycle fill one each', async () => {
+  const w = await world();
+  const grant = must(await w.client.planGrant('fixture-viewer', ['sessions.start']));
+  const lifecycle = must(await w.client.planDisable('fixture-viewer'));
+  const layout = must(await w.client.planLayoutSet(must(await w.client.exportLayout())));
+  const session = must(await w.client.planSessionStart('fixture-viewer', { engine: 'fixture-engine', folder: '/work/viewer' }));
+  // Layout plans, which need no grant, drop only plans of the layout.
+  for (let count = 0; count < MAX_LIVE_PLANS_PER_GAUGE; count += 1) must(await w.client.planLayoutSet(must(await w.client.exportLayout())));
+  assert.throws(() => w.fake.approve(layout.nonce), TypeError, 'the oldest layout plan is dropped');
+  for (const kept of [grant, lifecycle, session]) assert.ok(w.fake.approve(kept.nonce).length > 0);
+  // A Gauge that plans for itself, again and again, drops only its own plans.
+  for (let count = 0; count < 200; count += 1) must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/work/flood' }));
+  for (const kept of [grant, lifecycle, session]) assert.ok(w.fake.approve(kept.nonce).length > 0, 'the plans of another Gauge, and the plans of the person, are kept');
+  // Plans for the grants drop only plans for the grants.
+  for (let count = 0; count < MAX_LIVE_PLANS_PER_GAUGE; count += 1) must(await w.client.planGrant('fixture-starter', ['sessions.start']));
+  assert.throws(() => w.fake.approve(grant.nonce), TypeError);
+  for (const kept of [lifecycle, session]) assert.ok(w.fake.approve(kept.nonce).length > 0);
+});
+
+// The notices for the person
+
+test('the notices of a Gauge are bounded for each Gauge and in all, a repeat is one notice, and the newest are kept', async () => {
+  const w = await world();
+  w.occupy('fixture-other', REAL);
+  const job = await makeJob(w, [entry('writer', 'fixture-engine', LINK)], 'fixture-seer');
+  // One Gauge that applies the same plan 70 times has one notice.
+  const same = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
+  const approval = w.fake.approve(same.nonce);
+  for (let count = 0; count < 70; count += 1) await applyNow(w.client, same, approval);
+  assert.equal(w.fake.personNotices().length, 1);
+  // Five Gauges make 20 plans each, and each is refused for the second approval.
+  const made = new Map<string, string[]>();
+  for (const gauge of ['fixture-starter', 'fixture-stopper', 'fixture-viewer', 'fixture-blind', 'fixture-seer']) {
+    const nonces: string[] = [];
+    for (let count = 0; count < 20; count += 1) {
+      if (gauge === 'fixture-blind' || gauge === 'fixture-seer') {
+        const plan = must(await w.client.planRun(gauge, job));
+        await applyRunNow(w.client, plan, w.fake.approve(plan.nonce));
+        nonces.push(plan.nonce);
+      } else {
+        const plan = must(await w.client.planSessionStart(gauge, { engine: 'fixture-engine', folder: LINK }));
+        await applyNow(w.client, plan, w.fake.approve(plan.nonce));
+        nonces.push(plan.nonce);
+      }
+    }
+    made.set(gauge, nonces);
+  }
+  const notices = w.fake.personNotices();
+  const of = (gauge: string) => notices.filter(notice => notice.gauge === gauge).map(notice => notice.nonce);
+  assert.equal(notices.length, 64, 'the total is bounded');
+  assert.deepEqual(of('fixture-viewer'), made.get('fixture-viewer')?.slice(-16), 'a Gauge keeps its newest 16, oldest first');
+  assert.deepEqual(of('fixture-seer'), made.get('fixture-seer')?.slice(-16));
+  assert.deepEqual(of('fixture-starter'), [], 'the oldest notices of all are gone');
+  assert.equal(notices.at(-1)?.nonce, made.get('fixture-seer')?.at(-1), 'and the newest is there');
+});
+
+test('a plan that changed for a cause that a Gauge cannot see tells the person, and a Gauge is told only that the plan changed', async () => {
+  const w = await world();
+  const first = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: LINK }));
+  const approval = w.fake.approve(first.nonce);
+  w.occupy('fixture-other', REAL);
+  assert.deepEqual(await applyNow(w.client, first, approval), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+  assert.deepEqual(w.fake.personNotices(), [{ action: 'start', gauge: 'fixture-starter', nonce: first.nonce, shown: 'GAUGE_PLAN_CHANGED', cause: 'plan_changed_hidden', engines: ['fixture-other'], member: null }]);
+  // A link that moves is a change that a Gauge cannot see either, and there is no engine to name.
+  const second = must(await w.client.planSessionStart('fixture-starter', { engine: 'fixture-engine', folder: '/link/two' }));
+  const again = w.fake.approve(second.nonce);
+  w.links['/link/two'] = '/real/elsewhere';
+  assert.deepEqual(await applyNow(w.client, second, again), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+  assert.deepEqual(w.fake.personNotices().at(-1), { action: 'start', gauge: 'fixture-starter', nonce: second.nonce, shown: 'GAUGE_PLAN_CHANGED', cause: 'plan_changed_hidden', engines: [], member: null });
+  // A run too.
+  const job = await makeJob(w, [entry('writer', 'fixture-engine', '/link/three')]);
+  const run = must(await w.client.planRun('fixture-blind', job));
+  const approved = w.fake.approve(run.nonce);
+  w.occupy('fixture-third', '/real/three');
+  w.links['/link/three'] = '/real/three';
+  assert.deepEqual(await applyRunNow(w.client, run, approved), { ok: false, code: 'GAUGE_PLAN_CHANGED' });
+  assert.deepEqual(w.fake.personNotices().at(-1), { action: 'run', gauge: 'fixture-blind', nonce: run.nonce, shown: 'GAUGE_PLAN_CHANGED', cause: 'plan_changed_hidden', engines: ['fixture-third'], member: null });
+  assert.equal(JSON.stringify(run).includes('plan_changed'), false);
+});
+
+// The entropy of a test
+
+test('the entropy of a test must give the bytes that were asked for, and never the same nonce twice at once', async () => {
+  assert.throws(() => createFakeCore({ entropy: () => new Uint8Array(3) }), RangeError);
+  let calls = 0;
+  const flat = (size: number): Uint8Array => { calls += 1; return Buffer.alloc(size, calls === 1 ? 7 : 9); };
+  const client = createCoreClient(createFakeCore({ folders: FOLDERS, entropy: flat }));
+  must(await client.planInstall('starter-folder'));
+  await assert.rejects(client.planInstall('viewer-folder'), RangeError);
 });
 
 // A real link on disk

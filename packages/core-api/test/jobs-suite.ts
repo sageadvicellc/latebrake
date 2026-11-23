@@ -807,6 +807,8 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     assert.deepEqual(run.sessions.map(session => [session.label, session.engine]), [['writer', 'fixture-engine']]);
     must(await blind.listRuns('fixture-blind'));
     const text = seen.join('\n');
-    for (const secret of [real, 'fixture-asking']) assert.equal(text.includes(secret), false, secret);
+    const program = full[0]?.program ?? '';
+    assert.notEqual(program, '', 'the person reads the real program');
+    for (const secret of [real, program, 'fixture-asking']) assert.equal(text.includes(secret), false, secret);
   });
 }

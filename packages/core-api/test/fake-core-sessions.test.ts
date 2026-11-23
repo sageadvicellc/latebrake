@@ -30,9 +30,12 @@ export function makeRig(folders: readonly GaugeFolder[], options: { readonly sto
   roots.push(root);
   const launcher = recording(createProcessLauncher());
   const stopTimeoutMs = options.stopTimeoutMs ?? 250;
+  // The engines are configured with a link to the program, so that the real program is another path from the one that a Gauge reads.
+  const programLink = path.join(root, 'engine-program');
+  fs.symlinkSync(process.execPath, programLink);
   const engines = SESSION_ENGINES.map(fixture => {
     const spec = fakeEngine({ id: fixture.id, tag, steps: fixture.steps, ...(fixture.env === undefined ? {} : { env: fixture.env }), ...(fixture.takesModel === true ? { takesModel: true } : {}) });
-    return fixture.missing === true ? { ...spec, program: path.join(root, 'no-such-program') } : spec;
+    return fixture.missing === true ? { ...spec, program: path.join(root, 'no-such-program') } : { ...spec, program: programLink };
   });
   const host = createEngineHost({ engines, launcher, stopTimeoutMs, environment: () => SESSION_ENVIRONMENT });
   const fake = createFakeCore({ folders, now: () => now, engineHost: host });
@@ -47,7 +50,7 @@ export function makeRig(folders: readonly GaugeFolder[], options: { readonly sto
     folder: name => { const full = path.join(root, name); fs.mkdirSync(full, { recursive: true }); return full; },
     link: (name, target) => { const full = path.join(root, name); fs.symlinkSync(target, full); return full; },
     person: plan => { const full = fake.personSessionPlan(plan.nonce); return { folder: full.realFolder, program: full.realProgram, sharedWith: full.allSharedWith }; },
-    program: process.execPath,
+    program: programLink,
     stopTimeoutMs,
     launches: () => host.launched,
     output: index => launcher.lines[index] ?? [],
