@@ -217,9 +217,12 @@ const auditRefusal = (reason: AuditReason): Refusal => ({ ok: false, code: 'GAUG
 /** A refusal because of a grant: the code `GAUGE_GRANT_MISSING` with a reason of the closed set, or with none when the permission is plainly not granted. */
 const deny = (reason?: GrantReason): Refusal => (reason === undefined ? { ok: false, code: 'GAUGE_GRANT_MISSING' } : { ok: false, code: 'GAUGE_GRANT_MISSING', reason });
 /** A refusal of the Engine Host, as the core gives it. `ENGINE_REQUEST_INVALID`, `ENGINE_NOT_FOUND`, and `ENGINE_START_FAILED` keep their reason, and every other engine code has none. */
-const engineRefusal = (refusal: HostRefusal): Refusal => (
-  refusal.code === 'ENGINE_REQUEST_INVALID' || refusal.code === 'ENGINE_NOT_FOUND' || refusal.code === 'ENGINE_START_FAILED' ? { ok: false, code: refusal.code, reason: refusal.reason } as Refusal : { ok: false, code: refusal.code }
-);
+const engineRefusal = (refusal: HostRefusal): Refusal => {
+  if (refusal.code === 'ENGINE_REQUEST_INVALID') return { ok: false, code: refusal.code, reason: refusal.reason };
+  if (refusal.code === 'ENGINE_NOT_FOUND') return { ok: false, code: refusal.code, reason: refusal.reason };
+  if (refusal.code === 'ENGINE_START_FAILED') return { ok: false, code: refusal.code, reason: refusal.reason };
+  return { ok: false, code: refusal.code };
+};
 const reply = (refusal: Refusal): CoreReply => (refusal.reason === undefined ? { ok: false, code: refusal.code } : { ok: false, code: refusal.code, reason: refusal.reason });
 /** True when the value is a list of text with no hole. A hole is not a line of text. */
 /** Reads a list of text by index, once (see `readList`). A list with a hole, an accessor, or an item that is not text reads as `undefined`. */
@@ -950,7 +953,7 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     const c = planned.plan;
     const content: SessionContent = {
       action: 'stop', gauge: allowed.gauge, engine: c.engine, folder: c.folder, session: c.session, program: null, model: null, billing: found.billing, variables: [], sharedWith: [], force: c.force,
-      steps: stopSteps({ gauge: allowed.gauge, session: c.session, engine: c.engine, folder: c.folder, force: c.force, timeoutMs: host.stopTimeoutMs }),
+      steps: stopSteps({ gauge: allowed.gauge, session: c.session, engine: c.engine, folder: c.folder, force: c.force, ended: found.state === 'stopped' || found.state === 'failed', timeoutMs: host.stopTimeoutMs }),
     };
     return { ok: true, ...content, digest: sessionDigest(content), start: null };
   }

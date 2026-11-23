@@ -192,30 +192,47 @@ const startFailed = (reason: StartFailedReason): HostRefusal => ({ ok: false, co
 /** The code of an error of the operating system, when it has one. */
 const errorCode = (error: unknown): string | undefined => (typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' ? error.code : undefined);
 const REDACTED = '[redacted]';
+const REFUSED_KILL = 'the kill signal was refused; stop the session again';
 const MIN_SECRET_LENGTH = 6;
 /** The variables whose values are paths and plain names. They are not hidden, so the path in a crash stays readable. Redaction is a match of the value, as it is, and of its escaped form: no encoded form, and nothing under 6 characters. */
 const OPEN_VARIABLES: ReadonlySet<string> = new Set(['HOME', 'PATH', 'PWD', 'TMPDIR', 'SHELL', 'USER', 'LANG', 'LOGNAME']);
 
 /**
- * Cuts every secret out of a text, longest first, and gives the text. When `dropBefore` is given, everything that came from before that index of the text is left out of the answer as well,
- * and a secret that crosses the index is left out whole. It is how the part of a secret that the launcher cut at the start of its buffer, and a secret that crosses the start of the tail, never reach the log.
+ * Cuts every secret out of a text and gives the text. Every place where any secret occurs is a range, and ranges that overlap are merged, so two secrets where one ends inside the other leave no tail of either.
+ * Each merged range is replaced once by a mark. When `dropBefore` is given, everything that came from before that index of the text is left out of the answer as well, and a range that crosses the index is
+ * kept as its mark. It is how the part of a secret that the launcher cut at the start of its buffer, and a secret that crosses the start of the tail, never reach the log.
  */
 function redactText(secrets: readonly string[], text: string, dropBefore = 0): string {
-  if (secrets.length === 0) return dropBefore > 0 ? text.slice(dropBefore) : text;
-  let out = '', index = 0, cut = dropBefore > 0 ? -1 : 0;
-  while (index < text.length) {
-    if (cut === -1 && index >= dropBefore) cut = out.length;
-    const found = secrets.find(secret => text.startsWith(secret, index));
-    if (found === undefined) {
-      out += text[index];
-      index += 1;
-    } else {
-      // A secret that crosses the index stays in the answer as its mark, and the part before it goes.
-      if (cut === -1 && index < dropBefore && index + found.length > dropBefore) cut = out.length;
-      out += REDACTED;
-      index += found.length;
-    }
+  const found: [number, number][] = [];
+  for (const secret of secrets) {
+    for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + 1)) found.push([at, at + secret.length]);
   }
+  found.sort((left, right) => left[0] - right[0] || right[1] - left[1]);
+  const ranges: [number, number][] = [];
+  for (const range of found) {
+    const last = ranges[ranges.length - 1];
+    if (last !== undefined && range[0] < last[1]) last[1] = Math.max(last[1], range[1]);
+    else ranges.push([range[0], range[1]]);
+  }
+  let out = '', pos = 0, cut = dropBefore > 0 ? -1 : 0;
+  const plain = (to: number): void => {
+    if (cut === -1 && dropBefore >= pos && dropBefore <= to) {
+      out += text.slice(pos, dropBefore);
+      cut = out.length;
+      out += text.slice(dropBefore, to);
+    } else {
+      out += text.slice(pos, to);
+    }
+    pos = to;
+  };
+  for (const [start, end] of ranges) {
+    plain(start);
+    // A range that crosses the index stays in the answer as its mark, and the part before it goes.
+    if (cut === -1 && start < dropBefore && end > dropBefore) cut = out.length;
+    out += REDACTED;
+    pos = end;
+  }
+  plain(text.length);
   if (cut === -1) cut = out.length;
   return out.slice(cut);
 }
@@ -232,7 +249,7 @@ function field(request: object, key: string): unknown {
  * A file that is there and cannot run, or cannot be read for lack of permission, is `not_executable`, and never missing. A given absolute path whose folders cannot be searched is `not_executable` too, since the program was named.
  * A folder of PATH that cannot be searched is skipped: it says nothing about a program that may be nowhere.
  */
-function locateProgram(program: string): string | { readonly error: 'missing' | 'not_executable' } {
+function locateProgram(program: string, onError: (folder: string, code: string) => void): string | { readonly error: 'missing' | 'not_executable' } {
   const absolute = path.isAbsolute(program);
   const candidates = absolute ? [program] : (process.env['PATH'] ?? '').split(path.delimiter).filter(dir => dir !== '').map(dir => path.join(dir, program));
   let blocked = false;
@@ -242,7 +259,11 @@ function locateProgram(program: string): string | { readonly error: 'missing' | 
       isFile = fs.statSync(candidate).isFile();
     } catch (error) {
       const code = errorCode(error);
-      if (absolute && code !== 'ENOENT' && code !== 'ENOTDIR') blocked = true;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+        // A folder that says anything but "not there" is looked for in the log, since the program may be in it.
+        onError(path.dirname(candidate), code ?? 'unknown');
+        if (absolute) blocked = true;
+      }
       continue;
     }
     if (!isFile) continue;
@@ -320,8 +341,16 @@ export function createEngineHost(options: HostOptions): EngineHost {
   }
   const launcher = options.launcher;
   const environment = options.environment ?? ((): Readonly<Record<string, string | undefined>> => process.env);
-  const locate = options.locate ?? locateProgram;
-  const canonical = options.canonical ?? ((folder: string) => canonicalFolder(folder, code => report(log, { session: '', from: 'detected', to: 'detected', message: `engine host: could not read the folder ${escapeText(folder)}: ${escapeText(code)}` })));
+  /** A line about the host itself, with no session. Each folder and code is logged once, so a Gauge that plans again and again against a bad folder cannot flood the log. The record is bounded: when it is full it starts again. */
+  const logged = new Set<string>();
+  const logOnce = (key: string, message: string): void => {
+    if (logged.has(key)) return;
+    if (logged.size >= 1024) logged.clear();
+    logged.add(key);
+    report(log, { session: '', from: 'detected', to: 'detected', message: `engine host: ${message}` });
+  };
+  const locate = options.locate ?? ((program: string) => locateProgram(program, (folder, code) => logOnce(`program\u0000${folder}\u0000${code}`, `could not search the folder ${escapeText(folder)} for the program: ${escapeText(code)}`)));
+  const canonical = options.canonical ?? ((folder: string) => canonicalFolder(folder, code => logOnce(`folder\u0000${folder}\u0000${code}`, `could not read the folder ${escapeText(folder)}: ${escapeText(code)}`)));
   const log = options.log;
   const schedule = options.schedule ?? ((run: () => void, ms: number): (() => void) => { const timer = setTimeout(run, ms); timer.unref(); return () => clearTimeout(timer); });
   const newId = options.newId ?? ((): string => `s-${randomBytes(8).toString('hex')}`);
@@ -373,7 +402,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
   const killIfRunning = (record: Tracked): void => {
     if (record.exited) return;
     record.killedByHost = true;
-    record.handle?.signal('kill');
+    if (record.handle?.signal('kill') === false) say(record, record.session.state, REFUSED_KILL);
   };
 
   /**
@@ -381,7 +410,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
    * When the launcher's buffer was full, the first characters of it (the margin) may hold the end of a value that began before the buffer, so they are left out.
    */
   const tailOf = (record: Tracked, raw: string): string => {
-    const full = record.tailMargin > 0 && raw.length >= STDERR_TAIL_CHARS + record.tailMargin;
+    // The launcher drops a low half of a pair at the start of its buffer, so a full buffer may be one character short.
+    const full = record.tailMargin > 0 && raw.length >= STDERR_TAIL_CHARS + record.tailMargin - 1;
     const text = redactText(record.secrets, raw, full ? record.tailMargin : 0).slice(-STDERR_TAIL_CHARS);
     const first = text.charCodeAt(0);
     return first >= 0xdc00 && first <= 0xdfff ? text.slice(1) : text;
@@ -615,11 +645,11 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!record) throw new Error('engine host: a session that was planned is gone');
     const state = record.session.state;
     if (state === 'stopping') {
-      record.handle?.signal('kill');
+      if (record.handle?.signal('kill') === false) say(record, state, REFUSED_KILL);
     } else if (isTerminal(state)) {
       // Ended, but the program has not gone: the first kill did not land. The state is not rewritten, and the place is freed when the exit is seen.
       record.killedByHost = true;
-      record.handle?.signal('kill');
+      if (record.handle?.signal('kill') === false) say(record, state, REFUSED_KILL);
     } else if (state === 'starting' || state === 'running' || state === 'waiting') {
       record.cancelStart();
       record.session.move('stopping');

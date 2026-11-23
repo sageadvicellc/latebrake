@@ -309,3 +309,31 @@ test('the steps of an old lifecycle, grant, or layout plan that is sent back are
   }
   assert.equal((await fake.call('bowerloom.grants.apply', { plan: grant, approval })).ok, true);
 });
+
+test('the plan to stop a session that has ended but whose program may still run says so, and the plan for a stopping session keeps its text', async t => {
+  const rig = makeRig(SESSION_FOLDERS);
+  t.after(() => rig.close());
+  let ended = false;
+  const host: EngineHost = {
+    ...rig.host, launched: 0, stopTimeoutMs: rig.stopTimeoutMs,
+    get: id => { const found = rig.host.get(id); return found !== undefined && ended ? { ...found, state: 'failed' } : found; },
+    planStop: id => { const planned = rig.host.planStop(id); return planned.ok && ended ? { ok: true, plan: { ...planned.plan, force: true } } : planned; },
+  };
+  const fake = createFakeCore({ folders: SESSION_FOLDERS, engineHost: host });
+  const client = createCoreClient(fake);
+  for (const step of [() => client.planInstall('sessioner-folder'), () => client.planEnable(GAUGE)]) { const planned = must(await step()); must(await client.applyPlan(planned, fake.approve(planned.nonce))); }
+  const grant = must(await client.planGrant(GAUGE, ['sessions.read', 'sessions.start', 'sessions.stop']));
+  must(await client.applyGrant(grant, fake.approve(grant.nonce)));
+  const start = must(await client.planSessionStart(GAUGE, { engine: ENGINE, folder: rig.folder('alpha') }));
+  const started = must(await client.applySession(start, fake.approve(start.nonce)));
+  const live = must(await client.planSessionStop(GAUGE, started.session));
+  assert.equal(live.force, false);
+  assert.match(live.steps[2] ?? '', /^send the stop signal to the program/);
+  ended = true;
+  const plan = must(await client.planSessionStop(GAUGE, started.session));
+  assert.equal(plan.force, true);
+  assert.deepEqual(plan.steps.slice(2), [
+    'the session has ended, but its program may still be running: send the kill signal again, which the program cannot ignore, to the program and everything it started',
+    'the session keeps its state, and its place is free when the program has gone; if it does not go in time, the core refuses with ENGINE_STOP_TIMEOUT',
+  ]);
+});

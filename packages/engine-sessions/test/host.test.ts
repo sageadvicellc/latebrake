@@ -1293,6 +1293,15 @@ test('a PATH folder that cannot be searched does not make a program that is nowh
     const unreadable = make('tool').planStart(request('alpha', path.join(blocked, 'sub')));
     assert.deepEqual(unreadable, { ok: false, code: 'ENGINE_REQUEST_INVALID', reason: 'folder' });
     assert.equal(faults.some(entry => /EACCES/.test(entry.message)), true, 'the code is in the log');
+    const inSub = (): number => faults.filter(entry => /EACCES/.test(entry.message) && /sub/.test(entry.message)).length;
+    const inBlocked = (): number => faults.filter(entry => /EACCES/.test(entry.message) && !/sub/.test(entry.message) && /blocked/.test(entry.message)).length;
+    assert.equal(inSub(), 1);
+    assert.equal(inBlocked() >= 1, true, 'a folder of PATH that cannot be searched is logged with its code, once for each host: the first plans above ran on three hosts');
+    const one = make('tool');
+    const logged = inBlocked();
+    for (let again = 0; again < 4; again += 1) one.planStart(request('alpha', path.join(blocked, 'sub')));
+    assert.equal(inSub(), 2, 'a folder and a code are logged once on a host, so a replan cannot flood the log');
+    assert.equal(inBlocked(), logged + 1, 'and so is the folder of PATH');
   } finally {
     if (saved === undefined) delete process.env['PATH']; else process.env['PATH'] = saved;
     fs.chmodSync(blocked, 0o700);
@@ -1338,4 +1347,49 @@ test('killAll logs each session whose program was still alive when the wait ende
   const id = await startOne(r, 'alpha', '/work/one');
   assert.equal(await r.host.killAll(), 1);
   assert.equal(r.faults.some(entry => entry.session === id && /still running/.test(entry.message)), true);
+});
+
+// Round four
+
+test('a buffer that the launcher cut by one character, because it dropped the low half of a pair, still has its margin dropped: no part of a value with an emoji leaks', async () => {
+  const secret = `sk-live-\u{1F600}${'A1b2C3d4'.repeat(3)}`;
+  const r = rig({ environment: () => ({ API_KEY: secret }) }, [spec('alpha', { env: ['API_KEY'] })]);
+  await startOne(r, 'alpha', '/work/one');
+  assert.equal(programOf(r, 0).spec.tailMargin, secret.length - 1);
+  programOf(r, 0).line('state:running');
+  const remnant = secret.slice('sk-live-'.length + 2);
+  const middle = 1000;
+  const length = 2048 + secret.length - 1 - 1;
+  const raw = `${remnant}${'c'.repeat(middle)}${secret}${'c'.repeat(length - remnant.length - middle - secret.length)}`;
+  assert.equal(raw.length, length);
+  programOf(r, 0).exit(1, null, raw);
+  assert.equal(leaks(secret, r.faults[0]?.message ?? ''), false);
+});
+
+test('two values that overlap are one redacted range: nothing of either is left', async () => {
+  const one = 'secret-one-AAAA', two = 'AAAA-secret-two';
+  const r = rig({ environment: () => ({ ONE: one, TWO: two }) }, [spec('alpha', { env: ['ONE', 'TWO'] })]);
+  await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:running');
+  programOf(r, 0).exit(1, null, `x ${one.slice(0, 11)}${two} y ${one} ${two}`);
+  const message = r.faults[0]?.message ?? '';
+  assert.equal(leaks(one, message), false);
+  assert.equal(leaks(two, message), false);
+  assert.match(message, /"x \[redacted\] y \[redacted\] \[redacted\]"/);
+});
+
+test('a kill that the system refused is in the log of the host, with the way to try again', async () => {
+  const r = rig({ stopTimeoutMs: 20 }, undefined, manualLauncher({ signalLands: () => false }));
+  const id = await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:stopped');
+  const refused = (): number => r.faults.filter(entry => /the kill signal was refused; stop the session again/.test(entry.message) && entry.session === id).length;
+  assert.equal(refused(), 1, 'the fault kill');
+  await r.host.stop(id);
+  assert.equal(refused(), 2, 'the forced stop of an ended session');
+  const other = await startOne(r, 'beta', '/work/two');
+  programOf(r, 1).line('state:running');
+  await r.host.stop(other);
+  assert.equal(r.faults.filter(entry => entry.session === other).length, 0, 'a term signal that was refused is not the kill');
+  await r.host.stop(other);
+  assert.equal(r.faults.filter(entry => entry.session === other && /refused/.test(entry.message)).length, 1, 'the second stop is the kill');
 });

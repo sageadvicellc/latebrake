@@ -60,6 +60,8 @@ export interface StopStepsInput {
   readonly engine: string;
   readonly folder: string;
   readonly force: boolean;
+  /** True when the session has ended (stopped or failed) and the stop is the kill again, because its program has not gone. */
+  readonly ended: boolean;
   /** How long the core waits for the engine to go, in milliseconds. */
   readonly timeoutMs: number;
 }
@@ -70,16 +72,21 @@ export interface StopStepsInput {
  * 1. `Gauge <gauge> asks to stop session <session> of the engine <engine>`
  * 2. `folder: <real folder>`
  * 3. `send the stop signal to the program and everything it started, and wait up to <n> ms for them to go`, or, for a session that is stopping already,
- *    `the session is stopping already: send the kill signal, which the program cannot ignore, to the program and everything it started`
- * 4. `if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT`
+ *    `the session is stopping already: send the kill signal, which the program cannot ignore, to the program and everything it started`, or, for a session that has ended and whose program may still run,
+ *    `the session has ended, but its program may still be running: send the kill signal again, ...`
+ * 4. `if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT`, or, for a session that has ended, that it keeps its state and that its place is free when the program has gone
  */
 export function stopSteps(input: StopStepsInput): string[] {
   return [
     `Gauge ${escapeForPlan(input.gauge)} asks to stop session ${escapeForPlan(input.session)} of the engine ${escapeForPlan(input.engine)}`,
     `folder: ${escapeForPlan(input.folder)}`,
     input.force
-      ? 'the session is stopping already: send the kill signal, which the program cannot ignore, to the program and everything it started'
+      ? (input.ended
+        ? 'the session has ended, but its program may still be running: send the kill signal again, which the program cannot ignore, to the program and everything it started'
+        : 'the session is stopping already: send the kill signal, which the program cannot ignore, to the program and everything it started')
       : `send the stop signal to the program and everything it started, and wait up to ${input.timeoutMs} ms for them to go`,
-    'if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT',
+    input.force && input.ended
+      ? 'the session keeps its state, and its place is free when the program has gone; if it does not go in time, the core refuses with ENGINE_STOP_TIMEOUT'
+      : 'if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT',
   ];
 }

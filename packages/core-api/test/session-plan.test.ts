@@ -42,7 +42,7 @@ test('a start plan with a model choice, a local billing source, no variables, an
 });
 
 test('a stop plan reads exactly like this, for a first stop and for a session that is stopping already', () => {
-  const input = { gauge: 'fixture-sessioner', session: 's-1', engine: 'fixture-engine', folder: '/work/alpha', force: false, timeoutMs: 5000 };
+  const input = { gauge: 'fixture-sessioner', session: 's-1', engine: 'fixture-engine', folder: '/work/alpha', force: false, ended: false, timeoutMs: 5000 };
   assert.deepEqual(stopSteps(input), [
     'Gauge fixture-sessioner asks to stop session s-1 of the engine fixture-engine',
     'folder: /work/alpha',
@@ -54,6 +54,12 @@ test('a stop plan reads exactly like this, for a first stop and for a session th
     'folder: /work/alpha',
     'the session is stopping already: send the kill signal, which the program cannot ignore, to the program and everything it started',
     'if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT',
+  ]);
+  assert.deepEqual(stopSteps({ ...input, force: true, ended: true }), [
+    'Gauge fixture-sessioner asks to stop session s-1 of the engine fixture-engine',
+    'folder: /work/alpha',
+    'the session has ended, but its program may still be running: send the kill signal again, which the program cannot ignore, to the program and everything it started',
+    'the session keeps its state, and its place is free when the program has gone; if it does not go in time, the core refuses with ENGINE_STOP_TIMEOUT',
   ]);
 });
 
@@ -69,7 +75,7 @@ test('every value is escaped, so no value can add or forge a line of the plan', 
   assert.equal(lines[3], `model: ${escaped} ${escaped}, as the Gauge asks`);
   assert.equal(lines[5], `variables passed: ${escaped}`);
   assert.equal(lines[8], `notice: ${escaped} already runs in this folder, and two engines in one folder can overwrite each other's files`);
-  const stop = stopSteps({ gauge: hostile, session: hostile, engine: hostile, folder: hostile, force: false, timeoutMs: 1 });
+  const stop = stopSteps({ gauge: hostile, session: hostile, engine: hostile, folder: hostile, force: false, ended: false, timeoutMs: 1 });
   for (const line of stop) assert.equal(BREAKS.test(line), false, line);
   assert.equal(stop[0], `Gauge ${escaped} asks to stop session ${escaped} of the engine ${escaped}`);
   assert.equal(stop[1], `folder: ${escaped}`);
