@@ -397,6 +397,11 @@ test('the lists of an outgoing call are copied from the caller by index too: a h
   Object.defineProperty(accessor, 0, { get() { return 'engines.read'; }, enumerable: true });
   await assert.rejects(client.planGrant('a', accessor), TypeError);
   await assert.rejects(client.planSessionStart('g', { engine: 'e', folder: '/f', variables: Sub.from(['A']) }), TypeError);
+  for (const item of [5, null, {}, undefined]) {
+    await assert.rejects(client.planGrant('a', [item] as unknown as string[]), TypeError);
+    await assert.rejects(client.revoke('a', [item] as unknown as string[]), TypeError);
+    await assert.rejects(client.planSessionStart('g', { engine: 'e', folder: '/f', variables: [item] as unknown as string[] }), TypeError);
+  }
   assert.equal(core.calls.length, 0, 'nothing was sent');
   const hostile = { ...START, steps: accessor } as unknown as SessionPlan;
   await client.applySession(hostile, 'approval');
