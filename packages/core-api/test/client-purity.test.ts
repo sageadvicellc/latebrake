@@ -31,12 +31,12 @@ function graph(entry: string): { readonly files: Set<string>; readonly nodes: Se
 test('the client reaches no host, no launcher, no file system, and no child process', () => {
   const { files, nodes } = graph(CLIENT);
   const names = [...files].map(file => path.relative(path.resolve(path.dirname(CLIENT), '../..'), file).split(path.sep).join('/'));
-  for (const forbidden of ['engine-sessions/src/host.js', 'engine-sessions/src/process-launcher.js', 'engine-sessions/src/fixtures.js', 'engine-sessions/src/index.js', 'core-api/src/fake-core.js']) {
+  for (const forbidden of ['engine-sessions/src/host.js', 'engine-sessions/src/process-launcher.js', 'engine-sessions/src/fixtures.js', 'engine-sessions/src/index.js', 'core-api/src/fake-core.js', 'jobs/src/store.js', 'jobs/src/runs.js', 'jobs/src/index.js']) {
     assert.equal(names.includes(forbidden), false, `the client reaches ${forbidden}`);
   }
   for (const forbidden of ['node:fs', 'node:child_process', 'node:string_decoder', 'node:path', 'node:os', 'node:process', 'fs', 'child_process']) assert.equal(nodes.has(forbidden), false, `the client imports ${forbidden}`);
   assert.deepEqual([...nodes].sort(), ['node:crypto'], 'the one platform module that the client still reaches, through the error registry, is crypto');
-  for (const needed of ['engine-sessions/src/request.js', 'engine-sessions/src/states.js', 'engine-sessions/src/text.js', 'engine-sessions/src/vocab.js']) assert.equal(names.includes(needed), true, needed);
+  for (const needed of ['engine-sessions/src/request.js', 'engine-sessions/src/states.js', 'engine-sessions/src/text.js', 'engine-sessions/src/vocab.js', 'jobs/src/definition.js', 'jobs/src/ids.js']) assert.equal(names.includes(needed), true, needed);
 });
 
 test('the graph reader finds imports and exports, so the check above is not empty', () => {

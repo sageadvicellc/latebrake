@@ -179,3 +179,52 @@ test('the message of a log that threw is escaped before it is written to standar
   assert.equal(lines.length, 2);
   assert.equal(lines[1], 'engine session s-1: the log sink threw: broke\\u{a}forged line\\u{202e}\n');
 });
+
+// The change listener: the host learns of each change of state at once, and a listener that throws never changes the state.
+
+test('a listener is called after every change of state, with the new state already set: a legal move, a fail, and a fault', () => {
+  const seen: SessionState[] = [];
+  let session: ReturnType<typeof createSession>;
+  session = createSession('s-1', () => undefined, () => seen.push(session.state));
+  session.move('ready');
+  session.move('starting');
+  session.move('running');
+  assert.deepEqual(seen, ['ready', 'starting', 'running']);
+  session.fault('nonsense');
+  assert.deepEqual(seen, ['ready', 'starting', 'running', 'failed']);
+  const other: SessionState[] = [];
+  const failing = createSession('s-2', () => undefined, () => other.push(failing.state));
+  failing.fail('crashed');
+  assert.deepEqual(other, ['failed']);
+  const illegal: SessionState[] = [];
+  const jumper = createSession('s-3', () => undefined, () => illegal.push(jumper.state));
+  jumper.move('running');
+  assert.deepEqual(illegal, ['failed'], 'an illegal move is a change, to failed');
+});
+
+test('a listener is not called when nothing changed: a session that has ended, and a move to the same state', () => {
+  let calls = 0;
+  const session = createSession('s-1', () => undefined, () => { calls += 1; });
+  session.fail('crashed');
+  assert.equal(calls, 1);
+  session.fail('crashed');
+  session.move('ready');
+  session.fault('x');
+  assert.equal(calls, 1, 'an ended session never changes again');
+});
+
+test('a listener that throws is reported on standard error and never changes the state or the answer', () => {
+  const written: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try {
+    const session = createSession('s-1', () => undefined, () => { throw new Error('the listener broke\nforged line'); });
+    assert.deepEqual(session.move('ready'), { ok: true, state: 'ready' });
+    assert.equal(session.state, 'ready');
+    assert.deepEqual(session.fail('crashed'), { ok: true, state: 'failed' });
+  } finally {
+    process.stderr.write = original;
+  }
+  assert.equal(written.length, 2);
+  assert.match(written[0] ?? '', /^engine session s-1: the change listener threw: the listener broke\\u\{a\}forged line\n$/);
+});

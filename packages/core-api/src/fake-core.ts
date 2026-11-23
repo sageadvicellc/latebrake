@@ -8,15 +8,21 @@ import {
   MAX_REVISION, PAGE_IDS, canonicalText, checkLayout, defaultLayout, droppedRevision, layoutObject, newFile, parseLayout, parseLayoutFile, proposeTile, reconcileLayout, saveRevision, serializeLayoutFile, swapPlace, defaultPlace, tileInfoOf, invalid as layoutInvalid,
   type GaugeInfo, type Layout, type LayoutFile, type LayoutRefusal, type TileInfo, type UnknownGaugeRefusal,
 } from '../../gauge-layout/src/index.js';
-import { BILLING_SOURCES, checkModel, checkSessionId, createEngineHost, readList, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
+import { checkModel, checkSessionId, createEngineHost, isBilling, readList, type Billing, type EngineHost, type HostRefusal, type SessionInfo, type StartPlanContent } from '../../engine-sessions/src/index.js';
+import { MAX_JOB_SESSIONS, checkDefinition, hashDefinition, type DefinitionRefusal, type JobDefinition } from '../../jobs/src/definition.js';
+import { checkJobId, createJobStore, type Job } from '../../jobs/src/store.js';
+import { createRunBook, type PlannedRun, type RunOutcome, type RunRefusal, type RunView } from '../../jobs/src/runs.js';
+import { isRunId } from '../../jobs/src/ids.js';
 import { FIXTURE_GAUGES, HOME_STOCK } from './fixtures.js';
+import { jobSteps, runSteps } from './job-plan.js';
+import { denseTexts as readTexts } from './reading.js';
 import { layoutChangeSteps, layoutSteps } from './layout-plan.js';
 import { DEFAULT_AUDIT_MAX_BYTES, MAX_AUDIT_MAX_BYTES, MIN_AUDIT_MAX_BYTES, appendAuditStep, auditLine, grantSteps } from './grants.js';
 import { escapeForPlan } from './plan-text.js';
 import { startSteps, stopSteps } from './session-plan.js';
 import {
-  LAYOUT_KINDS, PLAN_ACTIONS, SESSION_ACTIONS, type AuditEntry, type AuditRead, type Core, type CoreRefusal, type CoreReply, type EngineCode, type EngineReasonCode, type GaugeApplied, type GaugePlan, type GaugeSummary, type LayoutKind, type LayoutSafe, type PlanAction,
-  type SessionAction, type SessionModel,
+  JOB_KINDS, LAYOUT_KINDS, PLAN_ACTIONS, SESSION_ACTIONS, type AuditEntry, type AuditRead, type Core, type CoreRefusal, type CoreReply, type EngineCode, type EngineReasonCode, type JobCode, type JobReasonCode, type RunRollbackCode, type GaugeApplied, type GaugePlan, type GaugeSummary, type LayoutKind, type LayoutSafe, type PlanAction,
+  type JobKind, type RunSessionSummary, type RunSummary, type SessionAction, type SessionModel,
 } from './types.js';
 
 export { escapeForPlan };
@@ -70,6 +76,12 @@ export interface FakeCoreOptions {
   readonly reconcile?: typeof reconcileLayout;
   /** The Engine Host that starts, watches, and stops sessions (`packages/engine-sessions`). A host with no engine by default, so every engine is `ENGINE_NOT_FOUND`. A test passes one over scripted fake engines. */
   readonly engineHost?: EngineHost;
+  /** Makes the id of a job. `job-` and sixteen hexadecimal characters by default. A test passes a counter. */
+  readonly jobIds?: () => string;
+  /** Makes the id of a run. `run-` and sixteen hexadecimal characters by default. A test passes a counter. */
+  readonly runIds?: () => string;
+  /** The most jobs the core holds: a whole number from 1 to 64. 64 by default. A test lowers it. */
+  readonly jobCap?: number;
 }
 
 /**
@@ -206,7 +218,7 @@ function describe(manifest: GaugeManifest): readonly string[] {
 const digestOfGrant = (plan: GrantContent): string => sha256(JSON.stringify(['grant', plan.id, plan.version, plan.permissions, plan.steps, plan.manifestHash, plan.folderHash]));
 const sealedGrant = (plan: GrantContent): SealedGrant => ({ ...plan, permissions: [...plan.permissions], steps: [...plan.steps], digest: digestOfGrant(plan) });
 
-type PlainCode = Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | EngineReasonCode>;
+type PlainCode = Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | EngineReasonCode | JobCode | JobReasonCode | RunRollbackCode>;
 const refuse = (code: PlainCode, reason?: ManifestReason): Refusal => (reason === undefined ? { ok: false, code } : { ok: false, code, reason });
 /** A refusal because a Gauge is protected: the lifecycle gives no reason. */
 const protectedRefusal = (): Refusal => ({ ok: false, code: 'GAUGE_PROTECTED' });
@@ -223,7 +235,7 @@ const engineRefusal = (refusal: HostRefusal): Refusal => {
   if (refusal.code === 'ENGINE_START_FAILED') return { ok: false, code: refusal.code, reason: refusal.reason };
   return { ok: false, code: refusal.code };
 };
-const reply = (refusal: Refusal): CoreReply => (refusal.reason === undefined ? { ok: false, code: refusal.code } : { ok: false, code: refusal.code, reason: refusal.reason });
+const reply = (refusal: Refusal): CoreReply => ({ ...refusal });
 /** True when the value is a list of text with no hole. A hole is not a line of text. */
 /** Reads a list of text by index, once (see `readList`). A list with a hole, an accessor, or an item that is not text reads as `undefined`. */
 const denseTexts = (value: unknown): string[] | undefined => {
@@ -891,7 +903,6 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     'session', plan.action, plan.gauge, plan.engine, plan.folder, plan.session, plan.program, plan.model === null ? null : [plan.model.provider, plan.model.model], plan.billing, plan.variables, plan.sharedWith, plan.force, plan.steps,
   ]));
   const isSessionAction = (value: unknown): value is SessionAction => typeof value === 'string' && (SESSION_ACTIONS as readonly string[]).includes(value);
-  const isBilling = (value: unknown): value is Billing => typeof value === 'string' && (BILLING_SOURCES as readonly string[]).includes(value);
   /** A session as it goes over the seam: a new object each time, with no output of the engine. */
   const sessionObject = (info: SessionInfo) => ({
     id: info.id, engine: info.engine, folder: info.folder, state: info.state, billing: info.billing, model: info.model === null ? null : { provider: info.model.provider, model: info.model.model }, failure: info.failure,
@@ -1015,6 +1026,252 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
     return { ok: true, result: { action: 'stop', session: fresh.session, engine: plan.engine, state: settled.info.state } };
   }
 
+
+  // Jobs and runs
+
+  /** The jobs the core holds, and the runs that have begun. Jobs are the person's saved work: a Gauge asks for a change through a plan, and no Gauge owns a job. */
+  const jobStore = createJobStore({ ...(options.jobCap === undefined ? {} : { cap: options.jobCap }), ...(options.jobIds === undefined ? {} : { newId: options.jobIds }) });
+  const runBook = createRunBook({ host, ...(options.runIds === undefined ? {} : { newId: options.runIds }) });
+
+  const isJobKind = (value: unknown): value is JobKind => typeof value === 'string' && (JOB_KINDS as readonly string[]).includes(value);
+  const jobInvalid = (reason: 'job' | 'request'): Refusal => ({ ok: false, code: 'GAUGE_JOB_INVALID', reason });
+  /** The refusal of the host for a session of a run, with the place and the label of that session. */
+  const memberRefusal = (refusal: RunRefusal): Refusal => ({ ...engineRefusal(refusal), member: { index: refusal.index, label: refusal.label } });
+  /**
+   * Looks at the top-level keys of a raw call that plans or applies a job or a run. A `schedule` key, or an `unattended` key, with any value, is refused as not interactive (a schedule before an unattended flag), and any key that the call does
+   * not know is refused as a request that is malformed. The client never sends such a key, so only a raw caller meets this.
+   */
+  function unknownKeys(params: Readonly<Record<string, unknown>>, known: readonly PropertyKey[]): Refusal | undefined {
+    const keys = Reflect.ownKeys(params);
+    if (keys.includes('schedule')) return { ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE', reason: 'schedule' };
+    if (keys.includes('unattended')) return { ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE', reason: 'unattended' };
+    return keys.some(key => !known.includes(key)) ? jobInvalid('request') : undefined;
+  }
+  /** The refusal of the definition check as the core gives it. */
+  const definitionRefusal = (refused: DefinitionRefusal): Refusal => refused;
+  const hashOf = (definition: JobDefinition | null): string | null => (definition === null ? null : hashDefinition(definition));
+  /** A definition as it goes over the seam: new objects each time. */
+  const definitionObject = (definition: JobDefinition) => ({
+    title: definition.title,
+    sessions: definition.sessions.map(session => ({ ...session, model: session.model === null ? null : { provider: session.model.provider, model: session.model.model } })),
+  });
+
+  /** What a job plan says before the core seals it. */
+  interface JobContent {
+    readonly kind: JobKind;
+    readonly gauge: string;
+    readonly job: string | null;
+    readonly definition: JobDefinition | null;
+    readonly baseHash: string | null;
+    readonly nextHash: string | null;
+    readonly steps: readonly string[];
+  }
+  type JobPlanned = (JobContent & { readonly ok: true; readonly digest: string }) | Refusal;
+  const jobDigest = (plan: JobContent): string => sha256(JSON.stringify(['job', plan.kind, plan.gauge, plan.job, plan.baseHash, plan.nextHash, plan.steps]));
+
+  /**
+   * Plans a change to a job. Nothing changes. Every check runs here, so the plan the person sees is one that can be applied: the grant first (so a Gauge with no grant learns nothing about any job), then the shape of
+   * the job id and of the definition (a schedule is refused here as not interactive), then whether the job is there, and for a create whether the store has room.
+   */
+  function planJob(params: Readonly<Record<string, unknown>>): JobPlanned {
+    const kind = params['kind'];
+    if (!isJobKind(kind)) throw new Error(`unknown job change: ${String(kind)}`);
+    const allowed = enforce(params['gauge'], 'jobs.write', undefined);
+    if (!allowed.ok) return allowed;
+    const stray = unknownKeys(params, ['kind', 'gauge', 'job', 'definition']);
+    if (stray) return stray;
+    let id: string | null = null;
+    if (kind !== 'create') {
+      const checked = checkJobId(params['job']);
+      if (!checked.ok) return jobInvalid('job');
+      id = checked.value;
+    }
+    let definition: JobDefinition | null = null;
+    if (kind !== 'delete') {
+      const checked = checkDefinition(params['definition']);
+      if (!checked.ok) return definitionRefusal(checked);
+      definition = checked.value;
+    }
+    let before: Job | undefined;
+    if (id === null) {
+      if (jobStore.full) return { ok: false, code: 'GAUGE_JOB_LIMIT' };
+    } else {
+      before = jobStore.get(id);
+      if (before === undefined) return { ok: false, code: 'GAUGE_JOB_UNKNOWN' };
+    }
+    const content: JobContent = {
+      kind, gauge: allowed.gauge, job: id, definition, baseHash: hashOf(before?.definition ?? null), nextHash: hashOf(definition),
+      steps: jobSteps({ kind, gauge: allowed.gauge, job: id, before: before?.definition ?? null, definition, baseHash: hashOf(before?.definition ?? null), nextHash: hashOf(definition) }),
+    };
+    return { ok: true, ...content, digest: jobDigest(content) };
+  }
+
+  /** Reads the job plan a caller sends back. Anything that is not a whole plan reads as `undefined`. The digest is computed here, and the one the caller sent is ignored. */
+  function readJobPlan(value: unknown): (JobContent & { readonly digest: string; readonly nonce: string }) | undefined {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+    const field = (key: string): unknown => { const descriptor = Object.getOwnPropertyDescriptor(value, key); return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined; };
+    const action = field('action'), kind = field('kind'), gauge = field('gauge'), job = field('job'), baseHash = field('baseHash'), nextHash = field('nextHash'), steps = readTexts(field('steps')), nonce = field('nonce');
+    if (action !== 'job' || !isJobKind(kind) || typeof gauge !== 'string' || typeof nonce !== 'string' || steps === undefined) return undefined;
+    const nullable = (item: unknown): item is string | null => item === null || typeof item === 'string';
+    if (!nullable(job) || !nullable(baseHash) || !nullable(nextHash)) return undefined;
+    const rawDefinition = field('definition');
+    let definition: JobDefinition | null = null;
+    if (rawDefinition !== null) {
+      const checked = checkDefinition(rawDefinition);
+      if (!checked.ok) return undefined;
+      definition = checked.value;
+    }
+    const content: JobContent = { kind, gauge, job, definition, baseHash, nextHash, steps };
+    return { ...content, digest: jobDigest(content), nonce };
+  }
+
+  /** Applies a job plan: the approval, the plan, and a plan made again from the state now are checked as for every plan. A job that changed since, or a grant that was revoked since, is refused. */
+  function applyJob(params: Readonly<Record<string, unknown>>): CoreReply {
+    const live = liveApproval(params);
+    if (!live) return reply(refuse('GAUGE_PLAN_NOT_APPROVED'));
+    const { token, approval } = live;
+    const plan = readJobPlan(params['plan']);
+    if (!plan || plan.nonce !== approval.nonce || plan.digest !== approval.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    const fresh = planJob({ kind: plan.kind, gauge: plan.gauge, job: plan.job, definition: plan.definition === null ? undefined : definitionObject(plan.definition) });
+    if (!fresh.ok) return reply(fresh);
+    if (fresh.digest !== plan.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    let job: string;
+    if (fresh.kind === 'create') {
+      if (fresh.definition === null) throw new Error('a create plan holds a definition');
+      const made = jobStore.create(fresh.definition);
+      if (!made.ok) return reply({ ok: false, code: made.code });
+      job = made.id;
+    } else {
+      if (fresh.job === null) throw new Error('an update or a delete plan holds a job');
+      job = fresh.job;
+      if (fresh.kind === 'update') {
+        if (fresh.definition === null) throw new Error('an update plan holds a definition');
+        if (!jobStore.replace(job, fresh.definition)) throw new Error('a job that was planned is gone');
+      } else if (!jobStore.remove(job)) throw new Error('a job that was planned is gone');
+    }
+    retire(plan.nonce, token);
+    return { ok: true, result: { kind: fresh.kind, job } };
+  }
+
+  /** What a run plan says before the core seals it. */
+  interface RunContent {
+    readonly gauge: string;
+    readonly job: string;
+    readonly title: string;
+    readonly shared: boolean;
+    readonly sessions: PlannedRun['plan']['sessions'];
+    readonly steps: readonly string[];
+  }
+  type RunPlanned = (RunContent & { readonly ok: true; readonly digest: string; readonly planned: PlannedRun }) | Refusal;
+  const runDigest = (plan: RunContent): string => sha256(JSON.stringify([
+    'run', plan.gauge, plan.job, plan.title, plan.shared,
+    plan.sessions.map(session => [session.label, session.engine, session.engineTitle, session.harness, session.program, session.folder, session.model === null ? null : [session.model.provider, session.model.model], session.billing, session.variables, session.sharedWith, session.task]),
+    plan.steps,
+  ]));
+  const runSessionObject = (session: PlannedRun['plan']['sessions'][number]) => ({
+    label: session.label, engine: session.engine, engineTitle: session.engineTitle, harness: session.harness, program: session.program, folder: session.folder,
+    model: session.model === null ? null : { provider: session.model.provider, model: session.model.model }, billing: session.billing, variables: [...session.variables], sharedWith: [...session.sharedWith], task: session.task,
+  });
+
+  /**
+   * Plans a run of a job. Nothing changes. The grant `jobs.run` first, so a Gauge with none learns nothing about any job. A key that asks for a schedule or an unattended run is refused: v0.9.1 runs are interactive, and any other key that the call does not know is refused too. Then the job, and the
+   * `sessions.start` grant for the engine of every session of it, by the one enforcement point: a Gauge that lists one engine never starts another engine through a job. Last, the Engine Host plans the whole group.
+   */
+  function planRun(params: Readonly<Record<string, unknown>>): RunPlanned {
+    const allowed = enforce(params['gauge'], 'jobs.run', undefined);
+    if (!allowed.ok) return allowed;
+    const stray = unknownKeys(params, ['gauge', 'job']);
+    if (stray) return stray;
+    const id = checkJobId(params['job']);
+    if (!id.ok) return jobInvalid('job');
+    const job = jobStore.get(id.value);
+    if (job === undefined) return { ok: false, code: 'GAUGE_JOB_UNKNOWN' };
+    for (const session of job.definition.sessions) {
+      const startable = enforce(allowed.gauge, 'sessions.start', session.engine);
+      if (!startable.ok) return startable;
+    }
+    const planned = runBook.plan(job);
+    if (!planned.ok) return memberRefusal(planned);
+    const content: RunContent = {
+      gauge: allowed.gauge, job: planned.plan.job, title: planned.plan.title, shared: planned.plan.shared, sessions: planned.plan.sessions,
+      steps: runSteps({ gauge: allowed.gauge, job: planned.plan.job, title: planned.plan.title, shared: planned.plan.shared, sessions: planned.plan.sessions }),
+    };
+    return { ok: true, ...content, digest: runDigest(content), planned: { plan: planned.plan, start: planned.start } };
+  }
+
+  /** Reads the run plan a caller sends back, from own data properties. Anything that is not a whole plan reads as `undefined`. The digest is computed here, from what was sent. */
+  function readRunPlan(value: unknown): (RunContent & { readonly digest: string; readonly nonce: string }) | undefined {
+    const record = (item: unknown): Record<string, unknown> | undefined => (typeof item === 'object' && item !== null && !Array.isArray(item) ? item as Record<string, unknown> : undefined);
+    const own = (item: object, key: string): unknown => { const descriptor = Object.getOwnPropertyDescriptor(item, key); return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined; };
+    const top = record(value);
+    if (top === undefined) return undefined;
+    const action = own(top, 'action'), gauge = own(top, 'gauge'), job = own(top, 'job'), title = own(top, 'title'), shared = own(top, 'shared'), nonce = own(top, 'nonce');
+    const items = readList(own(top, 'sessions'), MAX_JOB_SESSIONS), steps = readTexts(own(top, 'steps'));
+    if (action !== 'run' || typeof gauge !== 'string' || typeof job !== 'string' || typeof title !== 'string' || typeof shared !== 'boolean' || typeof nonce !== 'string' || items === undefined || steps === undefined) return undefined;
+    const sessions: PlannedRun['plan']['sessions'][number][] = [];
+    for (const item of items) {
+      const entry = record(item);
+      if (entry === undefined) return undefined;
+      const text = (key: string): string | undefined => { const field = own(entry, key); return typeof field === 'string' ? field : undefined; };
+      const model = checkModel(own(entry, 'model') ?? undefined);
+      const variables = readTexts(own(entry, 'variables')), sharedWith = readTexts(own(entry, 'sharedWith')), billing = own(entry, 'billing');
+      const label = text('label'), engine = text('engine'), engineTitle = text('engineTitle'), harness = text('harness'), program = text('program'), folder = text('folder'), task = text('task');
+      if (label === undefined || engine === undefined || engineTitle === undefined || harness === undefined || program === undefined || folder === undefined || task === undefined) return undefined;
+      if (!model.ok || variables === undefined || sharedWith === undefined || !isBilling(billing)) return undefined;
+      sessions.push({ label, engine, engineTitle, harness, program, folder, model: model.value, billing, variables, sharedWith, task });
+    }
+    const content: RunContent = { gauge, job, title, shared, sessions, steps };
+    return { ...content, digest: runDigest(content), nonce };
+  }
+
+  /** A run as a Gauge may read it: a session of an engine that the Gauge holds no `sessions.read` grant for is `hidden`, with no id, so the answer is the same whatever that session is. */
+  function runSummary(gauge: string, view: RunView): RunSummary {
+    const sessions = view.sessions.map((session): RunSessionSummary => (enforce(gauge, 'sessions.read', session.engine).ok
+      ? { label: session.label, engine: session.engine, session: session.session, state: session.state }
+      : { label: session.label, engine: session.engine, session: null, state: 'hidden' }));
+    return { id: view.id, job: view.job, title: view.title, sessions };
+  }
+
+  /** The failure of a run that did not start: the first failure and its session, with the run that it left, or the failure of the undo with the cause. */
+  const outcomeRefusal = (outcome: Exclude<RunOutcome, { readonly ok: true }>): Refusal => (outcome.code === 'GAUGE_RUN_ROLLBACK_FAILED'
+    ? { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run: outcome.run, member: outcome.member, cause: outcome.cause }
+    : { ok: false, code: 'ENGINE_START_FAILED', reason: outcome.reason, member: outcome.member, run: outcome.run });
+
+  /**
+   * Applies a run plan. The first approval, the plan, and a plan made again from the state now are checked as for every plan, and a plan with `shared` needs the second approval, once. Everything is checked before the
+   * book is asked, and the book is asked before the approval is used up. The wait for the programs comes after the approval is used up and every older plan is retired.
+   */
+  async function applyRun(params: Readonly<Record<string, unknown>>): Promise<CoreReply> {
+    const stray = unknownKeys(params, ['plan', 'approval', 'sharedApproval']);
+    if (stray) return reply(stray);
+    const live = liveApproval(params);
+    if (!live) return reply(refuse('GAUGE_PLAN_NOT_APPROVED'));
+    const { token, approval } = live;
+    const plan = readRunPlan(params['plan']);
+    if (!plan || plan.nonce !== approval.nonce || plan.digest !== approval.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    const fresh = planRun({ gauge: plan.gauge, job: plan.job });
+    if (!fresh.ok) return reply(fresh);
+    if (fresh.digest !== plan.digest) return reply(refuse('GAUGE_PLAN_CHANGED'));
+    let second: { readonly token: string; readonly approval: Approval } | undefined;
+    if (fresh.shared) {
+      second = liveApproval(params, 'sharedApproval', 'shared');
+      if (!second || second.approval.nonce !== plan.nonce || second.approval.digest !== plan.digest) {
+        const index = fresh.sessions.findIndex(session => session.sharedWith.length > 0);
+        const label = fresh.sessions[index]?.label;
+        if (label === undefined) throw new Error('a shared run holds a session that shares its folder');
+        return reply(memberRefusal({ ok: false, code: 'ENGINE_FOLDER_SHARED', index, label }));
+      }
+    }
+    const begun = runBook.begin(fresh.planned, { sharedApproved: second !== undefined });
+    if (!begun.ok) return reply(memberRefusal(begun));
+    retire(plan.nonce, token);
+    const outcome = await begun.settled;
+    if (!outcome.ok) return reply(outcomeRefusal(outcome));
+    const view = runBook.get(begun.run);
+    if (view === undefined) throw new Error('a run that began is gone');
+    return { ok: true, result: runSummary(plan.gauge, view) };
+  }
+
   return {
     approve(nonce) {
       const plan = typeof nonce === 'string' ? issued.get(nonce) : undefined;
@@ -1136,6 +1393,53 @@ export function createFakeCore(options: FakeCoreOptions = {}): FakeCore {
           const found = host.get(id.value);
           if (!found || !granted.engines.has(found.engine)) return reply(engineRefusal({ ok: false, code: 'ENGINE_SESSION_UNKNOWN' }));
           return { ok: true, result: sessionObject(found) };
+        }
+        case 'bowerloom.jobs.list': {
+          const allowed = enforce(params['gauge'], 'jobs.read', undefined);
+          if (!allowed.ok) return reply(allowed);
+          return { ok: true, result: jobStore.list().map(job => ({ ...job })) };
+        }
+        case 'bowerloom.jobs.get': {
+          const allowed = enforce(params['gauge'], 'jobs.read', undefined);
+          if (!allowed.ok) return reply(allowed);
+          const id = checkJobId(params['job']);
+          if (!id.ok) return reply(jobInvalid('job'));
+          const job = jobStore.get(id.value);
+          if (job === undefined) return { ok: false, code: 'GAUGE_JOB_UNKNOWN' };
+          return { ok: true, result: { id: job.id, ...definitionObject(job.definition) } };
+        }
+        case 'bowerloom.jobs.plan': {
+          const planned = planJob(params);
+          if (!planned.ok) return reply(planned);
+          const nonce = randomBytes(32).toString('hex');
+          issued.set(nonce, { digest: planned.digest, epoch, gauge: planned.gauge, shared: false });
+          const { kind, gauge, job, definition, baseHash, nextHash, steps, digest } = planned;
+          return { ok: true, result: { action: 'job', kind, gauge, job, definition: definition === null ? null : definitionObject(definition), baseHash, nextHash, steps: [...steps], digest, nonce } };
+        }
+        case 'bowerloom.jobs.apply':
+          return applyJob(params);
+        case 'bowerloom.runs.plan': {
+          const planned = planRun(params);
+          if (!planned.ok) return reply(planned);
+          const nonce = randomBytes(32).toString('hex');
+          issued.set(nonce, { digest: planned.digest, epoch, gauge: planned.gauge, shared: planned.shared });
+          const { gauge, job, title, shared, sessions, steps, digest } = planned;
+          return { ok: true, result: { action: 'run', gauge, job, title, shared, sessions: sessions.map(runSessionObject), steps: [...steps], digest, nonce } };
+        }
+        case 'bowerloom.runs.apply':
+          return applyRun(params);
+        case 'bowerloom.runs.list': {
+          const allowed = enforce(params['gauge'], 'jobs.read', undefined);
+          if (!allowed.ok) return reply(allowed);
+          return { ok: true, result: runBook.list().map(view => runSummary(allowed.gauge, view)) };
+        }
+        case 'bowerloom.runs.get': {
+          const allowed = enforce(params['gauge'], 'jobs.read', undefined);
+          if (!allowed.ok) return reply(allowed);
+          const id = params['run'];
+          const view = isRunId(id) ? runBook.get(id) : undefined;
+          if (view === undefined) return { ok: false, code: 'GAUGE_RUN_UNKNOWN' };
+          return { ok: true, result: runSummary(allowed.gauge, view) };
         }
         case 'bowerloom.gauges.routes':
           return { ok: true, result: [...installed.values()].filter(gauge => gauge.enabled).map(({ summary }) => `/gauges/${summary.id}`) };

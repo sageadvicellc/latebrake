@@ -5,6 +5,8 @@ import type { ModelChoice, RequestReason } from '../../engine-sessions/src/reque
 import type { SessionFailure } from '../../engine-sessions/src/session.js';
 import type { SessionState } from '../../engine-sessions/src/states.js';
 import type { Billing, NotFoundReason, StartFailedReason } from '../../engine-sessions/src/vocab.js';
+import type { JobReason, JobSession, NotInteractiveReason } from '../../jobs/src/definition.js';
+import type { RunMember, RunSessionPlan, RunSessionState } from '../../jobs/src/runs.js';
 
 /** The wire names of the calls the core offers. Wire identifiers keep the `bowerloom` prefix until the rename. */
 export type CoreMethod =
@@ -13,7 +15,9 @@ export type CoreMethod =
   | 'bowerloom.grants.plan' | 'bowerloom.grants.apply' | 'bowerloom.grants.revoke' | 'bowerloom.grants.list'
   | 'bowerloom.permissions.check' | 'bowerloom.audit.read'
   | 'bowerloom.layout.read' | 'bowerloom.layout.revisions' | 'bowerloom.layout.export' | 'bowerloom.layout.plan' | 'bowerloom.layout.apply'
-  | 'bowerloom.sessions.list' | 'bowerloom.sessions.get' | 'bowerloom.sessions.plan' | 'bowerloom.sessions.apply';
+  | 'bowerloom.sessions.list' | 'bowerloom.sessions.get' | 'bowerloom.sessions.plan' | 'bowerloom.sessions.apply'
+  | 'bowerloom.jobs.list' | 'bowerloom.jobs.get' | 'bowerloom.jobs.plan' | 'bowerloom.jobs.apply'
+  | 'bowerloom.runs.list' | 'bowerloom.runs.get' | 'bowerloom.runs.plan' | 'bowerloom.runs.apply';
 
 /** The five steps of a Gauge's life, in one list that the client and the fake core both use. Each goes through a plan and an approval. An update is an install plan of the new version. */
 export const PLAN_ACTIONS = Object.freeze(['install', 'enable', 'disable', 'update', 'remove'] as const);
@@ -247,10 +251,90 @@ export interface SessionSummary {
   readonly failure: SessionFailure | null;
 }
 
+
+/** The three changes to a job, in one list that the client and the fake core both use. Each goes through a plan and an approval. */
+export const JOB_KINDS = Object.freeze(['create', 'update', 'delete'] as const);
+export type JobKind = (typeof JOB_KINDS)[number];
+
+/** A job as a read gives it: the id the core made, a title, and one to eight sessions. */
+export interface JobRecord {
+  readonly id: string;
+  readonly title: string;
+  readonly sessions: readonly JobSession[];
+}
+
+/** One job of the list: what a person needs to pick one, with no folder and no task. */
+export interface JobListing {
+  readonly id: string;
+  readonly title: string;
+  readonly sessions: number;
+}
+
+/**
+ * What a change to a job would do, shown to the person before anything changes. `kind` names the change. `gauge` is the Gauge that asked. `job` is the id of the job (`null` for a create: the core makes the id
+ * when the plan is applied). `definition` is the job the change gives (`null` for a delete). `baseHash` is the SHA-256 of the canonical text of the job as it is now (`null` for a create) and `nextHash` is that
+ * of `definition` (`null` for a delete). Both are in the `digest`, so an approval is for the change the person saw, and a job that changed since holds it no longer. `digest` is the SHA-256 of the plan, and `nonce` is
+ * issued by the core and is exactly 64 lowercase hexadecimal characters. A Gauge never makes an approval.
+ */
+export interface JobPlan {
+  readonly action: 'job';
+  readonly kind: JobKind;
+  readonly gauge: string;
+  readonly job: string | null;
+  readonly definition: { readonly title: string; readonly sessions: readonly JobSession[] } | null;
+  readonly baseHash: string | null;
+  readonly nextHash: string | null;
+  readonly steps: readonly string[];
+  readonly digest: string;
+  readonly nonce: string;
+}
+
+/** What an applied job plan gives back: the change and the id of the job (for a create, the id the core made). */
+export interface JobApplied {
+  readonly kind: JobKind;
+  readonly job: string;
+}
+
+/**
+ * What a run would do, shown to the person before anything starts: every session of the run, in the order of the job, with its real program, its real folder, and what it shares. `shared` is true when any session
+ * shares its folder with another engine, and then the run needs the second approval, once for the whole run. `digest` binds the plan to the job as it is now and to the state of the host. A run starts
+ * through this one plan: an engine never starts another engine, and no call adds a session to a run.
+ */
+export interface RunPlan {
+  readonly action: 'run';
+  readonly gauge: string;
+  readonly job: string;
+  readonly title: string;
+  readonly shared: boolean;
+  readonly sessions: readonly RunSessionPlan[];
+  readonly steps: readonly string[];
+  readonly digest: string;
+  readonly nonce: string;
+}
+
+/**
+ * A session of a run, as a Gauge may read it. `state` is the state the Engine Host holds, or `forgotten` when the host has dropped the session from its history, or `hidden` when the Gauge holds no `sessions.read`
+ * grant for the engine: then `session` is `null`, so the answer is the same whatever the session is.
+ */
+export interface RunSessionSummary {
+  readonly label: string;
+  readonly engine: string;
+  readonly session: string | null;
+  readonly state: RunSessionState | 'hidden';
+}
+
+/** A run read as a group of its sessions, in the order of the plan. It holds no output of an engine and no state of its own. */
+export interface RunSummary {
+  readonly id: string;
+  readonly job: string;
+  readonly title: string;
+  readonly sessions: readonly RunSessionSummary[];
+}
+
 /** The raw answer of a core: a result, or a refusal with a code. The client checks the code against the registry. */
 export type CoreReply =
   | { readonly ok: true; readonly result: unknown }
-  | { readonly ok: false; readonly code: string; readonly reason?: string };
+  | { readonly ok: false; readonly code: string; readonly reason?: string; readonly member?: unknown; readonly run?: unknown; readonly cause?: unknown };
 
 /**
  * The seam. The fake core and the real core both have this shape, and a Gauge reaches either one only through a client built on it.
@@ -288,7 +372,26 @@ export type EngineCodesMatchRegistry = Exactly<EngineCode | EngineReasonCode, Ex
 /** The engine codes that always carry a reason. */
 export type EngineReasonCode = 'ENGINE_REQUEST_INVALID' | 'ENGINE_NOT_FOUND' | 'ENGINE_START_FAILED';
 
-export type CoreRefusal =
+/** The job and run codes that never carry a reason. `GAUGE_JOB_INVALID` and `GAUGE_JOB_NOT_INTERACTIVE` always carry one. */
+export const JOB_CODES = Object.freeze(['GAUGE_JOB_UNKNOWN', 'GAUGE_JOB_LIMIT', 'GAUGE_RUN_UNKNOWN'] as const);
+export type JobCode = (typeof JOB_CODES)[number];
+/** The job codes that always carry a reason. */
+export type JobReasonCode = 'GAUGE_JOB_INVALID' | 'GAUGE_JOB_NOT_INTERACTIVE';
+/** The run code that carries a run, a session, and a cause, and no reason. */
+export type RunRollbackCode = 'GAUGE_RUN_ROLLBACK_FAILED';
+/** A compile-time check that ties the job codes of this package to the registry: it is `true` only when `JOB_CODES`, `JobReasonCode`, and `RunRollbackCode` are exactly the registry codes that start with `GAUGE_JOB_` or `GAUGE_RUN_`. */
+export type JobCodesMatchRegistry = Exactly<JobCode | JobReasonCode | RunRollbackCode, Extract<GaugeCode, `GAUGE_JOB_${string}` | `GAUGE_RUN_${string}`>>;
+
+/**
+ * What a refusal of a run call may carry besides its code and reason. `member` is the session that the refusal is about: its place in the plan and its label, for a refusal of a plan (the first session that cannot start) and of an apply.
+ * `run` is the id of the run that a failed apply left behind: the run stays recorded and reads as a group that ended, so the id is how a Gauge finds it. Both are closed values.
+ */
+export interface RefusalExtras {
+  readonly member?: RunMember;
+  readonly run?: string;
+}
+
+export type CoreRefusal = (
   | { readonly ok: false; readonly code: EngineCode; readonly reason?: never }
   | { readonly ok: false; readonly code: 'ENGINE_REQUEST_INVALID'; readonly reason: RequestReason }
   | { readonly ok: false; readonly code: 'ENGINE_NOT_FOUND'; readonly reason: NotFoundReason }
@@ -297,4 +400,9 @@ export type CoreRefusal =
   | { readonly ok: false; readonly code: 'GAUGE_AUDIT_FAILED'; readonly reason: AuditReason }
   | { readonly ok: false; readonly code: 'GAUGE_LAYOUT_INVALID'; readonly reason: LayoutReason }
   | { readonly ok: false; readonly code: 'GAUGE_PROTECTED'; readonly reason?: ProtectedReason }
-  | { readonly ok: false; readonly code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | EngineReasonCode>; readonly reason?: ManifestReason };
+  | { readonly ok: false; readonly code: 'GAUGE_JOB_INVALID'; readonly reason: JobReason }
+  | { readonly ok: false; readonly code: 'GAUGE_JOB_NOT_INTERACTIVE'; readonly reason: NotInteractiveReason }
+  | { readonly ok: false; readonly code: JobCode; readonly reason?: never }
+  | { readonly ok: false; readonly code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | EngineReasonCode | JobCode | JobReasonCode | RunRollbackCode>; readonly reason?: ManifestReason }
+) & RefusalExtras
+  | { readonly ok: false; readonly code: RunRollbackCode; readonly reason?: never; readonly run: string; readonly member: RunMember; readonly cause: StartFailedReason };

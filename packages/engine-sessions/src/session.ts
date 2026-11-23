@@ -57,19 +57,32 @@ export interface Session {
 
 const printable = (value: unknown): string => (typeof value === 'string' ? escapeText(value) : String(typeof value));
 
-/** Makes a session in the state `detected`. `log` receives each fault. A log that throws is reported on standard error, and never changes the state. */
-export function createSession(id: string, log?: (entry: FaultEntry) => void): Session {
+/**
+ * Makes a session in the state `detected`. `log` receives each fault. A log that throws is reported on standard error, and never changes the state. `onChange` is called after every change of state, with the new
+ * state already set, so the host learns of a change at once. A listener that throws is reported on standard error, and never changes the state or the answer of a move.
+ */
+export function createSession(id: string, log?: (entry: FaultEntry) => void, onChange?: () => void): Session {
   let state: SessionState = 'detected';
   let failure: SessionFailure | null = null;
+  const changed = (): void => {
+    if (onChange === undefined) return;
+    try {
+      onChange();
+    } catch (error) {
+      process.stderr.write(`engine session ${id}: the change listener threw: ${escapeText(error instanceof Error ? error.message : String(error))}\n`);
+    }
+  };
   const fault = (to: unknown): MoveResult => {
     const from = state;
     // The state changes first: a session that has not ended is failed, so the log can never be skipped by a throw.
-    if (!isTerminal(from)) {
+    const moved = !isTerminal(from);
+    if (moved) {
       state = 'failed';
       failure = 'illegal_move';
     }
     const shown = printable(to);
     report(log, { session: id, from, to: shown, message: `engine session ${id}: illegal move ${from} -> ${shown}` });
+    if (moved) changed();
     return { ok: false, state };
   };
   return {
@@ -80,6 +93,7 @@ export function createSession(id: string, log?: (entry: FaultEntry) => void): Se
       if (to === 'failed') throw new TypeError('a move to failed has no cause: use fail(cause)');
       if (isLegalMove(state, to)) {
         state = to;
+        changed();
         return { ok: true, state };
       }
       return fault(to);
@@ -89,6 +103,7 @@ export function createSession(id: string, log?: (entry: FaultEntry) => void): Se
       if (isTerminal(state)) return { ok: false, state };
       state = 'failed';
       failure = cause;
+      changed();
       return { ok: true, state };
     },
   };

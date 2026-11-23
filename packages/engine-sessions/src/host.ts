@@ -3,12 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { MAX_TAIL_MARGIN, STDERR_TAIL_CHARS, type Launched, type Launcher } from './launcher.js';
 import {
-  MAX_NAME_LENGTH, MAX_VARIABLES, checkEngineId, checkFolder, checkModel, checkSessionId, checkVariables, isLoaderVariable, isRefusedVariable, type ModelChoice, type RequestReason,
+  MAX_NAME_LENGTH, MAX_VARIABLES, checkEngineId, checkFolder, checkModel, checkSessionId, checkVariables, isLoaderVariable, isRefusedVariable, readList, type ModelChoice, type RequestReason,
 } from './request.js';
 import { createSession, report, type FaultEntry, type Session, type SessionFailure } from './session.js';
 import { isTerminal, type SessionState } from './states.js';
 import { escapeText, hasUnsafeChar } from './text.js';
-import { BILLING_SOURCES, KEEP_ENDED_SESSIONS, type Billing, type NotFoundReason, type StartFailedReason } from './vocab.js';
+import { BILLING_SOURCES, KEEP_ENDED_SESSIONS, MAX_START_GROUP, isBilling, type Billing, type NotFoundReason, type StartFailedReason } from './vocab.js';
 
 export { BILLING_SOURCES };
 export type { Billing };
@@ -26,6 +26,7 @@ const MAX_STOP_TIMEOUT_MS = 600_000;
 const MAX_START_TIMEOUT_MS = 600_000;
 const MAX_KILL_WAIT_MS = 60_000;
 const MAX_ENGINES = 16;
+export { MAX_START_GROUP };
 
 /**
  * What the host knows about one engine. The five built-in adapters of the Engine Host spec are later work, and the fake engines of the tests use this shape.
@@ -122,11 +123,26 @@ export interface BegunStart {
   readonly ok: true;
   readonly session: string;
   readonly settled: Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal>;
+  /**
+   * Resolves when the session has left `starting`, and says how: `ok` with the session in `running` or `waiting`, or `ENGINE_START_FAILED` with a reason of its own (`exited`: the program ended before it said it runs, `timed_out`,
+   * `adapter_error`, `illegal_claim`, `stopped` for a stop of the person or the end of the host, or the reason of a launch that failed). It is the answer that matters for a run, since `settled` resolves at the spawn of the program.
+   * It resolves once and keeps its answer. It is bounded by the start timeout of the host, which fails a session that does not say it runs.
+   */
+  readonly started: Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal>;
 }
 /** A stop that began: the session is stopping and the signal is sent. `settled` resolves when the engine has gone, or refuses with `ENGINE_STOP_TIMEOUT` and leaves the session stopping. */
 export interface BegunStop {
   readonly ok: true;
   readonly settled: Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal>;
+}
+
+/** A refusal of one member of a group: the refusal of the host, and the index of the member (the first is 0) that it is for. */
+export type GroupRefusal = HostRefusal & { readonly index: number };
+
+/** A group start that began: every member exists and its program was asked to run, in the order of the plans. Each member settles on its own. */
+export interface BegunGroup {
+  readonly ok: true;
+  readonly members: readonly BegunStart[];
 }
 
 export interface EngineHost {
@@ -138,6 +154,18 @@ export interface EngineHost {
    * The host never asks the person: the core checks every approval first and says so here.
    */
   beginStart(plan: StartPlanContent, options: { readonly sharedApproved: boolean }): BegunStart | HostRefusal;
+  /**
+   * Plans several starts as one group, from live state, and changes nothing. Each member is planned as if the members before it had started: the cap, the pair rule, and the shared folder count them, so a group that
+   * is planned is a group that can begin. The first member that is refused gives its refusal and its `index`. The requests are a plain list of 1 to `MAX_START_GROUP` (a list of another shape is a bug of the caller, and throws).
+   */
+  planStartGroup(requests: unknown): { readonly ok: true; readonly plans: readonly StartPlanContent[] } | GroupRefusal;
+  /**
+   * Begins a group: reads each plan once, from own data properties (a plan that is not a plan is a bug of the caller, and throws), plans the group again from live state, and the plans given must be the plans that come out, in the
+   * same order (a plan that differs throws too). A group with a member that shares its folder needs `sharedApproved`. Every member is made, and its program asked to run, before this returns, from the plans that the host
+   * checked, so a member whose launch fails at once frees no place that another member counted on. If a step throws part way (a bad session id), the members that began are stopped, with the kill signal when the stop
+   * times out, each is logged with its session id, and the throw goes on unchanged. The member that threw made no session, so it holds no place.
+   */
+  beginStartGroup(plans: readonly StartPlanContent[], options: { readonly sharedApproved: boolean }): BegunGroup | GroupRefusal;
   /** Plans a stop from live state. It changes nothing. */
   planStop(sessionId: unknown): { readonly ok: true; readonly plan: StopPlanContent } | HostRefusal;
   /** Begins a stop: the first stop asks the engine to go (SIGTERM), and a stop of a session that is stopping already kills it (SIGKILL). */
@@ -179,6 +207,10 @@ interface Tracked {
   /** True once the host has sent the kill signal to a session that it failed or ended itself, so the end of its standard error is worth a log line. */
   killedByHost: boolean;
   readonly endWaiters: (() => void)[];
+  /** Why the start failed, when the host knows it better than the failure of the session says. Set before the session changes state. */
+  startReason: StartFailedReason | undefined;
+  /** Resolves `started`. It does nothing the second time. */
+  resolveStarted: (result: { readonly ok: true; readonly info: SessionInfo } | HostRefusal) => void;
 }
 
 const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -483,7 +515,10 @@ export function createEngineHost(options: HostOptions): EngineHost {
     endOf(record);
   }
 
-  function planWithKey(request: unknown): { readonly ok: true; readonly plan: StartPlanContent; readonly key: string } | HostRefusal {
+  /** A member of a group that is planned but has not begun: its engine and folder key, which count against the cap, the pair rule, and the shared folder of the members after it. */
+  interface Pending { readonly engine: string; readonly key: string }
+
+  function planWithKey(request: unknown, pending: readonly Pending[] = []): { readonly ok: true; readonly plan: StartPlanContent; readonly key: string } | HostRefusal {
     if (closed) return startFailed('shutting_down');
     if (typeof request !== 'object' || request === null || Array.isArray(request)) return invalid('engine');
     const id = checkEngineId(field(request, 'engine'));
@@ -513,11 +548,11 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (typeof real.key !== 'string' || real.key === '') throw new Error('engine host: canonical gave a folder with no key');
     // The core never picks another model on its own: a choice for an engine that cannot take one is refused, and is never dropped.
     if (model.value !== null && spec.modelArgs === undefined) return refusal('MODEL_NOT_FOR_ENGINE');
-    const live = active();
+    const live: readonly { readonly engine: string; readonly key: string }[] = [...active().map(record => ({ engine: record.engine.id, key: record.key })), ...pending];
     // The variables of the plan, those of the engine and those allowed together, are at most 32, so no approved plan fails to start for a count.
     const variables = sorted([...spec.env, ...allowed.value]);
     if (variables.length > MAX_VARIABLES) return invalid('variables');
-    if (live.some(record => record.engine.id === spec.id && record.key === real.key)) return refusal('ENGINE_PAIR_BUSY');
+    if (live.some(record => record.engine === spec.id && record.key === real.key)) return refusal('ENGINE_PAIR_BUSY');
     if (live.length >= cap) return refusal('ENGINE_LIMIT');
     return {
       ok: true,
@@ -525,7 +560,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
       plan: Object.freeze({
         engine: spec.id, title: spec.title, program, folder: real.path, model: model.value, billing: spec.billing,
         variables: Object.freeze(variables),
-        sharedWith: Object.freeze(sorted(live.filter(record => record.key === real.key).map(record => record.engine.id))),
+        sharedWith: Object.freeze(sorted(live.filter(record => record.key === real.key).map(record => record.engine))),
       }),
     };
   }
@@ -546,16 +581,41 @@ export function createEngineHost(options: HostOptions): EngineHost {
     return Object.fromEntries(entries);
   }
 
+  /** The request that makes a plan again. */
+  const requestOf = (plan: StartPlanContent): unknown => ({ engine: plan.engine, folder: plan.folder, model: plan.model, variables: plan.variables });
+
   function beginStart(plan: StartPlanContent, approvals: { readonly sharedApproved: boolean }): BegunStart | HostRefusal {
     // The caller's objects are read once. Everything below runs from the plan that the host made itself and checked, and never from a second read of the caller's plan.
     const sharedApproved = approvals.sharedApproved;
-    const fresh = planWithKey({ engine: plan.engine, folder: plan.folder, model: plan.model, variables: plan.variables });
+    const fresh = planWithKey(requestOf(plan));
     if (!fresh.ok) return fresh;
     const verified = fresh.plan;
     // The core plans again from live state, in the same tick, before it calls this. A plan that differs here is a bug in the caller, so it throws.
     if (JSON.stringify(verified) !== JSON.stringify(plan)) throw new Error('engine host: the plan does not match the state now, so the core must plan again before it begins a start');
     // Only the value true is the second approval: a truthy value of another kind is not.
     if (verified.sharedWith.length > 0 && sharedApproved !== true) return refusal('ENGINE_FOLDER_SHARED');
+    return startVerified(verified, fresh.key);
+  }
+
+  /** The answer of `started` for a session that has left `starting`. A reason that the host set wins. Otherwise the cause is read from the state and the failure of the session. */
+  function startedResult(record: Tracked): { readonly ok: true; readonly info: SessionInfo } | HostRefusal {
+    const state = record.session.state;
+    if (state === 'running' || state === 'waiting') return { ok: true, info: info(record) };
+    if (record.startReason !== undefined) return startFailed(record.startReason);
+    if (state === 'stopping') return startFailed('stopped');
+    const failure = record.session.failure;
+    return startFailed(failure === 'adapter_error' ? 'adapter_error' : failure === 'illegal_move' ? 'illegal_claim' : 'exited');
+  }
+
+  /** Called after every change of state of a session: the first change out of the start resolves `started`, and it keeps that answer. */
+  function leftStarting(record: Tracked): void {
+    const state = record.session.state;
+    if (state === 'detected' || state === 'ready' || state === 'starting') return;
+    record.resolveStarted(startedResult(record));
+  }
+
+  /** Makes the session and asks the launcher for the program, from a plan that the host made and checked itself. */
+  function startVerified(verified: StartPlanContent, key: string): BegunStart {
     const spec = engines.get(verified.engine);
     if (!spec) throw new Error('engine host: an engine that was planned is gone');
     const id = newId();
@@ -566,8 +626,11 @@ export function createEngineHost(options: HostOptions): EngineHost {
     const secrets = [...new Set(values.flatMap(value => [value, escapeText(value)]))].sort((a, b) => b.length - a.length);
     const tailMargin = Math.min(MAX_TAIL_MARGIN, Math.max(0, ...values.map(value => value.length - 1)));
     const sink = (entry: FaultEntry): void => report(log, { ...entry, to: redactText(secrets, entry.to), message: redactText(secrets, entry.message) });
+    let resolveStarted: Tracked['resolveStarted'] = () => undefined;
+    const started = new Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal>(resolve => { resolveStarted = resolve; });
     const record: Tracked = {
-      session: createSession(id, sink), engine: spec, folder: verified.folder, key: fresh.key, model: verified.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [], secrets, tailMargin, sink, killedByHost: false,
+      session: createSession(id, sink, () => leftStarting(record)), engine: spec, folder: verified.folder, key, model: verified.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [], secrets, tailMargin, sink,
+      killedByHost: false, startReason: undefined, resolveStarted,
     };
     records.set(id, record);
     // The program was found when the start was planned, and the session is checked ready, so the session walks detected, ready, starting before the program runs.
@@ -582,11 +645,6 @@ export function createEngineHost(options: HostOptions): EngineHost {
         const from = record.session.state;
         const code = errorCode(error);
         record.cancelStart();
-        if (from === 'stopping') record.session.move('stopped');
-        else record.session.fail('start_failed');
-        say(record, from, `the program could not be started: ${code === undefined ? '' : `${escapeText(code)} `}${escapeText(error instanceof Error ? error.message : String(error))}`);
-        killIfRunning(record);
-        if (!programMade) endOf(record);
         const folderThere = ((): boolean => { try { return canonical(verified.folder) !== undefined; } catch { return false; } })();
         // The reason is a closed word taken from the error code. A folder that cannot be searched also gives EACCES, so the folder is looked at before the program is blamed.
         const reason: StartFailedReason = forced ?? (code === 'ENOENT' ? (folderThere ? 'program_missing' : 'folder_unusable')
@@ -595,6 +653,13 @@ export function createEngineHost(options: HostOptions): EngineHost {
           : code === 'EPERM' || code === 'ENOEXEC' ? 'not_executable'
           : code !== undefined && RESOURCE_CODES.has(code) ? 'resource_limit'
           : 'other');
+        // The reason for `started` is set before the session changes state. (A session that is stopping has left `starting` already, so `started` has its answer, `stopped`.)
+        record.startReason = reason;
+        if (from === 'stopping') record.session.move('stopped');
+        else record.session.fail('start_failed');
+        say(record, from, `the program could not be started: ${code === undefined ? '' : `${escapeText(code)} `}${escapeText(error instanceof Error ? error.message : String(error))}`);
+        killIfRunning(record);
+        if (!programMade) endOf(record);
         resolve(startFailed(reason));
       };
       let args: string[];
@@ -615,6 +680,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
         handle.onError(error => failed(error, false));
         record.cancelStart = schedule(() => {
           if (record.session.state !== 'starting') return;
+          record.startReason = 'timed_out';
           record.session.fail('start_failed');
           say(record, 'starting', `the program did not say it runs within ${startTimeoutMs} ms`);
           killIfRunning(record);
@@ -625,7 +691,95 @@ export function createEngineHost(options: HostOptions): EngineHost {
         failed(error, record.handle !== undefined);
       }
     });
-    return { ok: true, session: id, settled };
+    // The answer of the spawn is a promise that a caller may never read. If the start executor threw, it rejects, and an unread rejection would crash the process, so a handler is attached here. A caller that reads it still sees the rejection.
+    settled.catch(() => undefined);
+    return { ok: true, session: id, settled, started };
+  }
+
+  /** Reads the requests or plans of a group: a plain list of 1 to `MAX_START_GROUP`. Anything else is a bug of the caller. */
+  function groupOf(value: unknown): unknown[] {
+    const items = readList(value, MAX_START_GROUP);
+    if (items === undefined || items.length === 0) throw new TypeError(`engine host: a group is a plain list of 1 to ${MAX_START_GROUP} members`);
+    return items;
+  }
+
+  /** Plans each member as if the members before it had started. The first refusal gives its index. */
+  function planGroup(requests: readonly unknown[]): { readonly ok: true; readonly plans: readonly StartPlanContent[]; readonly keys: readonly string[] } | GroupRefusal {
+    const plans: StartPlanContent[] = [];
+    const keys: string[] = [];
+    const pending: Pending[] = [];
+    for (const [index, request] of requests.entries()) {
+      const planned = planWithKey(request, pending);
+      if (!planned.ok) return { ...planned, index };
+      plans.push(planned.plan);
+      keys.push(planned.key);
+      pending.push({ engine: planned.plan.engine, key: planned.key });
+    }
+    return { ok: true, plans: Object.freeze(plans), keys };
+  }
+
+  function planStartGroup(requests: unknown): { readonly ok: true; readonly plans: readonly StartPlanContent[] } | GroupRefusal {
+    const planned = planGroup(groupOf(requests));
+    return planned.ok ? { ok: true, plans: planned.plans } : planned;
+  }
+
+  /** Reads a plan of a caller once, from own data properties, into a new frozen plan. Anything that is not a whole plan is a bug of the caller, and throws. */
+  function readPlan(value: unknown): StartPlanContent {
+    const bad = (): never => { throw new TypeError('engine host: a member of a group is a start plan'); };
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return bad();
+    const own = (key: string): unknown => { const descriptor = Object.getOwnPropertyDescriptor(value, key); return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined; };
+    const texts = (item: unknown): string[] => { const list = readList(item, MAX_VARIABLES); return list !== undefined && list.every((entry): entry is string => typeof entry === 'string') ? list : bad(); };
+    const engine = own('engine'), title = own('title'), program = own('program'), folder = own('folder'), billing = own('billing'), model = checkModel(own('model'));
+    if (typeof engine !== 'string' || typeof title !== 'string' || typeof program !== 'string' || typeof folder !== 'string' || !model.ok || own('model') === undefined) return bad();
+    if (!isBilling(billing)) return bad();
+    return Object.freeze({
+      engine, title, program, folder, model: model.value, billing, variables: Object.freeze(texts(own('variables'))), sharedWith: Object.freeze(texts(own('sharedWith'))),
+    });
+  }
+
+  /**
+   * A member of a group that began and must be stopped, because a later member could not begin. It is logged with its session id, stopped, and stopped again with the kill signal when the first stop times out.
+   * A stop that throws is logged and never replaces the error that caused the cleanup. The work runs on, and every step of it is caught, so no rejection goes unhandled.
+   */
+  function abandon(sessionId: string): void {
+    const record = records.get(sessionId);
+    if (record === undefined) return;
+    say(record, record.session.state, 'the start of its group failed, so it is stopped');
+    void (async (): Promise<void> => {
+      try {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const stopped = await stopAndWait(sessionId);
+          if (stopped.ok || stopped.code === 'ENGINE_SESSION_ENDED' || stopped.code === 'ENGINE_SESSION_UNKNOWN') return;
+        }
+        say(record, record.session.state, 'it could not be stopped after the start of its group failed');
+      } catch (error) {
+        say(record, record.session.state, `the stop of its group failed to run: ${escapeText(error instanceof Error ? error.message : String(error))}`);
+      }
+    })();
+  }
+
+  function beginStartGroup(plans: readonly StartPlanContent[], approvals: { readonly sharedApproved: boolean }): BegunGroup | GroupRefusal {
+    const given = groupOf(plans).map(readPlan);
+    const sharedApproved = approvals.sharedApproved;
+    const fresh = planGroup(given.map(requestOf));
+    if (!fresh.ok) return fresh;
+    // The caller plans again in the same tick, before it calls this. Plans that differ here, or that come in another order, are a bug in the caller, so it throws.
+    if (JSON.stringify(fresh.plans) !== JSON.stringify(given)) throw new Error('engine host: the plans do not match the state now, so the core must plan again before it begins a group');
+    const unapproved = fresh.plans.findIndex(plan => plan.sharedWith.length > 0);
+    if (unapproved !== -1 && sharedApproved !== true) return { ok: false, code: 'ENGINE_FOLDER_SHARED', index: unapproved };
+    const members: BegunStart[] = [];
+    try {
+      for (const [index, plan] of fresh.plans.entries()) {
+        const key = fresh.keys[index];
+        if (key === undefined) throw new Error('engine host: a planned member has no folder key');
+        members.push(startVerified(plan, key));
+      }
+    } catch (error) {
+      // A member could not even begin. The members that began are stopped, so no session is left running that nothing will ever read, and the error that caused it goes on as it was.
+      for (const member of members) abandon(member.session);
+      throw error;
+    }
+    return { ok: true, members: Object.freeze(members) };
   }
 
   function planStop(sessionId: unknown): { readonly ok: true; readonly plan: StopPlanContent } | HostRefusal {
@@ -662,15 +816,20 @@ export function createEngineHost(options: HostOptions): EngineHost {
     return { ok: true, settled };
   }
 
+  /** Begins a stop and waits for it. */
+  async function stopAndWait(sessionId: unknown): Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal> {
+    const begun = beginStop(sessionId);
+    return begun.ok ? begun.settled : begun;
+  }
+
   return {
     planStart,
     beginStart,
+    planStartGroup,
+    beginStartGroup,
     planStop,
     beginStop,
-    async stop(sessionId) {
-      const begun = beginStop(sessionId);
-      return begun.ok ? begun.settled : begun;
-    },
+    stop: stopAndWait,
     list: engine => Object.freeze([...records.values()].filter(record => engine === undefined || record.engine.id === engine).map(info)),
     get: sessionId => { const record = records.get(sessionId); return record ? info(record) : undefined; },
     async killAll() {
