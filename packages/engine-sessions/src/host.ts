@@ -224,7 +224,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
   let launched = 0;
 
   const info = (record: Tracked): SessionInfo => Object.freeze({
-    id: record.session.id, engine: record.engine.id, folder: record.folder, state: record.session.state, billing: record.engine.billing, model: record.model, failure: record.session.failure,
+    id: record.session.id, engine: record.engine.id, folder: record.folder, state: record.session.state, billing: record.engine.billing,
+    model: record.model === null ? null : Object.freeze({ provider: record.model.provider, model: record.model.model }), failure: record.session.failure,
   });
   const active = (): Tracked[] => [...records.values()].filter(record => !isTerminal(record.session.state));
 
