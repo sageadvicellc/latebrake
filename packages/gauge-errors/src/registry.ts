@@ -56,6 +56,21 @@ const ENTRIES = [
   { code: 'GAUGE_JOB_NOT_INTERACTIVE', meaning: 'A schedule or an unattended run is refused, because runs are interactive in this version. The reason says which.' },
   { code: 'GAUGE_RUN_UNKNOWN', meaning: 'No run has that id.' },
   { code: 'GAUGE_RUN_ROLLBACK_FAILED', meaning: 'A session of the run failed to start, and a session that had started could not be stopped.' },
+  // Relay
+  { code: 'GAUGE_ROUTE_INVALID', meaning: 'A relay route of a job is malformed, so no route was made. The reason says which part.' },
+  { code: 'GAUGE_ROUTE_UNKNOWN', meaning: 'No route has that id, or none that this session may send on.' },
+  { code: 'GAUGE_MESSAGE_INVALID', meaning: 'A relay message is malformed, so it was not sent. The reason says which part.' },
+  { code: 'GAUGE_MESSAGE_TOO_LARGE', meaning: 'The body of a relay message is over 16,384 bytes. Larger content moves as a file path.' },
+  { code: 'GAUGE_MESSAGE_SECRET_FOUND', meaning: 'The body of a relay message holds what looks like a secret value, so it was not sent.' },
+  { code: 'GAUGE_MESSAGE_UNKNOWN', meaning: 'No relay message has that id, or none that this session may use.' },
+  { code: 'GAUGE_MESSAGE_NOT_ACCEPTED', meaning: 'The relay message is not in a state that allows this move. The reason says its state.' },
+  { code: 'GAUGE_RELAY_UNAUTHENTICATED', meaning: 'A write to the relay bus came without the right session secret, so it was refused.' },
+  { code: 'GAUGE_RELAY_RECEIPT_INVALID', meaning: 'The receipt does not match the message, so the core does not report it delivered.' },
+  { code: 'GAUGE_RELAY_LOOP_CAP', meaning: 'Two sessions passed messages back and forth up to the loop cap, so the core stopped their routes.' },
+  { code: 'GAUGE_RELAY_MESSAGE_CAP', meaning: 'A route reached its cap on messages, so the core stopped it until the person resumes it.' },
+  { code: 'GAUGE_RELAY_QUEUE_FULL', meaning: 'The route holds as many waiting messages as it may, so none can be added until some move.' },
+  { code: 'GAUGE_RELAY_RECEIVER_GONE', meaning: 'The session that should receive the message has ended, so the message cannot be delivered.' },
+  { code: 'GAUGE_RELAY_CLOSED', meaning: 'The relay of the run has closed, so it takes no more messages.' },
 ] as const;
 
 /** A Gauge refusal code. */

@@ -21,6 +21,8 @@ const STABLE = [
   'ENGINE_NOT_FOUND', 'ENGINE_REQUEST_INVALID', 'MODEL_NOT_FOR_ENGINE', 'ENGINE_LIMIT', 'ENGINE_PAIR_BUSY', 'ENGINE_FOLDER_SHARED',
   'ENGINE_START_FAILED', 'ENGINE_SESSION_UNKNOWN', 'ENGINE_SESSION_ENDED', 'ENGINE_STOP_TIMEOUT',
   'GAUGE_JOB_INVALID', 'GAUGE_JOB_UNKNOWN', 'GAUGE_JOB_LIMIT', 'GAUGE_JOB_NOT_INTERACTIVE', 'GAUGE_RUN_UNKNOWN', 'GAUGE_RUN_ROLLBACK_FAILED',
+  'GAUGE_ROUTE_INVALID', 'GAUGE_ROUTE_UNKNOWN', 'GAUGE_MESSAGE_INVALID', 'GAUGE_MESSAGE_TOO_LARGE', 'GAUGE_MESSAGE_SECRET_FOUND', 'GAUGE_MESSAGE_UNKNOWN', 'GAUGE_MESSAGE_NOT_ACCEPTED',
+  'GAUGE_RELAY_UNAUTHENTICATED', 'GAUGE_RELAY_RECEIPT_INVALID', 'GAUGE_RELAY_LOOP_CAP', 'GAUGE_RELAY_MESSAGE_CAP', 'GAUGE_RELAY_QUEUE_FULL', 'GAUGE_RELAY_RECEIVER_GONE', 'GAUGE_RELAY_CLOSED',
 ];
 
 test('the registry lists the stable codes, each once, in a fixed order', () => {
@@ -170,6 +172,23 @@ test('the job and run codes name what they refuse, in one line each', () => {
   assert.equal(GAUGE_MEANINGS.GAUGE_JOB_NOT_INTERACTIVE, 'A schedule or an unattended run is refused, because runs are interactive in this version. The reason says which.');
   assert.equal(GAUGE_MEANINGS.GAUGE_RUN_UNKNOWN, 'No run has that id.');
   assert.equal(GAUGE_MEANINGS.GAUGE_RUN_ROLLBACK_FAILED, 'A session of the run failed to start, and a session that had started could not be stopped.');
+});
+
+test('the relay codes name what they refuse, in one line each', () => {
+  assert.equal(GAUGE_MEANINGS.GAUGE_ROUTE_INVALID, 'A relay route of a job is malformed, so no route was made. The reason says which part.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_ROUTE_UNKNOWN, 'No route has that id, or none that this session may send on.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_MESSAGE_INVALID, 'A relay message is malformed, so it was not sent. The reason says which part.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_MESSAGE_TOO_LARGE, 'The body of a relay message is over 16,384 bytes. Larger content moves as a file path.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_MESSAGE_SECRET_FOUND, 'The body of a relay message holds what looks like a secret value, so it was not sent.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_MESSAGE_UNKNOWN, 'No relay message has that id, or none that this session may use.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_MESSAGE_NOT_ACCEPTED, 'The relay message is not in a state that allows this move. The reason says its state.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_RELAY_UNAUTHENTICATED, 'A write to the relay bus came without the right session secret, so it was refused.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_RELAY_RECEIPT_INVALID, 'The receipt does not match the message, so the core does not report it delivered.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_RELAY_LOOP_CAP, 'Two sessions passed messages back and forth up to the loop cap, so the core stopped their routes.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_RELAY_MESSAGE_CAP, 'A route reached its cap on messages, so the core stopped it until the person resumes it.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_RELAY_QUEUE_FULL, 'The route holds as many waiting messages as it may, so none can be added until some move.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_RELAY_RECEIVER_GONE, 'The session that should receive the message has ended, so the message cannot be delivered.');
+  assert.equal(GAUGE_MEANINGS.GAUGE_RELAY_CLOSED, 'The relay of the run has closed, so it takes no more messages.');
 });
 
 test('the code for a missing approval says that a required approval is missing, and not that the plan has none', () => {
