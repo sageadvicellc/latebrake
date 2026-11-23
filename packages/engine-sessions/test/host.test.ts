@@ -1150,7 +1150,9 @@ test('a part of a value that the launcher cut at the start of its buffer is neve
   const r = rig({ environment: () => ({ API_KEY: KEY }) }, [spec('alpha', { env: ['API_KEY'] })]);
   await startOne(r, 'alpha', '/work/one');
   programOf(r, 0).line('state:running');
-  programOf(r, 0).exit(1, null, `${KEY.slice(5)}${'c'.repeat(2048 + KEY.length - 1 - (KEY.length - 5))}`);
+  // A whole value in the buffer shrinks the text when it is redacted, so only the margin can keep the end of the cut value out of the final cut.
+  const middle = 1000;
+  programOf(r, 0).exit(1, null, `${KEY.slice(5)}${'c'.repeat(middle)}${KEY}${'c'.repeat(2048 + KEY.length - 1 - (KEY.length - 5) - middle - KEY.length)}`);
   assert.equal(leaks(KEY, r.faults[0]?.message ?? ''), false);
 });
 
