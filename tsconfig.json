@@ -27,6 +27,7 @@
     "packages/gauge-errors/test/**/*.ts",
     "packages/core-api/test/**/*.ts",
     "packages/gauge-manifest/test/**/*.ts",
-    "packages/gauge-layout/test/**/*.ts"
+    "packages/gauge-layout/test/**/*.ts",
+    "packages/engine-sessions/test/**/*.ts"
   ]
 }

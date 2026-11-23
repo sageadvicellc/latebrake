@@ -5,7 +5,7 @@ The error registry of the Core API for Gauges (v0.9.1). Every refusal a Gauge ca
 ## Rules for a code
 
 - Capitals, digits, and single underscores. Every word starts with a capital letter, so `GAUGE_2` is refused. At most 40 characters.
-- The word `GAUGE` is one of its words. It may lead (`GAUGE_EXISTS`), follow (`UNKNOWN_GAUGE`), or sit between others. A client must not filter codes by a `GAUGE_` prefix. Use `isGaugeCode`.
+- The word `GAUGE` or the word `ENGINE` is one of its words. It may lead (`GAUGE_EXISTS`, `ENGINE_LIMIT`), follow (`UNKNOWN_GAUGE`, `MODEL_NOT_FOR_ENGINE`), or sit between others. The Engine Host spec names its codes `ENGINE_LIMIT` and `ENGINE_STOP_TIMEOUT`, so `ENGINE` is the second scope word. A client must not filter codes by a `GAUGE_` prefix. Use `isGaugeCode`.
 - The text `EXTENSION` and the text `MODULE` appear nowhere in a code, not even inside a longer word, because those two names are retired.
 - It never equals a code literal that the scan found at the pinned commit of the fixture.
 - It never changes its name. A test pins the list.
@@ -14,7 +14,7 @@ To add a code, write its test in `test/registry.test.mjs` first, then add one li
 
 ## Scope of the starter set
 
-The set covers manifest, lifecycle, grant, layout, and plan refusals. `GAUGE_TRACES_OWN_STEP` and `GAUGE_AUDIT_FAILED` are the codes of the grants ticket: the other grant refusals reuse `GAUGE_GRANT_MISSING` with a reason. `GAUGE_GRANT_STALE` stays in the registry, but the fake core no longer produces it: an update drops the grants of the old version, so none can be stale. A refusal to hide, remove, or replace a protected Gauge, such as the Gauge manager, reuses `GAUGE_PROTECTED`, with the reason `hidden`, `removed`, or `replaced` when the layout refuses it. `GAUGE_LAYOUT_INVALID` always has a reason, from `packages/gauge-layout`. In v0.9.1 Gauges have layout slots and no routes, so there are no route codes. Later tickets own any further codes.
+The set covers manifest, lifecycle, grant, layout, and plan refusals. `GAUGE_TRACES_OWN_STEP` and `GAUGE_AUDIT_FAILED` are the codes of the grants ticket: the other grant refusals reuse `GAUGE_GRANT_MISSING` with a reason. `GAUGE_GRANT_STALE` stays in the registry, but the fake core no longer produces it: an update drops the grants of the old version, so none can be stale. A refusal to hide, remove, or replace a protected Gauge, such as the Gauge manager, reuses `GAUGE_PROTECTED`, with the reason `hidden`, `removed`, or `replaced` when the layout refuses it. `GAUGE_LAYOUT_INVALID` always has a reason, from `packages/gauge-layout`. In v0.9.1 Gauges have layout slots and no routes, so there are no route codes. The engine session codes (ticket 711) are `ENGINE_NOT_FOUND`, `ENGINE_REQUEST_INVALID` (always with a reason from `packages/engine-sessions`), `MODEL_NOT_FOR_ENGINE`, `ENGINE_LIMIT`, `ENGINE_PAIR_BUSY`, `ENGINE_FOLDER_SHARED`, `ENGINE_START_FAILED`, `ENGINE_SESSION_UNKNOWN`, `ENGINE_SESSION_ENDED`, and `ENGINE_STOP_TIMEOUT`. The plan refusals of a session start or stop reuse `GAUGE_PLAN_NOT_APPROVED` and `GAUGE_PLAN_CHANGED`. The other engine, model, and key codes of the Engine Host spec stay for the tickets that build them. Later tickets own any further codes.
 
 ## The old-literal fixture
 

@@ -7,8 +7,8 @@ import { createHash } from 'node:crypto';
  * literals that exist in the product at the pinned commit of the fixture, and hold each code to the naming rules of `codeNameProblems`.
  *
  * The naming rules (`codeNameProblems`): capitals, digits and single underscores, every word starting with a capital letter, at most 40 characters, the word
- * `GAUGE` as one of the words (it may lead, follow or sit between others, as in `UNKNOWN_GAUGE`), and neither `EXTENSION` nor `MODULE` anywhere in the code,
- * because those two names are retired. Wire identifiers keep the `bowerloom` prefix until the rename, but a code is a bare word, so it carries no prefix.
+ * `GAUGE` or the word `ENGINE` as one of the words (it may lead, follow or sit between others, as in `UNKNOWN_GAUGE` and `MODEL_NOT_FOR_ENGINE`), and neither `EXTENSION`
+ * nor `MODULE` anywhere in the code, because those two names are retired. The Engine Host spec names its codes `ENGINE_LIMIT` and `ENGINE_STOP_TIMEOUT`, so `ENGINE` is the second scope word. Wire identifiers keep the `bowerloom` prefix until the rename, but a code is a bare word, so it carries no prefix.
  *
  * A refusal to hide, remove or replace a protected Gauge, such as the Gauge manager, uses `GAUGE_PROTECTED`, in the layout as well as in the lifecycle.
  */
@@ -38,6 +38,17 @@ const ENTRIES = [
   // Plans
   { code: 'GAUGE_PLAN_NOT_APPROVED', meaning: 'The write needs a plan that the person has approved, and none was approved.' },
   { code: 'GAUGE_PLAN_CHANGED', meaning: 'The plan to run is not the plan the person approved.' },
+  // Engine sessions
+  { code: 'ENGINE_NOT_FOUND', meaning: 'No engine has that id, or the program of the engine is not on this computer.' },
+  { code: 'ENGINE_REQUEST_INVALID', meaning: 'The request for a session is malformed, so no plan was made. The reason says which field.' },
+  { code: 'MODEL_NOT_FOR_ENGINE', meaning: 'The engine cannot take a main-model choice, and the core never picks another model on its own.' },
+  { code: 'ENGINE_LIMIT', meaning: 'The cap on sessions is reached, so no session can start until one ends.' },
+  { code: 'ENGINE_PAIR_BUSY', meaning: 'This engine already has a session in this folder.' },
+  { code: 'ENGINE_FOLDER_SHARED', meaning: 'Another engine runs in this folder, so the start needs a second approval from the person.' },
+  { code: 'ENGINE_START_FAILED', meaning: 'The program of the engine could not be started, so the session failed.' },
+  { code: 'ENGINE_SESSION_UNKNOWN', meaning: 'No session has that id.' },
+  { code: 'ENGINE_SESSION_ENDED', meaning: 'The session has stopped or failed already, so there is nothing to stop.' },
+  { code: 'ENGINE_STOP_TIMEOUT', meaning: 'The engine did not stop in time, so the session stays stopping.' },
 ] as const;
 
 /** A Gauge refusal code. */
@@ -94,7 +105,8 @@ export function codeNameProblems(code: unknown): string[] {
   const problems: string[] = [];
   if (!SHAPE.test(code)) problems.push('a code uses capitals, digits, and underscores only, every word starts with a capital letter, and single underscores join the words');
   if (code.length > MAX_CODE_LENGTH) problems.push(`a code has at most ${MAX_CODE_LENGTH} characters`);
-  if (!code.split('_').includes('GAUGE')) problems.push('a code holds the word GAUGE');
+  const words = code.split('_');
+  if (!words.includes('GAUGE') && !words.includes('ENGINE')) problems.push('a code holds the word GAUGE or the word ENGINE');
   for (const retired of RETIRED_WORDS) if (code.includes(retired)) problems.push(`a code does not hold ${retired} anywhere, because that word is retired`);
   return problems;
 }
