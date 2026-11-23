@@ -76,14 +76,30 @@ test('a run plan lists every session of the job, with what the person approves f
   assert.deepEqual(result.plan, {
     job: 'job-1', title: 'Morning review', shared: false,
     sessions: [
-      { label: 'writer', engine: 'alpha', engineTitle: 'Engine alpha', harness: 'plain-harness', program: '/bin/alpha', folder: '/w/a', model: null, billing: 'engine-plan', variables: ['ALPHA_KEY'], sharedWith: [], task: 'Write the summary.' },
-      { label: 'checker', engine: 'delta', engineTitle: 'Engine delta', harness: 'plain-harness', program: '/bin/delta', folder: '/w/b', model: null, billing: 'local', variables: [], sharedWith: [], task: 'Check it.' },
+      { label: 'writer', engine: 'alpha', engineTitle: 'Engine alpha', harness: 'plain-harness', program: '/bin/alpha', folder: '/w/a', model: null, billing: 'engine-plan', variables: ['ALPHA_KEY'], sharedWith: [], task: 'Write the summary.', requestedFolder: '/w/a', configuredProgram: '/bin/alpha' },
+      { label: 'checker', engine: 'delta', engineTitle: 'Engine delta', harness: 'plain-harness', program: '/bin/delta', folder: '/w/b', model: null, billing: 'local', variables: [], sharedWith: [], task: 'Check it.', requestedFolder: '/w/b', configuredProgram: '/bin/delta' },
     ],
   });
   assert.equal(result.start.length, 2);
   assert.deepEqual(r.host.list(), []);
   assert.equal(r.host.launched, 0);
   assert.deepEqual(r.book.list(), []);
+});
+
+test('a run plan keeps the folder as the job names it and the program as the engine is configured, beside the real folder and the real program', () => {
+  const launcher = manualLauncher();
+  const host = createEngineHost({
+    engines: [{ ...spec('alpha'), program: 'claude' }, spec('beta')], launcher, log: () => undefined, schedule: () => () => undefined, newId: () => 's-1',
+    locate: program => (program === 'claude' ? '/real/bin/claude-1.2' : program),
+    canonical: folder => { const real = folder.startsWith('/link/') ? '/real/one' : folder; return { path: real, key: real }; },
+  });
+  const book = createRunBook({ host, newId: () => 'run-1', log: () => undefined });
+  const job = jobOf([{ label: 'writer', engine: 'alpha', folder: '/link/one' }, { label: 'checker', engine: 'beta', folder: '/real/one' }]);
+  const result = planned(book, job);
+  assert.deepEqual(result.plan.sessions.map(session => [session.label, session.folder, session.requestedFolder, session.program, session.configuredProgram, session.sharedWith]), [
+    ['writer', '/real/one', '/link/one', '/real/bin/claude-1.2', 'claude', ['beta']],
+    ['checker', '/real/one', '/real/one', '/bin/beta', '/bin/beta', ['alpha']],
+  ]);
 });
 
 test('a plan is frozen, and a plan of the same job twice is the same plan', () => {
