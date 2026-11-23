@@ -8,7 +8,7 @@ import {
 import { createSession, report, type FaultEntry, type Session, type SessionFailure } from './session.js';
 import { isTerminal, type SessionState } from './states.js';
 import { escapeText, hasUnsafeChar } from './text.js';
-import { BILLING_SOURCES, KEEP_ENDED_SESSIONS, type Billing, type NotFoundReason, type StartFailedReason } from './vocab.js';
+import { BILLING_SOURCES, KEEP_ENDED_SESSIONS, MAX_START_GROUP, type Billing, type NotFoundReason, type StartFailedReason } from './vocab.js';
 
 export { BILLING_SOURCES };
 export type { Billing };
@@ -26,8 +26,7 @@ const MAX_STOP_TIMEOUT_MS = 600_000;
 const MAX_START_TIMEOUT_MS = 600_000;
 const MAX_KILL_WAIT_MS = 60_000;
 const MAX_ENGINES = 16;
-/** The most sessions that one group start may hold. A run of a job starts its sessions as one group. */
-export const MAX_START_GROUP = 8;
+export { MAX_START_GROUP };
 
 /**
  * What the host knows about one engine. The five built-in adapters of the Engine Host spec are later work, and the fake engines of the tests use this shape.

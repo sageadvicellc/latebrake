@@ -27,3 +27,6 @@ export const isStartFailedReason = (value: unknown): value is StartFailedReason 
 export const KEEP_ENDED_SESSIONS = 256;
 /** The most sessions that a read can give: the largest cap (64) and the ended sessions that are kept. */
 export const MAX_SESSIONS_LISTED = 64 + KEEP_ENDED_SESSIONS;
+
+/** The most sessions that one group start may hold. A run of a job starts its sessions as one group, and a job holds at most this many sessions. */
+export const MAX_START_GROUP = 8;
