@@ -29,6 +29,7 @@
     "packages/gauge-manifest/test/**/*.ts",
     "packages/gauge-layout/test/**/*.ts",
     "packages/engine-sessions/test/**/*.ts",
-    "packages/jobs/test/**/*.ts"
+    "packages/jobs/test/**/*.ts",
+    "packages/relay/test/**/*.ts"
   ]
 }
