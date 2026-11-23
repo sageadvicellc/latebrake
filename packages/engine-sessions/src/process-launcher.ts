@@ -1,57 +1,63 @@
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
-import type { Launched, LaunchSpec, Launcher, StopSignal } from './launcher.js';
+import { MAX_TAIL_MARGIN, STDERR_TAIL_CHARS, type Launched, type LaunchSpec, type Launcher, type StopSignal } from './launcher.js';
+import { escapeText } from './text.js';
 
 /** The longest line a program can hand to the host. The rest of a longer line is dropped, so a program cannot fill memory with one line. */
 export const MAX_LINE_CHARS = 4096;
 
-/** How much of the end of standard error comes with the exit, in characters. */
-export const STDERR_TAIL_CHARS = 2048;
+export { MAX_TAIL_MARGIN, STDERR_TAIL_CHARS };
 
 /**
- * The process groups of the programs that are running now, by the pid of their leader. When this process ends, each is killed, so a core that exits or is stopped leaves no engine in its own group behind.
+ * What every copy of this module shares, held in one slot of the global object, so a second copy (a duplicate package, a bundle and a plugin) reuses the cover of the first instead of counting it as another listener.
+ * The process groups of the programs that are running now are kept by the pid of their leader. When this process ends, each is killed, so a core that exits or is stopped leaves no engine in its own group behind.
  * A core that is killed with SIGKILL cannot do this, and a helper that left the group of its engine is out of reach: those are known limits.
  */
-const liveGroups = new Set<number>();
+interface Shared {
+  readonly liveGroups: Set<number>;
+  exitHook: (() => void) | undefined;
+}
+
+const SLOT = Symbol.for('latebrake.engine-launcher');
+/** The mark on a listener that is the launcher's own. A listener with the mark is not "another listener": whatever else is left is the app's. */
+export const HANDLER_MARK = Symbol.for('latebrake.engine-launcher.handler');
+const globals = globalThis as unknown as Record<symbol, Shared | undefined>;
+const shared: Shared = (globals[SLOT] ??= { liveGroups: new Set<number>(), exitHook: undefined });
+const mark = <T extends () => void>(listener: T): T => { Object.defineProperty(listener, HANDLER_MARK, { value: true }); return listener; };
+const isOurs = (listener: unknown): boolean => typeof listener === 'function' && (listener as unknown as Record<symbol, unknown>)[HANDLER_MARK] === true;
 
 /** Kills every process group that a program of this launcher leads and that is still running. It is synchronous and never throws, so it can run while the process exits. */
 export function killLiveGroups(): void {
-  for (const pid of [...liveGroups]) {
+  for (const pid of [...shared.liveGroups]) {
     try {
       process.kill(-pid, 'SIGKILL');
     } catch {
       // The group is gone, or the platform has no groups.
     }
-    liveGroups.delete(pid);
+    shared.liveGroups.delete(pid);
   }
 }
 
 const COVERED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
-const signalHandlers = new Map<NodeJS.Signals, () => void>();
-let exitHandlerInstalled = false;
 
 /**
- * Installs the handlers that kill the groups when this process exits, and when it gets SIGINT, SIGTERM, SIGHUP, or SIGQUIT. It is called at every launch and installs whatever is missing, so the cover is there for every engine.
- * A signal handler stays installed when something else listens for the signal: the process lives on, and an engine that starts later needs the cover too. When it is the only listener, it removes itself and sends the signal
- * again, so the process ends as it would have without it, and the next launch installs it again.
+ * Installs the exit hook and the signal handlers, whatever of them is missing. It is called at every launch, so the cover is there for every engine, also after something removed it.
+ * The handler is put first in the list of listeners, so it runs before a listener of the app that was registered with `once`, and it still sees that listener.
+ * When the app has a listener of its own for the signal, the signal is the app's: the engines are left to the app's own shutdown (its `killAll`) and to the exit hook, which kills every group when the process ends.
+ * When no listener but ours is left, the handler kills the groups, removes our handlers, and sends the signal again, so the process ends as it would have without us. The next launch installs them again.
  */
 function installHandlers(): void {
-  if (!exitHandlerInstalled) {
-    exitHandlerInstalled = true;
-    process.on('exit', killLiveGroups);
-  }
+  shared.exitHook ??= mark(() => killLiveGroups());
+  if (!process.listeners('exit').some(isOurs)) process.on('exit', shared.exitHook);
   for (const signal of COVERED_SIGNALS) {
-    const existing = signalHandlers.get(signal);
-    if (existing !== undefined && process.listeners(signal).includes(existing)) continue;
-    const handler = (): void => {
+    if (process.listeners(signal).some(isOurs)) continue;
+    const handler = mark((): void => {
+      if (process.listeners(signal).some(listener => !isOurs(listener))) return;
       killLiveGroups();
-      if (process.listenerCount(signal) === 1) {
-        process.removeListener(signal, handler);
-        process.kill(process.pid, signal);
-      }
-    };
-    signalHandlers.set(signal, handler);
-    process.on(signal, handler);
+      for (const own of process.listeners(signal).filter(isOurs)) process.removeListener(signal, own as () => void);
+      process.kill(process.pid, signal);
+    });
+    process.prependListener(signal, handler);
   }
 }
 
@@ -104,9 +110,9 @@ export interface ProcessLauncherOptions {
 
 const toStandardError = (message: string): void => { process.stderr.write(`engine launcher: ${message}\n`); };
 
-/** The last `STDERR_TAIL_CHARS` characters of a text, never starting with the low half of a surrogate pair. */
-function endOf(text: string): string {
-  const tail = text.slice(-STDERR_TAIL_CHARS);
+/** The last `keep` characters of a text, never starting with the low half of a surrogate pair. */
+function endOf(text: string, keep: number): string {
+  const tail = text.slice(-keep);
   const first = tail.charCodeAt(0);
   return first >= 0xdc00 && first <= 0xdfff ? tail.slice(1) : tail;
 }
@@ -121,42 +127,60 @@ export function createProcessLauncher(options: ProcessLauncherOptions = {}): Lau
   const start = options.spawn ?? spawn;
   return {
     launch(spec: LaunchSpec): Launched {
+      const margin = spec.tailMargin ?? 0;
+      if (!Number.isSafeInteger(margin) || margin < 0 || margin > MAX_TAIL_MARGIN) throw new RangeError(`the tail margin is a whole number of characters from 0 to ${MAX_TAIL_MARGIN}`);
+      const keep = STDERR_TAIL_CHARS + margin;
       installHandlers();
       const spawnListeners: (() => void)[] = [], errorListeners: ((error: Error) => void)[] = [], lineListeners: ((line: string) => void)[] = [];
       const exitListeners: ((code: number | null, signal: string | null, stderrTail: string) => void)[] = [];
       const child = start(spec.program, [...spec.args], { cwd: spec.cwd, env: { ...spec.env }, shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       // The group exists from the moment the program is made, and not from the later spawn event, so a process that exits in the same tick still takes the engine with it.
-      if (child.pid !== undefined) liveGroups.add(child.pid);
+      if (child.pid !== undefined) shared.liveGroups.add(child.pid);
+      // A line of the log names the session and the pid, so a person can tell which program a failure is about. The text goes through `escapeText`, since it may hold what the operating system or the program said.
+      const where = `${spec.label === undefined ? '' : `session ${spec.label} `}pid ${String(child.pid)}`;
+      const say = (message: string): void => {
+        const line = escapeText(`${where}: ${message}`);
+        try {
+          log(line);
+        } catch (error) {
+          // A log that throws must not break a signal or a stop: the line goes to standard error instead.
+          process.stderr.write(`engine launcher: ${line}\nengine launcher: the log threw: ${escapeText(error instanceof Error ? error.message : String(error))}\n`);
+        }
+      };
       let spawned = false, groupGone = false, finished = false;
-      const killGroup = (signal: NodeJS.Signals): void => {
-        if (child.pid === undefined || groupGone) return;
+      /** True when the signal was sent, or when there is nothing left to signal (no program, or the group is gone). False when the system refused it: the program may still run. */
+      const killGroup = (signal: NodeJS.Signals): boolean => {
+        if (child.pid === undefined || groupGone) return true;
         try {
           process.kill(-child.pid, signal);
+          return true;
         } catch (error) {
           // ESRCH is the group being gone, and there is nothing left to signal. Any other error means a program may still run, so it is reported.
           const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : '';
-          if (code !== 'ESRCH') log(`could not send ${signal} to the group of the program: ${code === '' ? String(error) : code}`);
+          if (code === 'ESRCH') return true;
+          say(`could not send ${signal} to the group of the program: ${code === '' ? String(error) : code}`);
+          return false;
         }
       };
       const stdout = lineSplitter(line => { for (const listener of lineListeners) listener(line); });
       child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
-      child.stdout?.on('error', error => log(`the output of the program failed: ${error.message}`));
+      child.stdout?.on('error', error => say(`the output of the program failed: ${error.message}`));
       // Standard error is read so that the pipe never fills. No state is read from it. Its last characters are kept for the log of a failed session.
       let stderrTail = '';
       const stderrDecoder = new StringDecoder('utf8');
-      child.stderr?.on('data', (chunk: Buffer) => { stderrTail = endOf(stderrTail + stderrDecoder.write(chunk)); });
-      child.stderr?.on('error', error => log(`the standard error of the program failed: ${error.message}`));
+      child.stderr?.on('data', (chunk: Buffer) => { stderrTail = endOf(stderrTail + stderrDecoder.write(chunk), keep); });
+      child.stderr?.on('error', error => say(`the standard error of the program failed: ${error.message}`));
       child.on('spawn', () => { spawned = true; for (const listener of spawnListeners) listener(); });
       child.on('error', error => {
-        if (!spawned && !finished) { finished = true; if (child.pid !== undefined) liveGroups.delete(child.pid); for (const listener of errorListeners) listener(error); return; }
-        log(`the program reported an error: ${error.message}`);
+        if (!spawned && !finished) { finished = true; if (child.pid !== undefined) shared.liveGroups.delete(child.pid); for (const listener of errorListeners) listener(error); return; }
+        say(`the program reported an error: ${error.message}`);
       });
       let result: { code: number | null; signal: string | null } | undefined;
       const finish = (): void => {
         if (finished || result === undefined) return;
         finished = true;
         stdout.end();
-        stderrTail = endOf(stderrTail + stderrDecoder.end());
+        stderrTail = endOf(stderrTail + stderrDecoder.end(), keep);
         for (const listener of exitListeners) listener(result.code, result.signal, stderrTail);
       };
       child.on('exit', (code, signal) => {
@@ -164,7 +188,7 @@ export function createProcessLauncher(options: ProcessLauncherOptions = {}): Lau
         // Whatever the program left in its group is killed now: the pipes close, and no process is left behind. The group is gone from this moment, so no later signal can reach a group id that was reused.
         killGroup('SIGKILL');
         groupGone = true;
-        if (child.pid !== undefined) liveGroups.delete(child.pid);
+        if (child.pid !== undefined) shared.liveGroups.delete(child.pid);
         const timer = setTimeout(() => { child.stdout?.destroy(); child.stderr?.destroy(); finish(); }, CLOSE_GRACE_MS);
         timer.unref();
         child.once('close', () => { clearTimeout(timer); finish(); });

@@ -29,8 +29,8 @@ export interface ModelChoice {
 const NAME = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const SESSION_ID = /^[a-z0-9][a-z0-9-]*$/;
 const VARIABLE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-/** The plain charset of a provider and a model: letters, digits, and `. _ : / @ + -`. Nothing that a shell, a flag, or a path means. */
-const CHOICE_CHARS = /^[A-Za-z0-9._:/@+-]+$/;
+/** The plain charset of a provider and a model: the first character is a letter or a digit, then letters, digits, and `. _ : / @ + -`. Nothing that a shell, a flag, or a path means. */
+const CHOICE_CHARS = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$/;
 /** The names that make a program load code of the caller's choice, or run a start-up script, or trust another set of certificates, or find its tools elsewhere. */
 const LOADER_PREFIX = /^(?:LD_|DYLD_)/;
 const LOADER_NAMES: ReadonlySet<string> = new Set(['NODE_OPTIONS']);
@@ -79,9 +79,9 @@ function ownData(record: object, key: string): unknown {
   return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
 }
 
-/** A provider or a model: 1 to 128 characters of the plain charset, never starting with a dash (a flag), an equals sign, an at sign, or a plus sign (each of which a tool may read as an option or a file). */
+/** A provider or a model: 1 to 128 characters of the plain charset, starting with a letter or a digit, so it is never a flag, an option, a path, or anything else that a tool may read as more than a name. */
 const choiceText = (value: unknown): value is string =>
-  typeof value === 'string' && value.length >= 1 && value.length <= MAX_CHOICE_LENGTH && CHOICE_CHARS.test(value) && !/^[-=@+]/.test(value);
+  typeof value === 'string' && value.length >= 1 && value.length <= MAX_CHOICE_LENGTH && CHOICE_CHARS.test(value);
 
 /** A model choice: `null` (the engine's own default), or exactly a provider and a model, each a short plain text. `undefined` reads as `null`. */
 export function checkModel(value: unknown): Checked<ModelChoice | null> {

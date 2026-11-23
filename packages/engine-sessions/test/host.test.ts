@@ -6,6 +6,9 @@ import { KEEP_ENDED_SESSIONS, MAX_SESSIONS_LISTED } from '../src/vocab.js';
 import { fakeSignal } from '../src/fixtures.js';
 import type { FaultEntry } from '../src/session.js';
 import { manualLauncher } from './support.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const spec = (id: string, extra: Partial<EngineSpec> = {}): EngineSpec => ({ id, title: `Engine ${id}`, program: `/bin/${id}`, args: ['--flag'], env: [], billing: 'engine-plan', signalOf: fakeSignal, ...extra });
 
@@ -15,8 +18,7 @@ interface Rig {
   readonly faults: FaultEntry[];
 }
 /** A host over the manual launcher. Folders are plain names, and programs are found as they are written. */
-function rig(options: Partial<HostOptions> = {}, engines: readonly EngineSpec[] = [spec('alpha'), spec('beta'), spec('gamma')]): Rig {
-  const launcher = manualLauncher();
+function rig(options: Partial<HostOptions> = {}, engines: readonly EngineSpec[] = [spec('alpha'), spec('beta'), spec('gamma')], launcher: ReturnType<typeof manualLauncher> = manualLauncher()): Rig {
   const faults: FaultEntry[] = [];
   let counter = 0;
   // The start timeout is timed by a schedule that runs nothing, so no test holds a real timer for 30 s. The tests of the timeout pass their own schedule.
@@ -575,7 +577,7 @@ test('the environment is built from the variables the plan lists, from the sourc
 test('the program starts in the folder of the plan, with the arguments of the engine, and nothing else', async () => {
   const r = rig();
   await startOne(r, 'alpha', '/work/one');
-  assert.deepEqual(programOf(r, 0).spec, { program: '/bin/alpha', args: ['--flag'], cwd: '/work/one', env: {} });
+  assert.deepEqual(programOf(r, 0).spec, { program: '/bin/alpha', args: ['--flag'], cwd: '/work/one', env: {}, label: 's-1', tailMargin: 0 });
 });
 
 test('killAll sends the kill signal to every program that is still running, and waits for it to go', async () => {
@@ -589,7 +591,7 @@ test('killAll sends the kill signal to every program that is still running, and 
   assert.deepEqual(programOf(r, 1).signals, ['kill']);
   programOf(r, 1).exit(null, 'SIGKILL');
   await killing;
-  assert.deepEqual(r.host.list().map(item => item.state), ['stopped', 'failed']);
+  assert.deepEqual(r.host.list().map(item => item.state), ['stopped', 'stopped'], 'a program that the host ends is stopped, not crashed');
 });
 
 test('two starts of the same plan in a row: the second finds the pair busy and starts nothing', () => {
@@ -637,12 +639,13 @@ test('a session that a claim failed still counts for the pair, the cap, and the 
   assert.equal(stateOf(r, id), 'failed');
   assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_PAIR_BUSY' });
   assert.deepEqual(r.host.planStart(request('beta', '/work/two')), { ok: false, code: 'ENGINE_LIMIT' });
-  assert.deepEqual(r.host.planStop(id), { ok: false, code: 'ENGINE_SESSION_ENDED' });
+  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'alpha', folder: '/work/one', force: true } }, 'its process lives, so the stop is a kill again');
   const reads = [r.host.list(), r.host.list('alpha'), r.host.get(id)];
   assert.equal(reads.length, 3, 'a read does not throw');
   programOf(r, 0).exit(null, 'SIGKILL');
   assert.ok(r.host.planStart(request('alpha', '/work/one')).ok, 'the process has gone, so the pair is free');
   assert.equal(stateOf(r, id), 'failed');
+  assert.deepEqual(r.host.planStop(id), { ok: false, code: 'ENGINE_SESSION_ENDED' });
 });
 
 test('a failed session always has a cause, so a session is failed if and only if it has a failure', async () => {
@@ -832,7 +835,7 @@ test('launched counts a program only when the launcher is asked: a modelArgs tha
   assert.ok(planned.ok);
   const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
   assert.ok(begun.ok);
-  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'other' });
+  assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason: 'adapter_error' });
   assert.equal(r.host.launched, 0);
   assert.equal(r.launcher.programs.length, 0);
 });
@@ -995,7 +998,8 @@ test('the ENGINE_NOT_FOUND reasons tell an unknown engine, a missing program, an
 
 test('a start that fails with an error code gives the reason that the code means, and the free text stays in the log', async () => {
   const cases: readonly (readonly [string | undefined, string])[] = [
-    ['ENOENT', 'program_missing'], ['EACCES', 'not_executable'], ['EPERM', 'not_executable'], ['ENOEXEC', 'not_executable'], ['ENOTDIR', 'folder_unusable'], ['EMFILE', 'other'], ['E2BIG', 'other'], [undefined, 'other'],
+    ['ENOENT', 'program_missing'], ['EACCES', 'not_executable'], ['EPERM', 'not_executable'], ['ENOEXEC', 'not_executable'], ['ENOTDIR', 'folder_unusable'],
+    ['EMFILE', 'resource_limit'], ['ENFILE', 'resource_limit'], ['E2BIG', 'resource_limit'], ['EAGAIN', 'resource_limit'], ['ENOMEM', 'resource_limit'], ['EIO', 'other'], [undefined, 'other'],
   ];
   for (const [code, reason] of cases) {
     const r = rig();
@@ -1118,4 +1122,218 @@ test('the default timers are unref-ed: a pending start timeout or stop wait neve
   assert.equal(count(), before, 'and neither does the stop wait');
   launcher.programs[0]?.exit(0);
   await stopping.settled;
+});
+
+// Round three
+
+const KEY = 'sk-live-A1b2C3d4A1b2C3d4A1b2C3d4A1b2C3d4';
+/** True when any 8 characters in a row of the secret are in the text. */
+const leaks = (secret: string, text: string): boolean => { for (let at = 0; at + 8 <= secret.length; at += 1) if (text.includes(secret.slice(at, at + 8))) return true; return false; };
+const loggedTail = (message: string): string => message.slice(message.indexOf('standard error: "') + 'standard error: "'.length, -1);
+
+test('the standard error is redacted before it is cut, so a value that straddles the cut leaves no part of itself in the log', async () => {
+  const r = rig({ environment: () => ({ API_KEY: KEY }) }, [spec('alpha', { env: ['API_KEY'] })]);
+  await startOne(r, 'alpha', '/work/one');
+  assert.equal(programOf(r, 0).spec.tailMargin, KEY.length - 1, 'the launcher is asked to keep the longest value minus one characters before the tail');
+  programOf(r, 0).line('state:running');
+  const straddling = `${'a'.repeat(20)}${KEY}${'b'.repeat(2048 + KEY.length - 1 - 20 - KEY.length)}`;
+  assert.equal(straddling.length, 2048 + KEY.length - 1);
+  programOf(r, 0).exit(1, null, straddling);
+  const message = r.faults[0]?.message ?? '';
+  assert.equal(leaks(KEY, message), false);
+  assert.match(message, /\[redacted\]/);
+  assert.equal(loggedTail(message).length <= 2048, true);
+  assert.equal(loggedTail(message).endsWith('bbbb'), true);
+});
+
+test('a part of a value that the launcher cut at the start of its buffer is never logged', async () => {
+  const r = rig({ environment: () => ({ API_KEY: KEY }) }, [spec('alpha', { env: ['API_KEY'] })]);
+  await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:running');
+  programOf(r, 0).exit(1, null, `${KEY.slice(5)}${'c'.repeat(2048 + KEY.length - 1 - (KEY.length - 5))}`);
+  assert.equal(leaks(KEY, r.faults[0]?.message ?? ''), false);
+});
+
+test('a host with no value to hide asks for no margin, and keeps the end of the standard error as it is', async () => {
+  const r = rig();
+  await startOne(r, 'alpha', '/work/one');
+  assert.equal(programOf(r, 0).spec.tailMargin, 0);
+  programOf(r, 0).line('state:running');
+  programOf(r, 0).exit(1, null, `${'x'.repeat(2048)}`);
+  assert.equal(loggedTail(r.faults[0]?.message ?? '').length, 2048);
+});
+
+test('every log line of a session is redacted, whatever made it: an adapter that throws, a claim, a failed start, and the escaped form of a value', async () => {
+  const env = { API_KEY: KEY, ODD: 'pa\\ss-word-1' };
+  const make = (signalOf: EngineSpec['signalOf']) => rig({ environment: () => env }, [spec('alpha', { env: ['API_KEY', 'ODD'], signalOf })]);
+  const throwing = make(line => { if (line === 'boom') throw new Error(`bad key ${KEY} and pa\\ss-word-1`); return null; });
+  await startOne(throwing, 'alpha', '/work/one');
+  programOf(throwing, 0).line('boom');
+  assert.equal(throwing.faults.length, 1);
+  assert.equal(leaks(KEY, throwing.faults[0]?.message ?? ''), false);
+  assert.equal((throwing.faults[0]?.message ?? '').includes('ss-word-1'), false, 'the escaped form of a value is cut out too');
+  assert.match(throwing.faults[0]?.message ?? '', /bad key \[redacted\] and \[redacted\]/);
+  const claiming = make(line => (line === 'give' ? KEY : null));
+  await startOne(claiming, 'alpha', '/work/one');
+  programOf(claiming, 0).line('give');
+  assert.equal(claiming.faults.length, 1);
+  assert.equal(claiming.faults[0]?.to, '[redacted]');
+  assert.equal(leaks(KEY, claiming.faults[0]?.message ?? ''), false);
+  const failing = make(() => null);
+  const planned = failing.host.planStart(request('alpha', '/work/one'));
+  assert.ok(planned.ok);
+  const begun = failing.host.beginStart(planned.plan, { sharedApproved: false });
+  assert.ok(begun.ok);
+  programOf(failing, 0).fail(`spawn failed for ${KEY}`, 'EIO');
+  await begun.settled;
+  assert.equal(failing.faults.length, 1);
+  assert.equal(leaks(KEY, failing.faults[0]?.message ?? ''), false);
+  assert.match(failing.faults[0]?.message ?? '', /spawn failed for \[redacted\]/);
+});
+
+test('a log that throws is reported on standard error, and the report is redacted too', async () => {
+  const write = process.stderr.write;
+  const seen: string[] = [];
+  const r = rig({ environment: () => ({ API_KEY: KEY }), log: () => { throw new Error('the log broke'); } }, [spec('alpha', { env: ['API_KEY'], signalOf: line => { if (line === 'boom') throw new Error(`bad key ${KEY}`); return null; } })]);
+  await startOne(r, 'alpha', '/work/one');
+  process.stderr.write = ((chunk: string | Uint8Array) => { seen.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try {
+    programOf(r, 0).line('boom');
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.equal(seen.some(line => line.includes('the log broke')), true);
+  assert.equal(seen.some(line => leaks(KEY, line)), false);
+});
+
+test('the values of the variables named HOME, PATH, PWD, TMPDIR, SHELL, USER, LANG, and LOGNAME are not hidden, so a path in a crash stays readable', async () => {
+  const env = { HOME: '/home/hanna-long-name', PATH: '/usr/local/bin:/usr/bin', PWD: '/work/one', TMPDIR: '/var/tmp-long', SHELL: '/bin/zsh-long', USER: 'hannalong', LANG: 'en_US.UTF-8', LOGNAME: 'hannalong', TOKEN: 'tok-123456789' };
+  const r = rig({ environment: () => env }, [spec('alpha', { env: Object.keys(env) })]);
+  await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:running');
+  programOf(r, 0).exit(1, null, 'cannot read /home/hanna-long-name/x as hannalong with tok-123456789');
+  assert.match(r.faults[0]?.message ?? '', /"cannot read \/home\/hanna-long-name\/x as hannalong with \[redacted\]"/);
+});
+
+test('a failed session whose kill did not land keeps its place, and a stop of it is a kill again, which frees the place when the program goes', async () => {
+  let lands = false;
+  const r = rig({ stopTimeoutMs: 5000 }, undefined, manualLauncher({ signalLands: () => lands }));
+  const id = await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:stopped');
+  assert.equal(stateOf(r, id), 'failed');
+  assert.deepEqual(programOf(r, 0).signals, ['kill']);
+  assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_PAIR_BUSY' });
+  assert.deepEqual(r.host.planStop(id), { ok: true, plan: { session: id, engine: 'alpha', folder: '/work/one', force: true } });
+  lands = true;
+  const begun = r.host.beginStop(id);
+  assert.ok(begun.ok);
+  assert.deepEqual(programOf(r, 0).signals, ['kill', 'kill']);
+  programOf(r, 0).exit(null, 'SIGKILL');
+  const settled = await begun.settled;
+  assert.ok(settled.ok);
+  assert.equal(stateOf(r, id), 'failed', 'the session stays failed: its cause is not rewritten');
+  assert.deepEqual(r.host.planStop(id), { ok: false, code: 'ENGINE_SESSION_ENDED' });
+  assert.ok(r.host.planStart(request('alpha', '/work/one')).ok, 'the place is free');
+});
+
+test('a stop of a failed session that still does not go gives ENGINE_STOP_TIMEOUT, and may be tried again', async () => {
+  const r = rig({ stopTimeoutMs: 20 }, undefined, manualLauncher({ signalLands: () => false }));
+  const id = await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:stopped');
+  assert.deepEqual(await r.host.stop(id), { ok: false, code: 'ENGINE_STOP_TIMEOUT' });
+  assert.deepEqual(await r.host.stop(id), { ok: false, code: 'ENGINE_STOP_TIMEOUT' });
+  assert.deepEqual(programOf(r, 0).signals, ['kill', 'kill', 'kill']);
+});
+
+test('EACCES is folder_unusable when the working folder cannot be searched, and not_executable when it can', async t => {
+  if (process.getuid?.() === 0) return t.skip('root searches every folder');
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'host-eacces-')));
+  const dir = path.join(root, 'work');
+  fs.mkdirSync(dir);
+  try {
+    for (const [mode, reason] of [[0o700, 'not_executable'], [0o000, 'folder_unusable']] as const) {
+      const r = rig();
+      const planned = r.host.planStart(request('alpha', dir));
+      assert.ok(planned.ok);
+      const begun = r.host.beginStart(planned.plan, { sharedApproved: false });
+      assert.ok(begun.ok);
+      fs.chmodSync(dir, mode);
+      programOf(r, 0).fail('spawn EACCES', 'EACCES');
+      assert.deepEqual(await begun.settled, { ok: false, code: 'ENGINE_START_FAILED', reason });
+      fs.chmodSync(dir, 0o700);
+    }
+  } finally {
+    fs.chmodSync(dir, 0o700);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a PATH folder that cannot be searched does not make a program that is nowhere into one that cannot run, and a folder that cannot be read is logged with its code', async t => {
+  if (process.getuid?.() === 0) return t.skip('root searches every folder');
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'host-path-')));
+  const blocked = path.join(root, 'blocked'), plain = path.join(root, 'plain'), good = path.join(root, 'good'), work = path.join(root, 'work');
+  for (const dir of [blocked, plain, good, work, path.join(blocked, 'sub')]) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(plain, 'tool'), '#!/bin/sh\n', { mode: 0o644 });
+  fs.writeFileSync(path.join(good, 'tool'), '#!/bin/sh\n', { mode: 0o755 });
+  fs.chmodSync(blocked, 0o000);
+  const saved = process.env['PATH'];
+  const faults: FaultEntry[] = [];
+  const make = (program: string) => createEngineHost({ engines: [spec('alpha', { program })], launcher: manualLauncher(), log: entry => faults.push(entry) });
+  try {
+    process.env['PATH'] = blocked;
+    assert.deepEqual(make('no-such-program-xyz').planStart(request('alpha', work)), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
+    process.env['PATH'] = `${blocked}${path.delimiter}${plain}`;
+    assert.deepEqual(make('tool').planStart(request('alpha', work)), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_not_executable' });
+    process.env['PATH'] = `${blocked}${path.delimiter}${good}`;
+    const found = make('tool').planStart(request('alpha', work));
+    assert.ok(found.ok);
+    assert.equal(found.plan.program, path.join(good, 'tool'));
+    const unreadable = make('tool').planStart(request('alpha', path.join(blocked, 'sub')));
+    assert.deepEqual(unreadable, { ok: false, code: 'ENGINE_REQUEST_INVALID', reason: 'folder' });
+    assert.equal(faults.some(entry => /EACCES/.test(entry.message)), true, 'the code is in the log');
+  } finally {
+    if (saved === undefined) delete process.env['PATH']; else process.env['PATH'] = saved;
+    fs.chmodSync(blocked, 0o700);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a session that ends late is not pruned when it ends: the oldest session to have ended goes first, whatever the order they began in', async () => {
+  const r = rig({ cap: 4 });
+  const early = await startOne(r, 'beta', '/work/early');
+  const ids: string[] = [];
+  for (let index = 0; index < 300; index += 1) {
+    ids.push(await startOne(r, 'alpha', `/work/${index}`));
+    programOf(r, 1 + index).line('state:running');
+    programOf(r, 1 + index).exit(0);
+  }
+  programOf(r, 0).line('state:running');
+  programOf(r, 0).exit(0);
+  assert.equal(r.host.get(early)?.state, 'stopped', 'it ended last, so it is the newest ended session');
+  assert.equal(r.host.list().length, 256);
+  assert.equal(r.host.get(ids[44] ?? ''), undefined, 'the oldest ended session was dropped to make room');
+  assert.equal(r.host.get(ids[45] ?? '')?.state, 'stopped');
+  assert.equal(r.host.list()[0]?.id, early, 'a read lists the sessions in the order they began');
+});
+
+test('killAll ends a running session as stopped by the host, not crashed, and logs the end of its standard error', async () => {
+  const r = rig();
+  const id = await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:running');
+  const killing = r.host.killAll();
+  assert.equal(stateOf(r, id), 'stopping');
+  assert.deepEqual(programOf(r, 0).signals, ['kill']);
+  programOf(r, 0).exit(null, 'SIGKILL', 'last words');
+  assert.equal(await killing, 0);
+  assert.equal(stateOf(r, id), 'stopped');
+  assert.equal(r.host.get(id)?.failure, null);
+  assert.equal(r.faults.length, 1);
+  assert.match(r.faults[0]?.message ?? '', /after the host killed it; the end of its standard error: "last words"/);
+});
+
+test('killAll logs each session whose program was still alive when the wait ended', async () => {
+  const r = rig({ killWaitMs: 20 });
+  const id = await startOne(r, 'alpha', '/work/one');
+  assert.equal(await r.host.killAll(), 1);
+  assert.equal(r.faults.some(entry => entry.session === id && /still running/.test(entry.message)), true);
 });

@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Launched, Launcher } from './launcher.js';
+import { MAX_TAIL_MARGIN, STDERR_TAIL_CHARS, type Launched, type Launcher } from './launcher.js';
 import {
   MAX_NAME_LENGTH, MAX_VARIABLES, checkEngineId, checkFolder, checkModel, checkSessionId, checkVariables, isLoaderVariable, isRefusedVariable, type ModelChoice, type RequestReason,
 } from './request.js';
@@ -170,14 +170,20 @@ interface Tracked {
   exited: boolean;
   /** Cancels the start timeout. Safe to call again. */
   cancelStart: () => void;
-  /** The values of the variables that the program was given, 6 characters or more, longest first. They are cut out of any text of the program before it is logged. */
-  readonly secrets: readonly string[];
-  /** True once the host has sent the kill signal to a session that it failed itself, so the end of its standard error is worth a log line. */
+  /** The values of the variables that the program was given (6 characters or more, not the paths), and their escaped forms, longest first. They are cut out of any text of the program before it is logged. Emptied when the program has gone. */
+  readonly secrets: string[];
+  /** How many characters of standard error the launcher keeps before the tail: the longest value minus one, so a value that crosses the cut is whole in the buffer. */
+  readonly tailMargin: number;
+  /** Writes an entry to the log with every secret cut out of it. The session and the host use only this. It never throws. */
+  readonly sink: (entry: FaultEntry) => void;
+  /** True once the host has sent the kill signal to a session that it failed or ended itself, so the end of its standard error is worth a log line. */
   killedByHost: boolean;
   readonly endWaiters: (() => void)[];
 }
 
 const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** The error codes of the system that mean it is out of something: argument space, open files, processes, or memory. */
+const RESOURCE_CODES: ReadonlySet<string> = new Set(['E2BIG', 'EMFILE', 'ENFILE', 'EAGAIN', 'ENOMEM']);
 
 const sorted = (names: Iterable<string>): string[] => [...new Set(names)].sort();
 const refusal = (code: Extract<HostRefusal, { readonly reason?: undefined }>['code']): HostRefusal => ({ ok: false, code });
@@ -187,6 +193,32 @@ const startFailed = (reason: StartFailedReason): HostRefusal => ({ ok: false, co
 const errorCode = (error: unknown): string | undefined => (typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' ? error.code : undefined);
 const REDACTED = '[redacted]';
 const MIN_SECRET_LENGTH = 6;
+/** The variables whose values are paths and plain names. They are not hidden, so the path in a crash stays readable. Redaction is a match of the value, as it is, and of its escaped form: no encoded form, and nothing under 6 characters. */
+const OPEN_VARIABLES: ReadonlySet<string> = new Set(['HOME', 'PATH', 'PWD', 'TMPDIR', 'SHELL', 'USER', 'LANG', 'LOGNAME']);
+
+/**
+ * Cuts every secret out of a text, longest first, and gives the text. When `dropBefore` is given, everything that came from before that index of the text is left out of the answer as well,
+ * and a secret that crosses the index is left out whole. It is how the part of a secret that the launcher cut at the start of its buffer, and a secret that crosses the start of the tail, never reach the log.
+ */
+function redactText(secrets: readonly string[], text: string, dropBefore = 0): string {
+  if (secrets.length === 0) return dropBefore > 0 ? text.slice(dropBefore) : text;
+  let out = '', index = 0, cut = dropBefore > 0 ? -1 : 0;
+  while (index < text.length) {
+    if (cut === -1 && index >= dropBefore) cut = out.length;
+    const found = secrets.find(secret => text.startsWith(secret, index));
+    if (found === undefined) {
+      out += text[index];
+      index += 1;
+    } else {
+      // A secret that crosses the index stays in the answer as its mark, and the part before it goes.
+      if (cut === -1 && index < dropBefore && index + found.length > dropBefore) cut = out.length;
+      out += REDACTED;
+      index += found.length;
+    }
+  }
+  if (cut === -1) cut = out.length;
+  return out.slice(cut);
+}
 const invalid = (reason: RequestReason): HostRefusal => ({ ok: false, code: 'ENGINE_REQUEST_INVALID', reason });
 
 /** Reads one own data property of a request without running a getter. */
@@ -197,19 +229,28 @@ function field(request: object, key: string): unknown {
 
 /**
  * The default `locate`: a path must be an executable file, and a bare name is searched in the folders of PATH. The answer is the real path. A file that is not there, or that is not a file, is missing.
- * A file that is there and cannot run, a file that cannot be read for lack of permission, and a folder that cannot be searched are `not_executable`, and never missing.
+ * A file that is there and cannot run, or cannot be read for lack of permission, is `not_executable`, and never missing. A given absolute path whose folders cannot be searched is `not_executable` too, since the program was named.
+ * A folder of PATH that cannot be searched is skipped: it says nothing about a program that may be nowhere.
  */
 function locateProgram(program: string): string | { readonly error: 'missing' | 'not_executable' } {
-  const candidates = path.isAbsolute(program) ? [program] : (process.env['PATH'] ?? '').split(path.delimiter).filter(dir => dir !== '').map(dir => path.join(dir, program));
+  const absolute = path.isAbsolute(program);
+  const candidates = absolute ? [program] : (process.env['PATH'] ?? '').split(path.delimiter).filter(dir => dir !== '').map(dir => path.join(dir, program));
   let blocked = false;
   for (const candidate of candidates) {
+    let isFile = false;
     try {
-      if (!fs.statSync(candidate).isFile()) continue;
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.realpathSync.native(candidate);
+      isFile = fs.statSync(candidate).isFile();
     } catch (error) {
       const code = errorCode(error);
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') blocked = true;
+      if (absolute && code !== 'ENOENT' && code !== 'ENOTDIR') blocked = true;
+      continue;
+    }
+    if (!isFile) continue;
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.realpathSync.native(candidate);
+    } catch {
+      blocked = true;
     }
   }
   return { error: blocked ? 'not_executable' : 'missing' };
@@ -220,13 +261,26 @@ function locateProgram(program: string): string | { readonly error: 'missing' | 
  * so an inode above 2^53 is not rounded into another folder's number. There is a window between `realpath` and `stat`, in which the folder can be replaced: the plan is made again when the start begins, which reads both again,
  * and a folder that changed in between gives another key and so a changed plan. The window cannot be closed without opening the folder, which a core with no right to read it must not do.
  */
-function canonicalFolder(folder: string): { readonly path: string; readonly key: string } | undefined {
+function canonicalFolder(folder: string, onError: (code: string) => void): { readonly path: string; readonly key: string } | undefined {
   try {
     const real = fs.realpathSync.native(folder);
     const stat = fs.statSync(real, { bigint: true });
     return stat.isDirectory() ? { path: real, key: `${stat.dev}:${stat.ino}` } : undefined;
-  } catch {
+  } catch (error) {
+    // A folder that is not there is the plain answer. Any other code (a folder that cannot be searched, a loop of links) is a reason that a person looks for in the log.
+    const code = errorCode(error);
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') onError(code ?? 'unknown');
     return undefined;
+  }
+}
+
+/** True when the system says that the folder cannot be searched. It is how a start that failed with EACCES is told from a program that cannot run. */
+function folderBlocked(folder: string): boolean {
+  try {
+    fs.accessSync(folder, fs.constants.X_OK);
+    return false;
+  } catch (error) {
+    return errorCode(error) === 'EACCES';
   }
 }
 
@@ -267,7 +321,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
   const launcher = options.launcher;
   const environment = options.environment ?? ((): Readonly<Record<string, string | undefined>> => process.env);
   const locate = options.locate ?? locateProgram;
-  const canonical = options.canonical ?? canonicalFolder;
+  const canonical = options.canonical ?? ((folder: string) => canonicalFolder(folder, code => report(log, { session: '', from: 'detected', to: 'detected', message: `engine host: could not read the folder ${escapeText(folder)}: ${escapeText(code)}` })));
   const log = options.log;
   const schedule = options.schedule ?? ((run: () => void, ms: number): (() => void) => { const timer = setTimeout(run, ms); timer.unref(); return () => clearTimeout(timer); });
   const newId = options.newId ?? ((): string => `s-${randomBytes(8).toString('hex')}`);
@@ -284,19 +338,26 @@ export function createEngineHost(options: HostOptions): EngineHost {
   /** The sessions that hold a place: those that have not ended, and those that have ended in state while their process still lives, because a process that lives is a process that runs. */
   const active = (): Tracked[] => [...records.values()].filter(record => !isTerminal(record.session.state) || !record.exited);
 
+  /** The ids of the sessions that have ended and whose program has gone, in the order they ended. */
+  const ended: string[] = [];
   /**
    * The host keeps every session that is live and the newest 256 that have ended, so its memory and the list that a read gives stay bounded. A session that has ended but whose program has not been seen to go is not ended
-   * for this purpose. The oldest ended session is dropped first.
+   * for this purpose. The one that ended first is dropped first, whatever order the sessions began in: a session that lived long and ended last is the newest.
    */
   const prune = (): void => {
-    const ended = [...records.values()].filter(record => isTerminal(record.session.state) && record.exited);
-    for (const record of ended.slice(0, Math.max(0, ended.length - KEEP_ENDED_SESSIONS))) records.delete(record.session.id);
+    while (ended.length > KEEP_ENDED_SESSIONS) {
+      const oldest = ended.shift();
+      if (oldest !== undefined) records.delete(oldest);
+    }
   };
 
   const endOf = (record: Tracked): void => {
+    const first = !record.exited;
     record.exited = true;
+    // The program has gone, so nothing more of it is logged and no value needs to be hidden any longer.
+    record.secrets.length = 0;
     for (const resolve of record.endWaiters.splice(0)) resolve();
-    prune();
+    if (first) { ended.push(record.session.id); prune(); }
   };
   /** Resolves true when the program has gone, and false when `ms` milliseconds pass first. */
   const waitForEnd = (record: Tracked, ms: number): Promise<boolean> => new Promise(resolve => {
@@ -315,11 +376,19 @@ export function createEngineHost(options: HostOptions): EngineHost {
     record.handle?.signal('kill');
   };
 
-  /** Cuts the value of every variable that was passed to the program out of a text of the program, before it is logged. */
-  const redact = (record: Tracked, text: string): string => record.secrets.reduce((cleaned, secret) => cleaned.split(secret).join(REDACTED), text);
+  /**
+   * The end of the standard error of a program, as it is logged: every secret cut out of it first, and only then cut to its last 2,048 characters, so a value that crosses the cut leaves no part of itself.
+   * When the launcher's buffer was full, the first characters of it (the margin) may hold the end of a value that began before the buffer, so they are left out.
+   */
+  const tailOf = (record: Tracked, raw: string): string => {
+    const full = record.tailMargin > 0 && raw.length >= STDERR_TAIL_CHARS + record.tailMargin;
+    const text = redactText(record.secrets, raw, full ? record.tailMargin : 0).slice(-STDERR_TAIL_CHARS);
+    const first = text.charCodeAt(0);
+    return first >= 0xdc00 && first <= 0xdfff ? text.slice(1) : text;
+  };
 
   const say = (record: Tracked, from: SessionState, message: string): void => {
-    report(log, { session: record.session.id, from, to: record.session.state, message: `engine session ${record.session.id}: ${message}` });
+    record.sink({ session: record.session.id, from, to: record.session.state, message: `engine session ${record.session.id}: ${message}` });
   };
 
   /** A fault of the adapter: the first throw fails the session, and the program is killed. The message of the throw is escaped before it is logged. */
@@ -365,19 +434,22 @@ export function createEngineHost(options: HostOptions): EngineHost {
   function onExited(record: Tracked, code: number | null, signal: string | null, stderrTail: string): void {
     const before = record.session.state;
     record.cancelStart();
-    const tail = stderrTail === '' ? '' : `; the end of its standard error: "${escapeText(redact(record, stderrTail))}"`;
+    const readable = tailOf(record, stderrTail);
+    const tail = readable === '' ? '' : `; the end of its standard error: "${escapeText(readable)}"`;
+    const killed = record.killedByHost && tail !== '';
+    const oddStop = before === 'stopping' && !(code === 0 && signal === null) && signal !== 'SIGTERM' && signal !== 'SIGKILL';
     if (before === 'starting') record.session.fail('start_failed');
     else if (before === 'running' || before === 'waiting') {
       if (code === 0 && signal === null) record.session.move('stopped');
       else record.session.fail('crashed');
     } else if (before === 'stopping') {
       record.session.move('stopped');
-      // A stop ends the program with the signal it sent, or with a clean exit. Any other end is logged, and the session is stopped all the same.
-      if (!(code === 0 && signal === null) && signal !== 'SIGTERM' && signal !== 'SIGKILL') say(record, before, `${describeEnd(code, signal)} while it was stopping${tail}`);
     }
     if (record.session.state === 'failed' && (before === 'starting' || before === 'running' || before === 'waiting')) say(record, before, `${describeEnd(code, signal)}${tail}`);
-    // A session that the host failed or killed itself has its end logged too, with what the program last wrote, so the cause is not lost.
-    else if (before === 'failed' && record.killedByHost && tail !== '') say(record, before, `${describeEnd(code, signal)} after the host killed it${tail}`);
+    // A session that the host failed, killed, or stopped itself has its end logged too, with what the program last wrote, so the cause is not lost.
+    else if (killed && (before === 'failed' || before === 'stopped' || before === 'stopping')) say(record, before, `${describeEnd(code, signal)} after the host killed it${tail}`);
+    // A stop ends the program with the signal it sent, or with a clean exit. Any other end is logged, and the session is stopped all the same.
+    else if (oddStop) say(record, before, `${describeEnd(code, signal)} while it was stopping${tail}`);
     endOf(record);
   }
 
@@ -459,9 +531,13 @@ export function createEngineHost(options: HostOptions): EngineHost {
     const id = newId();
     if (!checkSessionId(id).ok || records.has(id)) throw new Error('engine host: newId gave a session id that is malformed or already used');
     const env = environmentOf(verified.variables);
-    const secrets = [...new Set(Object.values(env).filter(value => value.length >= MIN_SECRET_LENGTH))].sort((a, b) => b.length - a.length);
+    // The values to hide: those of 6 characters or more, except the paths and plain names. A value that holds a character that the log escapes is hidden in its escaped form too, longest first.
+    const values = Object.entries(env).filter(([name, value]) => !OPEN_VARIABLES.has(name) && value.length >= MIN_SECRET_LENGTH).map(([, value]) => value);
+    const secrets = [...new Set(values.flatMap(value => [value, escapeText(value)]))].sort((a, b) => b.length - a.length);
+    const tailMargin = Math.min(MAX_TAIL_MARGIN, Math.max(0, ...values.map(value => value.length - 1)));
+    const sink = (entry: FaultEntry): void => report(log, { ...entry, to: redactText(secrets, entry.to), message: redactText(secrets, entry.message) });
     const record: Tracked = {
-      session: createSession(id, log), engine: spec, folder: verified.folder, key: fresh.key, model: verified.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [], secrets, killedByHost: false,
+      session: createSession(id, sink), engine: spec, folder: verified.folder, key: fresh.key, model: verified.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [], secrets, tailMargin, sink, killedByHost: false,
     };
     records.set(id, record);
     // The program was found when the start was planned, and the session is checked ready, so the session walks detected, ready, starting before the program runs.
@@ -472,7 +548,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
        * The program could not be started, or a step after it was made threw. The cause goes to the log with the session id and the real state, and the person sees a closed reason. A session that is stopping stays stopped,
        * since the person asked for that. When no program was made, nothing can live and the place is freed. When one was made, it is killed, and the place is held until its exit is seen.
        */
-      const failed = (error: unknown, programMade: boolean): void => {
+      const failed = (error: unknown, programMade: boolean, forced?: StartFailedReason): void => {
         const from = record.session.state;
         const code = errorCode(error);
         record.cancelStart();
@@ -482,16 +558,26 @@ export function createEngineHost(options: HostOptions): EngineHost {
         killIfRunning(record);
         if (!programMade) endOf(record);
         const folderThere = ((): boolean => { try { return canonical(verified.folder) !== undefined; } catch { return false; } })();
-        const reason: StartFailedReason = code === 'ENOENT' ? (folderThere ? 'program_missing' : 'folder_unusable')
+        // The reason is a closed word taken from the error code. A folder that cannot be searched also gives EACCES, so the folder is looked at before the program is blamed.
+        const reason: StartFailedReason = forced ?? (code === 'ENOENT' ? (folderThere ? 'program_missing' : 'folder_unusable')
           : code === 'ENOTDIR' ? 'folder_unusable'
-          : code === 'EACCES' || code === 'EPERM' || code === 'ENOEXEC' ? 'not_executable'
-          : 'other';
+          : code === 'EACCES' ? (folderBlocked(verified.folder) ? 'folder_unusable' : 'not_executable')
+          : code === 'EPERM' || code === 'ENOEXEC' ? 'not_executable'
+          : code !== undefined && RESOURCE_CODES.has(code) ? 'resource_limit'
+          : 'other');
         resolve(startFailed(reason));
       };
+      let args: string[];
       try {
-        const args = [...spec.args, ...(verified.model !== null && spec.modelArgs !== undefined ? spec.modelArgs(verified.model) : [])];
+        args = [...spec.args, ...(verified.model !== null && spec.modelArgs !== undefined ? spec.modelArgs(verified.model) : [])];
+      } catch (error) {
+        // The adapter threw while it built the arguments: no program was asked for.
+        failed(error, false, 'adapter_error');
+        return;
+      }
+      try {
         launched += 1;
-        const handle = launcher.launch({ program: verified.program, args, cwd: verified.folder, env });
+        const handle = launcher.launch({ program: verified.program, args, cwd: verified.folder, env, label: id, tailMargin });
         record.handle = handle;
         // The exit is registered first, so that whatever throws after this, the exit of the program is seen and its place is freed only then.
         handle.onExit((code, signal, stderrTail) => onExited(record, code, signal, stderrTail));
@@ -517,8 +603,9 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!id.ok) return invalid(id.reason);
     const record = records.get(id.value);
     if (!record) return refusal('ENGINE_SESSION_UNKNOWN');
-    if (isTerminal(record.session.state)) return refusal('ENGINE_SESSION_ENDED');
-    return { ok: true, plan: Object.freeze({ session: id.value, engine: record.engine.id, folder: record.folder, force: record.session.state === 'stopping' }) };
+    // A session that has ended but whose program has not been seen to go still holds its place, and its kill may have been refused. A stop of it is the kill again, and it is a forced stop.
+    if (isTerminal(record.session.state) && record.exited) return refusal('ENGINE_SESSION_ENDED');
+    return { ok: true, plan: Object.freeze({ session: id.value, engine: record.engine.id, folder: record.folder, force: record.session.state === 'stopping' || isTerminal(record.session.state) }) };
   }
 
   function beginStop(sessionId: unknown): BegunStop | HostRefusal {
@@ -528,6 +615,10 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!record) throw new Error('engine host: a session that was planned is gone');
     const state = record.session.state;
     if (state === 'stopping') {
+      record.handle?.signal('kill');
+    } else if (isTerminal(state)) {
+      // Ended, but the program has not gone: the first kill did not land. The state is not rewritten, and the place is freed when the exit is seen.
+      record.killedByHost = true;
       record.handle?.signal('kill');
     } else if (state === 'starting' || state === 'running' || state === 'waiting') {
       record.cancelStart();
@@ -555,9 +646,20 @@ export function createEngineHost(options: HostOptions): EngineHost {
     async killAll() {
       closed = true;
       const running = [...records.values()].filter(record => !record.exited);
-      for (const record of running) record.handle?.signal('kill');
+      for (const record of running) {
+        // A program that the host ends is stopped, not crashed: the session moves to stopping first, so the exit makes it stopped.
+        const state = record.session.state;
+        if (state === 'starting' || state === 'running' || state === 'waiting') {
+          record.cancelStart();
+          record.session.move('stopping');
+        }
+        record.killedByHost = true;
+        record.handle?.signal('kill');
+      }
       const gone = await Promise.all(running.map(record => waitForEnd(record, killWaitMs)));
-      return gone.filter(went => !went).length;
+      const survivors = running.filter((_record, index) => gone[index] === false);
+      for (const record of survivors) say(record, record.session.state, `the program was still running ${killWaitMs} ms after the kill signal`);
+      return survivors.length;
     },
     get launched() { return launched; },
     get stopTimeoutMs() { return stopTimeoutMs; },

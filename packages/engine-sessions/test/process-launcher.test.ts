@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { CLOSE_GRACE_MS, MAX_LINE_CHARS, STDERR_TAIL_CHARS, createProcessLauncher, killLiveGroups, lineSplitter } from '../src/process-launcher.js';
+import { CLOSE_GRACE_MS, HANDLER_MARK, MAX_LINE_CHARS, STDERR_TAIL_CHARS, createProcessLauncher, killLiveGroups, lineSplitter } from '../src/process-launcher.js';
 import { FAKE_ENGINE_PROGRAM, type FakeStep } from '../src/fixtures.js';
 import type { Launched } from '../src/launcher.js';
 import { assertNoDescendants, assertNoLeaks, killWithTag, leavesBehind, liveDescendants, liveWithTag } from './leaks.js';
@@ -342,20 +342,152 @@ test('after the program has gone no signal is sent to its group at all, so a reu
   }
 });
 
-test('the signal handlers are installed again at a later launch when something has removed them', async () => {
+const isOurs = (listener: unknown): boolean => typeof listener === 'function' && (listener as unknown as Record<symbol, unknown>)[HANDLER_MARK] === true;
+
+test('the signal handlers and the exit hook are installed again at a later launch when something has removed them, and the test puts back only what it removed', async () => {
   const tag = newTag();
-  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
-  const saved = signals.map(signal => [signal, process.listeners(signal)] as const);
+  const events = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT', 'exit'] as const;
+  const emitter = process as NodeJS.EventEmitter;
+  const removed: (readonly [(typeof events)[number], (...args: unknown[]) => void])[] = [];
   try {
     await run([{ say: 'x' }], tag);
-    for (const signal of signals) process.removeAllListeners(signal);
-    await run([{ say: 'y' }], newTag());
-    for (const signal of signals) assert.equal(process.listenerCount(signal), 1, signal);
-  } finally {
-    for (const [signal, listeners] of saved) {
-      process.removeAllListeners(signal);
-      for (const listener of listeners) process.on(signal, listener as () => void);
+    for (const event of events) {
+      assert.equal(emitter.listeners(event).filter(isOurs).length, 1, `${event} has the cover after a launch`);
+      for (const listener of emitter.listeners(event).filter(isOurs)) { emitter.removeListener(event, listener as () => void); removed.push([event, listener as () => void]); }
     }
+    await run([{ say: 'y' }], newTag());
+    for (const event of events) assert.equal(emitter.listeners(event).filter(isOurs).length, 1, `${event} was installed again`);
+  } finally {
+    for (const event of events) for (const listener of emitter.listeners(event).filter(isOurs)) emitter.removeListener(event, listener as () => void);
+    for (const [event, listener] of removed) emitter.on(event, listener);
+    await assertNoLeaks(tag);
+  }
+});
+
+test('two copies of the module share one cover: one handler for each signal, and each copy can kill the engines of the other', async () => {
+  const a = (await import(`${new URL('../src/process-launcher.js', import.meta.url).href}?copy-a`)) as typeof import('../src/process-launcher.js');
+  const b = (await import(`${new URL('../src/process-launcher.js', import.meta.url).href}?copy-b`)) as typeof import('../src/process-launcher.js');
+  assert.notEqual(a.createProcessLauncher, b.createProcessLauncher, 'two real copies');
+  const tag = newTag();
+  const launch = (launcher: ReturnType<typeof createProcessLauncher>, suffix: string): { ended: () => boolean } => {
+    const handle = launcher.launch({ program: process.execPath, args: [FAKE_ENGINE_PROGRAM, '--tag', `${tag}${suffix}`, '--script', JSON.stringify([{ hold: true }])], cwd: process.cwd(), env: {} });
+    let gone = false;
+    handle.onExit(() => { gone = true; });
+    return { ended: () => gone };
+  };
+  try {
+    const first = launch(a.createProcessLauncher(), '-a');
+    const second = launch(b.createProcessLauncher(), '-b');
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const) assert.equal(process.listeners(signal).filter(isOurs).length, 1, signal);
+    assert.equal(process.listeners('exit').filter(isOurs).length, 1);
+    await waitFor(() => liveWithTag(tag).length === 2, 'both programs');
+    b.killLiveGroups();
+    await waitFor(() => first.ended() && second.ended(), 'both exits');
+  } finally {
+    killLiveGroups();
+    await assertNoLeaks(tag);
+  }
+});
+
+test('signal tells whether it landed: true when the signal was sent and when the group is gone, false when the system refused it', async () => {
+  const tag = newTag();
+  const kill = process.kill;
+  const launcher = createProcessLauncher({ log: () => undefined });
+  const handle = launcher.launch({ program: process.execPath, args: [FAKE_ENGINE_PROGRAM, '--tag', tag, '--script', JSON.stringify([{ hold: true }])], cwd: process.cwd(), env: {} });
+  let ended = false, spawned = false;
+  handle.onExit(() => { ended = true; });
+  handle.onSpawn(() => { spawned = true; });
+  try {
+    await waitFor(() => spawned, 'the spawn');
+    const refuse = (code: string) => { process.kill = ((pid: number, signal?: string | number) => { if (pid < 0) throw Object.assign(new Error(`kill ${code}`), { code }); return kill(pid, signal); }) as typeof process.kill; };
+    refuse('EPERM');
+    assert.equal(handle.signal('kill'), false);
+    refuse('ESRCH');
+    assert.equal(handle.signal('kill'), true, 'a group that is gone has nothing left to signal');
+    process.kill = kill;
+    assert.equal(handle.signal('kill'), true);
+    await waitFor(() => ended, 'the exit');
+    assert.equal(handle.signal('kill'), true, 'after the exit there is nothing to signal');
+  } finally {
+    process.kill = kill;
+    handle.signal('kill');
+    await assertNoLeaks(tag);
+  }
+});
+
+test('a log line about a signal or a pipe carries the label of the session and the pid, and is escaped', async () => {
+  const tag = newTag();
+  const kill = process.kill;
+  const messages: string[] = [];
+  let child: ReturnType<typeof spawn> | undefined;
+  const launcher = createProcessLauncher({ log: message => messages.push(message), spawn: ((...args: Parameters<typeof spawn>) => { child = spawn(...args); return child; }) as typeof spawn });
+  const handle = launcher.launch({ program: process.execPath, args: [FAKE_ENGINE_PROGRAM, '--tag', tag, '--script', JSON.stringify([{ hold: true }])], cwd: process.cwd(), env: {}, label: 's-1234' });
+  let ended = false, spawned = false;
+  handle.onExit(() => { ended = true; });
+  handle.onSpawn(() => { spawned = true; });
+  try {
+    await waitFor(() => spawned, 'the spawn');
+    assert.ok(child !== undefined);
+    process.kill = ((pid: number, signal?: string | number) => { if (pid < 0) throw Object.assign(new Error('kill EPERM'), { code: 'EPERM' }); return kill(pid, signal); }) as typeof process.kill;
+    handle.signal('term');
+    process.kill = kill;
+    child.stdout?.emit('error', new Error('out\nforged line'));
+    assert.equal(messages.length, 2);
+    for (const message of messages) {
+      assert.match(message, new RegExp(`^session s-1234 pid ${child.pid}: `));
+      assert.equal(message.includes('\n'), false, 'no raw line break');
+    }
+    assert.match(messages[0] ?? '', /could not send SIGTERM to the group of the program: EPERM/);
+    assert.match(messages[1] ?? '', /the output of the program failed: out.+forged line/);
+  } finally {
+    process.kill = kill;
+    handle.signal('kill');
+    await waitFor(() => ended, 'the exit');
+    await assertNoLeaks(tag);
+  }
+});
+
+test('a log that throws never escapes signal, and the launcher reports it on standard error instead', async () => {
+  const tag = newTag();
+  const kill = process.kill;
+  const write = process.stderr.write;
+  const seen: string[] = [];
+  const launcher = createProcessLauncher({ log: () => { throw new Error('the log broke'); } });
+  const handle = launcher.launch({ program: process.execPath, args: [FAKE_ENGINE_PROGRAM, '--tag', tag, '--script', JSON.stringify([{ hold: true }])], cwd: process.cwd(), env: {} });
+  let ended = false, spawned = false;
+  handle.onExit(() => { ended = true; });
+  handle.onSpawn(() => { spawned = true; });
+  try {
+    await waitFor(() => spawned, 'the spawn');
+    process.kill = ((pid: number, signal?: string | number) => { if (pid < 0) throw Object.assign(new Error('kill EPERM'), { code: 'EPERM' }); return kill(pid, signal); }) as typeof process.kill;
+    process.stderr.write = ((chunk: string | Uint8Array) => { seen.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    assert.doesNotThrow(() => handle.signal('term'));
+    process.kill = kill;
+    process.stderr.write = write;
+    assert.equal(seen.some(line => line.includes('the log broke')), true);
+  } finally {
+    process.kill = kill;
+    process.stderr.write = write;
+    handle.signal('kill');
+    await waitFor(() => ended, 'the exit');
+    await assertNoLeaks(tag);
+  }
+});
+
+test('the launcher keeps a margin of standard error before the tail when it is asked, so the caller can cut after it has redacted', async () => {
+  const tag = newTag();
+  try {
+    const exit = (margin: number | undefined) => new Promise<string>((resolve, reject) => {
+      const handle = createProcessLauncher().launch({ program: process.execPath, args: [FAKE_ENGINE_PROGRAM, '--tag', tag, '--script', JSON.stringify([{ stderr: `${'x'.repeat(5000)}END` }])], cwd: process.cwd(), env: {}, ...(margin === undefined ? {} : { tailMargin: margin }) });
+      handle.onExit((_code, _signal, tail) => resolve(tail));
+      handle.onError(reject);
+    });
+    assert.equal((await exit(undefined)).length, 2048);
+    assert.equal((await exit(0)).length, 2048);
+    assert.equal((await exit(39)).length, 2048 + 39);
+    assert.equal((await exit(39)).endsWith('xxxEND'), true);
+    for (const bad of [-1, 1.5, Number.NaN, 65537]) assert.throws(() => createProcessLauncher().launch({ program: process.execPath, args: [], cwd: process.cwd(), env: {}, tailMargin: bad }), RangeError, String(bad));
+  } finally {
     await assertNoLeaks(tag);
   }
 });
@@ -375,7 +507,10 @@ test('a failure of a pipe, and an error of the program after it started, go to t
     child.stdout?.emit('error', new Error('out broke'));
     child.stderr?.emit('error', new Error('err broke'));
     child.emit('error', new Error('program broke'));
-    assert.deepEqual(messages, ['the output of the program failed: out broke', 'the standard error of the program failed: err broke', 'the program reported an error: program broke']);
+    assert.equal(messages.length, 3);
+    assert.match(messages[0] ?? '', /^pid \d+: the output of the program failed: out broke$/);
+    assert.match(messages[1] ?? '', /^pid \d+: the standard error of the program failed: err broke$/);
+    assert.match(messages[2] ?? '', /^pid \d+: the program reported an error: program broke$/);
   } finally {
     handle.signal('kill');
     await waitFor(() => ended, 'the exit');

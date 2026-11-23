@@ -43,9 +43,9 @@ test('a model choice is null, or exactly a provider and a model, each a short pl
   refused.forEach((value, index) => assert.deepEqual(checkModel(value), bad('model'), `refused value ${index}`));
 });
 
-test('a model choice uses a plain charset: letters, digits, and . _ : / @ + - only, and it never starts with a dash or an equals sign', () => {
+test('a model choice uses a plain charset: letters, digits, and . _ : / @ + - only, and its first character is a letter or a digit', () => {
   for (const model of ['gpt-4.1', 'claude-sonnet-4-5', 'org/model:tag@v1+x', 'A_b.c', 'a'.repeat(128), '9']) assert.deepEqual(checkModel({ provider: 'p', model }), ok({ provider: 'p', model }), model);
-  for (const bad of ['-x', '=x', '@x', '+x', '@org/model', '+1', '--model', ' x', 'x ', 'a b', "a'b", 'a#b', 'a%b', 'a&b', 'a*b', 'a?b', 'a~b', 'a<b', 'a>b', 'a(b', 'a,b', 'a!b', 'a{b', 'a[b']) {
+  for (const bad of ['-x', '=x', '@x', '+x', '/x', '.x', ':x', '_x', '.hidden', '/abs/path', ':1', '@org/model', '+1', '--model', ' x', 'x ', 'a b', "a'b", 'a#b', 'a%b', 'a&b', 'a*b', 'a?b', 'a~b', 'a<b', 'a>b', 'a(b', 'a,b', 'a!b', 'a{b', 'a[b']) {
     assert.deepEqual(checkModel({ provider: 'p', model: bad }), bad_('model'), bad);
     assert.deepEqual(checkModel({ provider: bad, model: 'm' }), bad_('model'), `provider ${bad}`);
   }

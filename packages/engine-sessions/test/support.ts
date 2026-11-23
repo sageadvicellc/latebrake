@@ -53,7 +53,8 @@ export interface ManualProgram {
 }
 
 /** A launcher that starts no process. It gives a `ManualProgram` for each launch, for tests of the state changes. */
-export function manualLauncher(options: { readonly throwOnLaunch?: boolean; readonly throwOnListen?: boolean } = {}): Launcher & { readonly programs: readonly ManualProgram[] } {
+/** `signalLands` says whether a signal reaches the program: true when it does, false when the system refuses it. True by default. */
+export function manualLauncher(options: { readonly throwOnLaunch?: boolean; readonly throwOnListen?: boolean; readonly signalLands?: () => boolean } = {}): Launcher & { readonly programs: readonly ManualProgram[] } {
   const programs: ManualProgram[] = [];
   return {
     programs,
@@ -74,7 +75,7 @@ export function manualLauncher(options: { readonly throwOnLaunch?: boolean; read
         onError: listener => { listeners.error.push(listener); },
         onLine: listener => { if (options.throwOnListen === true) throw new Error('the listener broke'); listeners.line.push(listener); },
         onExit: listener => { listeners.exit.push(listener); },
-        signal: kind => { signals.push(kind); },
+        signal: kind => { signals.push(kind); return options.signalLands?.() ?? true; },
       };
     },
   };
