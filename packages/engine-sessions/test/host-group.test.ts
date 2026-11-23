@@ -262,3 +262,30 @@ test('a member of a group that is not a start plan is a bug of the caller, and t
   assert.equal(r.launcher.programs.length, 0);
   assert.deepEqual(r.host.list(), []);
 });
+
+test('a member whose start executor throws never becomes an unhandled rejection: the host handles the answer of every member', async () => {
+  const inner = manualLauncher();
+  const launcher: Launcher = {
+    launch(launchSpec: LaunchSpec): Launched {
+      const handle = inner.launch(launchSpec);
+      // The listener for the spawn throws, and so does the kill signal that the cleanup then sends: the throw comes out of the executor of the start.
+      return { ...handle, onSpawn: () => { throw new Error('the listener broke'); }, signal: () => { throw new Error('the signal failed'); } };
+    },
+  };
+  let counter = 0;
+  const host = createEngineHost({ engines: ['alpha'].map(spec), launcher, locate: program => program, canonical: folder => ({ path: folder, key: folder }), log: () => undefined, newId: () => `s-${(counter += 1)}`, schedule: () => () => undefined });
+  let unhandled = 0;
+  const listener = (): void => { unhandled += 1; };
+  process.on('unhandledRejection', listener);
+  try {
+    const group = host.beginStartGroup(planned(host, [asked('alpha', '/a')]), { sharedApproved: false });
+    assert.ok(group.ok);
+    // The answer of the member is a promise that rejects, and this caller never reads it. It must not crash the process.
+    assert.equal(host.get('s-1')?.state, 'failed');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await new Promise<void>(resolve => setImmediate(resolve));
+  } finally {
+    process.off('unhandledRejection', listener);
+  }
+  assert.equal(unhandled, 0);
+});

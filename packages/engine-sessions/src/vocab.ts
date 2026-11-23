@@ -1,6 +1,9 @@
 /** Where a session's tokens are billed. A provider key joins when the keys and spend work is built: a spec that names it is refused when the host is made. */
 export const BILLING_SOURCES = Object.freeze(['engine-plan', 'local'] as const);
 export type Billing = (typeof BILLING_SOURCES)[number];
+const BILLING_SET: ReadonlySet<string> = new Set(BILLING_SOURCES);
+/** True when the value is one of the billing sources. */
+export const isBilling = (value: unknown): value is Billing => typeof value === 'string' && BILLING_SET.has(value);
 
 /**
  * Why an engine was not found, as a closed set, with `ENGINE_NOT_FOUND`. `engine`: no engine of the host has the id. `program_missing`: the program of the engine is not on this computer (or its path is not one that a person

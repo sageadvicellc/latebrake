@@ -8,7 +8,7 @@ import {
 import { createSession, report, type FaultEntry, type Session, type SessionFailure } from './session.js';
 import { isTerminal, type SessionState } from './states.js';
 import { escapeText, hasUnsafeChar } from './text.js';
-import { BILLING_SOURCES, KEEP_ENDED_SESSIONS, MAX_START_GROUP, type Billing, type NotFoundReason, type StartFailedReason } from './vocab.js';
+import { BILLING_SOURCES, KEEP_ENDED_SESSIONS, MAX_START_GROUP, isBilling, type Billing, type NotFoundReason, type StartFailedReason } from './vocab.js';
 
 export { BILLING_SOURCES };
 export type { Billing };
@@ -691,6 +691,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
         failed(error, record.handle !== undefined);
       }
     });
+    // The answer of the spawn is a promise that a caller may never read. If the start executor threw, it rejects, and an unread rejection would crash the process, so a handler is attached here. A caller that reads it still sees the rejection.
+    settled.catch(() => undefined);
     return { ok: true, session: id, settled, started };
   }
 
@@ -729,9 +731,9 @@ export function createEngineHost(options: HostOptions): EngineHost {
     const texts = (item: unknown): string[] => { const list = readList(item, MAX_VARIABLES); return list !== undefined && list.every((entry): entry is string => typeof entry === 'string') ? list : bad(); };
     const engine = own('engine'), title = own('title'), program = own('program'), folder = own('folder'), billing = own('billing'), model = checkModel(own('model'));
     if (typeof engine !== 'string' || typeof title !== 'string' || typeof program !== 'string' || typeof folder !== 'string' || !model.ok || own('model') === undefined) return bad();
-    if (typeof billing !== 'string' || !(BILLING_SOURCES as readonly string[]).includes(billing)) return bad();
+    if (!isBilling(billing)) return bad();
     return Object.freeze({
-      engine, title, program, folder, model: model.value, billing: billing as Billing, variables: Object.freeze(texts(own('variables'))), sharedWith: Object.freeze(texts(own('sharedWith'))),
+      engine, title, program, folder, model: model.value, billing, variables: Object.freeze(texts(own('variables'))), sharedWith: Object.freeze(texts(own('sharedWith'))),
     });
   }
 
