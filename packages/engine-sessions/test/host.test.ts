@@ -1,7 +1,7 @@
 // The host, with a launcher that starts no process: each event of a program is made by the test, so every state change is exact. The tests with real processes are in `host-process.test.ts`.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_SESSION_CAP, DEFAULT_STOP_TIMEOUT_MS, createEngineHost, type EngineHost, type EngineSpec, type HostOptions } from '../src/host.js';
+import { DEFAULT_SESSION_CAP, DEFAULT_STOP_TIMEOUT_MS, StalePlanError, createEngineHost, type EngineHost, type EngineSpec, type HostOptions } from '../src/host.js';
 import { KEEP_ENDED_SESSIONS, MAX_SESSIONS_LISTED } from '../src/vocab.js';
 import { fakeSignal } from '../src/fixtures.js';
 import type { FaultEntry } from '../src/session.js';
@@ -118,9 +118,28 @@ test('a group member that is read from a caller needs the folder and the program
   }
 });
 
-test('a program that is configured with a hidden or separator character is not offered, as a real path with one is not', () => {
-  const r = rig({ locate: () => '/bin/alpha' }, [spec('alpha', { program: '/bin/al\u2028pha' })]);
+test('a folder that changes between the plan and the begin is a stale plan, with a class of its own, and nothing starts', () => {
+  // The first read of the folder gives one real folder, and every later read gives another: a link that was swapped between the two reads.
+  let reads = 0;
+  const r = rig({ canonical: () => { reads += 1; const real = reads === 1 ? '/real/one' : '/real/two'; return { path: real, key: real }; } });
+  const planned = r.host.planStart(request('alpha', '/link/one'));
+  assert.ok(planned.ok);
+  assert.throws(() => r.host.beginStart(planned.plan, { sharedApproved: false }), error => error instanceof StalePlanError && /does not match the state now/.test(error.message));
+  assert.equal(r.host.launched, 0);
+  reads = 0;
+  const group = r.host.planStartGroup([request('alpha', '/link/one')]);
+  assert.ok(group.ok);
+  assert.throws(() => r.host.beginStartGroup(group.plans, { sharedApproved: false }), error => error instanceof StalePlanError && /do not match the state now/.test(error.message));
+  assert.equal(r.host.launched, 0);
+  // A plan that is a bug of the caller (a malformed plan) is not a stale plan: it is the plain error that it was.
+  assert.throws(() => r.host.beginStartGroup([{ nothing: true } as never], { sharedApproved: false }), error => error instanceof TypeError && !(error instanceof StalePlanError));
+});
+
+test('a program that is configured with a hidden or separator character is logged once for the person, with the engine, and never in a refusal', () => {
+  const r = rig({ locate: () => '/bin/alpha' }, [spec('alpha', { program: '/bin/al pha' })]);
   assert.deepEqual(r.host.planStart(request('alpha', '/work/one')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
+  assert.deepEqual(r.host.planStart(request('alpha', '/work/two')), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'program_missing' });
+  assert.deepEqual(r.faults.map(entry => entry.message), ['engine host: the program of the engine alpha is configured with a control, format, or separator character: /bin/al\\u{2028}pha']);
 });
 
 

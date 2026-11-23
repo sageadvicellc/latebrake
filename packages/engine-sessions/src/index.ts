@@ -6,7 +6,7 @@ export type { FaultEntry, MoveResult, Session, SessionFailure } from './session.
 export { MAX_CHOICE_LENGTH, MAX_FOLDER_LENGTH, MAX_LIST_LENGTH, MAX_NAME_LENGTH, MAX_VARIABLES, MAX_VARIABLE_LENGTH, REQUEST_REASONS, checkEngineId, checkFolder, checkModel, checkSessionId, checkVariables, isLoaderVariable, isRefusedVariable, isRequestReason, readList } from './request.js';
 export type { Checked, ModelChoice, RequestReason } from './request.js';
 export { BILLING_SOURCES, KEEP_ENDED_SESSIONS, MAX_SESSIONS_LISTED, NOT_FOUND_REASONS, START_FAILED_REASONS, isBilling, isNotFoundReason, isStartFailedReason } from './vocab.js';
-export { DEFAULT_KILL_WAIT_MS, DEFAULT_SESSION_CAP, DEFAULT_START_TIMEOUT_MS, DEFAULT_STOP_TIMEOUT_MS, MAX_START_GROUP, createEngineHost } from './host.js';
+export { DEFAULT_KILL_WAIT_MS, DEFAULT_SESSION_CAP, DEFAULT_START_TIMEOUT_MS, DEFAULT_STOP_TIMEOUT_MS, MAX_START_GROUP, StalePlanError, createEngineHost } from './host.js';
 export type { Billing, NotFoundReason, StartFailedReason } from './vocab.js';
 export type { BegunGroup, BegunStart, BegunStop, GroupRefusal, EngineHost, EngineSpec, HostOptions, HostRefusal, SessionInfo, StartPlanContent, StopPlanContent } from './host.js';
 export type { Launched, LaunchSpec, Launcher, StopSignal } from './launcher.js';

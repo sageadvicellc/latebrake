@@ -10,6 +10,17 @@ import { isTerminal, type SessionState } from './states.js';
 import { escapeText, hasUnsafeChar } from './text.js';
 import { BILLING_SOURCES, KEEP_ENDED_SESSIONS, MAX_START_GROUP, isBilling, type Billing, type NotFoundReason, type StartFailedReason } from './vocab.js';
 
+/**
+ * The error of a begin whose plan no longer matches the state: the host planned again, and the answer was another plan. The core plans again in the same tick, so this happens only when the world moves between its read
+ * and the host's: a link that was swapped for another folder between the two reads of it. No session was made and nothing started. A core turns it into a changed plan. Any other mistake of a caller is a plain error.
+ */
+export class StalePlanError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StalePlanError';
+  }
+}
+
 export { BILLING_SOURCES };
 export type { Billing };
 
@@ -552,8 +563,12 @@ export function createEngineHost(options: HostOptions): EngineHost {
     }
     const program = located;
     // A program whose path holds a control or separator character is not offered to the person: the plan shows the real path as it is.
-    // The program as the engine is configured is shown to a Gauge, so it is held to the same rule.
-    if (hasUnsafeChar(program) || hasUnsafeChar(spec.program)) return notFound('program_missing');
+    if (hasUnsafeChar(program)) return notFound('program_missing');
+    // The program as the engine is configured is shown to a Gauge, so it is held to the same rule. It is a mistake of the configuration, so the person finds it in the log, once for each engine.
+    if (hasUnsafeChar(spec.program)) {
+      logOnce(`configured\u0000${spec.id}`, `the program of the engine ${spec.id} is configured with a control, format, or separator character: ${escapeText(spec.program)}`);
+      return notFound('program_missing');
+    }
     const real = canonical(folder.value);
     if (real === undefined || !checkFolder(real.path).ok) return invalid('folder');
     if (typeof real.key !== 'string' || real.key === '') throw new Error('engine host: canonical gave a folder with no key');
@@ -603,7 +618,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!fresh.ok) return fresh;
     const verified = fresh.plan;
     // The core plans again from live state, in the same tick, before it calls this. A plan that differs here is a bug in the caller, so it throws.
-    if (JSON.stringify(verified) !== JSON.stringify(plan)) throw new Error('engine host: the plan does not match the state now, so the core must plan again before it begins a start');
+    if (JSON.stringify(verified) !== JSON.stringify(plan)) throw new StalePlanError('engine host: the plan does not match the state now, so the core must plan again before it begins a start');
     // Only the value true is the second approval: a truthy value of another kind is not.
     if (verified.sharedWith.length > 0 && sharedApproved !== true) return refusal('ENGINE_FOLDER_SHARED');
     return startVerified(verified, fresh.key);
@@ -778,7 +793,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     const fresh = planGroup(given.map(requestOf));
     if (!fresh.ok) return fresh;
     // The caller plans again in the same tick, before it calls this. Plans that differ here, or that come in another order, are a bug in the caller, so it throws.
-    if (JSON.stringify(fresh.plans) !== JSON.stringify(given)) throw new Error('engine host: the plans do not match the state now, so the core must plan again before it begins a group');
+    if (JSON.stringify(fresh.plans) !== JSON.stringify(given)) throw new StalePlanError('engine host: the plans do not match the state now, so the core must plan again before it begins a group');
     const unapproved = fresh.plans.findIndex(plan => plan.sharedWith.length > 0);
     if (unapproved !== -1 && sharedApproved !== true) return { ok: false, code: 'ENGINE_FOLDER_SHARED', index: unapproved };
     const members: BegunStart[] = [];
