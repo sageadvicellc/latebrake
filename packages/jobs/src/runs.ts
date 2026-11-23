@@ -3,7 +3,11 @@ import type { EngineHost, GroupRefusal, HostRefusal, StartPlanContent } from '..
 import type { ModelChoice } from '../../engine-sessions/src/request.js';
 import type { SessionState } from '../../engine-sessions/src/states.js';
 import type { Billing } from '../../engine-sessions/src/vocab.js';
+import { escapeText } from '../../engine-sessions/src/text.js';
+import { isRunId } from './ids.js';
 import type { Job } from './store.js';
+
+export { isRunId };
 
 /**
  * The run book. A run is one execution of a job: a group of sessions that start from one plan. The book plans a run from a job, begins every session of it as one group of the Engine Host, reads a run as a
@@ -76,6 +80,8 @@ export interface RunBookOptions {
   readonly host: EngineHost;
   /** Makes a run id. `run-` and sixteen hexadecimal characters by default. A bad or repeated id is a bug, and throws before any session starts. */
   readonly newId?: () => string;
+  /** Receives a line about an undo that could not stop a session, with every value escaped. Standard error by default. A log that throws never stops an outcome. */
+  readonly log?: (message: string) => void;
 }
 
 export interface RunBook {
@@ -105,12 +111,20 @@ interface Recorded {
   readonly members: readonly Member[];
 }
 
-const RUN_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const sortedUnique = (names: Iterable<string>): string[] => [...new Set(names)].sort();
 
 export function createRunBook(options: RunBookOptions): RunBook {
   const host = options.host;
   const newId = options.newId ?? ((): string => `run-${randomBytes(8).toString('hex')}`);
+  const log = options.log ?? ((message: string): void => { process.stderr.write(`${message}\n`); });
+  /** Writes one line to the log. A log that throws is reported on standard error, and never reaches the caller. Every value is escaped by the caller of this. */
+  const say = (message: string): void => {
+    try {
+      log(message);
+    } catch (error) {
+      process.stderr.write(`run book: the log threw: ${escapeText(error instanceof Error ? error.message : String(error))}\n`);
+    }
+  };
   /** Every run that has begun and that the host still keeps a session of, in the order they began. A Map, so an id such as `__proto__` is only a key. */
   const runs = new Map<string, Recorded>();
 
@@ -127,18 +141,24 @@ export function createRunBook(options: RunBookOptions): RunBook {
     sessions: Object.freeze(run.members.map((member): RunSessionView => Object.freeze({ label: member.label, engine: member.engine, session: member.session, state: host.get(member.session)?.state ?? 'forgotten' }))),
   });
 
-  /** Stops a session of an undone run, and asks again with the kill signal when the first stop times out. True when the session has gone or was gone already. */
-  async function undo(session: string): Promise<boolean> {
+  /** Stops a session of an undone run, and asks again with the kill signal when the first stop times out. True when the session has gone or was gone already. A session that stays is logged, with the cause. */
+  async function undo(run: string, session: string): Promise<boolean> {
+    const where = `the stop of session ${escapeText(session)} for the run ${escapeText(run)}`;
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const stopped = await host.stop(session);
         if (stopped.ok) return true;
         // A session that has ended and gone, or that the host no longer holds, needs nothing more.
         if (stopped.code === 'ENGINE_SESSION_ENDED' || stopped.code === 'ENGINE_SESSION_UNKNOWN') return true;
-        if (stopped.code !== 'ENGINE_STOP_TIMEOUT') return false;
+        if (stopped.code !== 'ENGINE_STOP_TIMEOUT') {
+          say(`run book: ${where} was refused: ${escapeText(stopped.code)}`);
+          return false;
+        }
       }
-    } catch {
+      say(`run book: session ${escapeText(session)} of the run ${escapeText(run)} did not go in time, also after the kill signal`);
+    } catch (error) {
       // A host that throws did not stop the session. The undo says so, and `settled` still resolves.
+      say(`run book: ${where} threw: ${escapeText(error instanceof Error ? error.message : String(error))}`);
     }
     return false;
   }
@@ -148,7 +168,7 @@ export function createRunBook(options: RunBookOptions): RunBook {
     const failed = results.find((result): result is HostRefusal => !result.ok);
     if (failed === undefined) return { ok: true, run };
     // One session did not start, so no session of the run is left running: the person approved a run, and a part of it is not one.
-    const undone = await Promise.all(members.map(member => undo(member.session)));
+    const undone = await Promise.all(members.map(member => undo(run, member.session)));
     return undone.every(done => done) ? failed : { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED' };
   }
 
@@ -174,7 +194,7 @@ export function createRunBook(options: RunBookOptions): RunBook {
       prune();
       // The id is made before any session starts, so an id that throws or is bad leaves nothing running.
       const id = newId();
-      if (typeof id !== 'string' || !RUN_ID.test(id) || runs.has(id)) throw new Error('run book: newId gave a run id that is malformed or already used');
+      if (!isRunId(id) || runs.has(id)) throw new Error('run book: newId gave a run id that is malformed or already used');
       const group = host.beginStartGroup(planned.start, approvals);
       if (!group.ok) return group;
       runs.set(id, {

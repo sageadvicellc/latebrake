@@ -49,6 +49,17 @@ test('the store holds at most 64 jobs, and a full store refuses with GAUGE_JOB_L
   assert.deepEqual(store.create(make('Fits now')), { ok: true, id: `job-${MAX_JOBS + 1}` });
 });
 
+test('the store says when it is full, and a delete makes room', () => {
+  const store = createJobStore({ cap: 2, newId: counter() });
+  assert.equal(store.full, false);
+  store.create(make('A'));
+  assert.equal(store.full, false);
+  store.create(make('B'));
+  assert.equal(store.full, true);
+  store.remove('job-1');
+  assert.equal(store.full, false);
+});
+
 test('the cap can be lowered, and it is a whole number from 1 to 64', () => {
   const store = createJobStore({ cap: 2, newId: counter() });
   store.create(make('A'));

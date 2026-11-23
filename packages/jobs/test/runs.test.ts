@@ -422,6 +422,44 @@ test('a plan with a different number of sessions than the host plans is a bug of
   assert.equal(r.launcher.programs.length, 0);
 });
 
+/** A run book over a scripted stop, with a log that collects its lines. */
+async function loggedUndo(answers: readonly { readonly ok: boolean; readonly code?: string }[], log: (message: string) => void, stop?: () => never) {
+  const s = scriptedStop(answers);
+  const host: EngineHost = stop === undefined ? s.host : { ...s.host, stop };
+  const book = createRunBook({ host, newId: () => 'run-1', log });
+  const result = book.plan(jobOf([{ label: 'a', engine: 'alpha', folder: '/w/a' }, { label: 'b', engine: 'beta', folder: '/w/b' }]));
+  assert.ok(result.ok);
+  const run = book.begin(result, { sharedApproved: false });
+  assert.ok(run.ok);
+  s.launcher.programs[0]?.fail('no program', 'ENOENT');
+  s.launcher.programs[1]?.fail('no program', 'ENOENT');
+  return run.settled;
+}
+
+test('an undo that cannot stop a session says so in the log, with the run, the session, and the cause, and every value of the line is escaped', async () => {
+  const lines: string[] = [];
+  const thrown = await loggedUndo([], line => lines.push(line), () => { throw new Error('the host\nbroke\u202e'); });
+  assert.deepEqual(thrown, { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED' });
+  assert.deepEqual(lines, [
+    'run book: the stop of session s-1 for the run run-1 threw: the host\\u{a}broke\\u{202e}',
+    'run book: the stop of session s-2 for the run run-1 threw: the host\\u{a}broke\\u{202e}',
+  ]);
+  const refused: string[] = [];
+  await loggedUndo([{ ok: false, code: 'ENGINE_REQUEST_INVALID' }], line => refused.push(line));
+  assert.deepEqual(refused, ['run book: the stop of session s-1 for the run run-1 was refused: ENGINE_REQUEST_INVALID', 'run book: the stop of session s-2 for the run run-1 was refused: ENGINE_REQUEST_INVALID']);
+  const timed: string[] = [];
+  await loggedUndo([{ ok: false, code: 'ENGINE_STOP_TIMEOUT' }], line => timed.push(line));
+  assert.deepEqual(timed, ['run book: session s-1 of the run run-1 did not go in time, also after the kill signal', 'run book: session s-2 of the run run-1 did not go in time, also after the kill signal']);
+});
+
+test('an undo that works logs nothing, and a log that throws never stops the outcome from arriving', async () => {
+  const quiet: string[] = [];
+  assert.deepEqual(await loggedUndo([{ ok: true }], line => quiet.push(line)), { ok: false, code: 'ENGINE_START_FAILED', reason: 'program_missing' });
+  assert.deepEqual(quiet, []);
+  const broken = await loggedUndo([{ ok: false, code: 'ENGINE_REQUEST_INVALID' }], () => { throw new Error('the log broke'); });
+  assert.deepEqual(broken, { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED' });
+});
+
 test('the default run id is run- and sixteen hexadecimal characters', () => {
   const launcher = manualLauncher();
   const host = createEngineHost({ engines: [spec('alpha')], launcher, locate: program => program, canonical: folder => ({ path: folder, key: folder }), log: () => undefined, schedule: () => () => undefined });

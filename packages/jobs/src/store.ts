@@ -1,8 +1,8 @@
 import { randomBytes } from 'node:crypto';
-import type { JobDefinition, JobReason } from './definition.js';
+import type { JobDefinition } from './definition.js';
+import { MAX_JOBS, checkJobId } from './ids.js';
 
-/** The most jobs the core holds. A create past it is refused with `GAUGE_JOB_LIMIT`. */
-export const MAX_JOBS = 64;
+export { MAX_JOBS, checkJobId };
 
 /** A job as a read gives it: the id the store made, and the definition that was checked. Frozen. */
 export interface Job {
@@ -15,13 +15,6 @@ export interface JobListing {
   readonly id: string;
   readonly title: string;
   readonly sessions: number;
-}
-
-const JOB_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
-
-/** A job id: a short lower-case token. The store makes the ids, so any other shape is a malformed request. */
-export function checkJobId(value: unknown): { readonly ok: true; readonly value: string } | { readonly ok: false; readonly reason: Extract<JobReason, 'job'> } {
-  return typeof value === 'string' && JOB_ID.test(value) ? { ok: true, value } : { ok: false, reason: 'job' };
 }
 
 export interface JobStoreOptions {
@@ -43,6 +36,8 @@ export interface JobStore {
   /** Removes a job. Gives false when no job has the id. */
   remove(id: string): boolean;
   readonly size: number;
+  /** True when the store holds as many jobs as its cap, so a create would be refused. */
+  readonly full: boolean;
 }
 
 /**
@@ -76,5 +71,6 @@ export function createJobStore(options: JobStoreOptions = {}): JobStore {
       return jobs.delete(id);
     },
     get size() { return jobs.size; },
+    get full() { return jobs.size >= cap; },
   };
 }

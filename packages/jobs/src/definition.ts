@@ -56,6 +56,8 @@ const invalid = (reason: JobReason): DefinitionRefusal => ({ ok: false, code: 'G
 const notInteractive = (reason: NotInteractiveReason): DefinitionRefusal => ({ ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE', reason });
 
 const LABEL = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+/** True for a label: lower-case words joined by single hyphens, at most 32 characters. */
+export const isLabel = (value: unknown): value is string => typeof value === 'string' && value.length <= MAX_LABEL_LENGTH && LABEL.test(value);
 /** The characters a task may not hold, once its line feeds and tabs are set aside: a control, format, line separator, or paragraph separator character. */
 const TASK_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 
@@ -84,6 +86,9 @@ function ownFields(value: object): Map<string, unknown> | undefined {
   }
 }
 
+/** True for a title of a job: 1 to 80 characters, no control or format character, no space at either end. */
+export const isTitle = (value: unknown): value is string => typeof value === 'string' && value.length >= 1 && value.length <= MAX_TITLE_LENGTH && value === value.trim() && !hasUnsafeChar(value);
+
 const SESSION_FIELDS = Object.freeze(['label', 'engine', 'harness', 'folder', 'model', 'task'] as const);
 
 /** The refusal for a field that asks for a schedule or an unattended run, which is checked before anything else in a record, so the person is told the true cause. */
@@ -93,7 +98,8 @@ function interactiveRefusal(fields: ReadonlyMap<string, unknown>): DefinitionRef
   return undefined;
 }
 
-function checkTask(value: unknown): JobReason | undefined {
+/** Checks the text of a task: `undefined` when it is good, `task` when it is the wrong shape, and `secret` when it looks like a secret. The Core API client uses it to read a plan. */
+export function checkTaskText(value: unknown): Extract<JobReason, 'task' | 'secret'> | undefined {
   if (typeof value !== 'string' || value.length < 1 || value.length > MAX_TASK_LENGTH) return 'task';
   if (TASK_UNSAFE.test(value.replace(/[\n\t]/g, ''))) return 'task';
   return looksLikeSecret(value) ? 'secret' : undefined;
@@ -107,14 +113,14 @@ function checkSession(value: unknown): { readonly ok: true; readonly value: JobS
   if (refused) return refused;
   if ([...fields.keys()].some(key => !(SESSION_FIELDS as readonly string[]).includes(key))) return invalid('request');
   const label = fields.get('label'), engine = fields.get('engine'), harness = fields.get('harness'), folder = fields.get('folder'), model = fields.get('model'), task = fields.get('task');
-  if (typeof label !== 'string' || label.length > MAX_LABEL_LENGTH || !LABEL.test(label)) return invalid('label');
+  if (!isLabel(label)) return invalid('label');
   if (typeof engine !== 'string' || !checkEngineId(engine).ok) return invalid('engine');
   if (typeof harness !== 'string' || !checkEngineId(harness).ok) return invalid('harness');
   if (typeof folder !== 'string' || !checkFolder(folder).ok) return invalid('folder');
   // A model choice is written out: `null` for the engine's own default, or a provider and a model. A field that is left out is not a choice.
   const checkedModel = model === undefined ? undefined : checkModel(model);
   if (checkedModel === undefined || !checkedModel.ok) return invalid('model');
-  const badTask = checkTask(task);
+  const badTask = checkTaskText(task);
   if (badTask !== undefined) return invalid(badTask);
   return { ok: true, value: Object.freeze({ label, engine, harness, folder, model: checkedModel.value, task: task as string }) };
 }
@@ -131,7 +137,7 @@ export function checkDefinition(value: unknown): { readonly ok: true; readonly v
   if (refused) return refused;
   if ([...fields.keys()].some(key => key !== 'title' && key !== 'sessions')) return invalid('request');
   const title = fields.get('title');
-  if (typeof title !== 'string' || title.length < 1 || title.length > MAX_TITLE_LENGTH || title !== title.trim() || hasUnsafeChar(title)) return invalid('title');
+  if (!isTitle(title)) return invalid('title');
   const items = readList(fields.get('sessions'), MAX_JOB_SESSIONS);
   if (items === undefined || items.length === 0) return invalid('sessions');
   const sessions: JobSession[] = [];
