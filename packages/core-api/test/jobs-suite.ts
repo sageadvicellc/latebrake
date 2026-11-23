@@ -535,7 +535,7 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     await bring(w, 'second-folder', 'fixture-second', FULL);
     const job = await jobWith(w, 'Review', [entry('writer', 'fixture-engine', w.harness.folder('alpha'))]);
     const one = await runPlan(w, job), two = await runPlan(w, job);
-    assert.equal(one.digest, two.digest);
+    assert.notEqual(one.nonce, two.nonce);
     assert.deepEqual(outcome(await w.client.applyRun(one, await w.harness.approve(two))), refused('GAUGE_PLAN_CHANGED'));
     const mine = await runPlan(w, job);
     const approval = await w.harness.approve(mine);

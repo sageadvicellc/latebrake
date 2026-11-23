@@ -21,7 +21,7 @@ export interface SessionsHarness {
   advance(milliseconds: number): void | Promise<void>;
   /** A folder that exists, made for this test, for a session to run in. The same name gives the same folder. It is a real path, with no link in it. */
   folder(name: string): string;
-  /** The real path of the program that every engine of `SESSION_ENGINES` runs as. */
+  /** The program that every engine of `SESSION_ENGINES` is configured with: a plan for a Gauge shows it as it is written here, and never the real path behind a link. */
   readonly program: string;
   /** How long the core waits for an engine to go before a stop times out, in milliseconds. */
   readonly stopTimeoutMs: number;
@@ -278,7 +278,8 @@ export function runSessionsSuite(name: string, makeHarness: (folders: readonly G
     assert.deepEqual(outcome(await w.client.applySession({ ...one, steps: [...one.steps, 'and also do this'] }, approval)), refused('GAUGE_PLAN_CHANGED'), 'another text');
     assert.deepEqual(outcome(await w.client.applySession({ ...one, variables: [...one.variables, 'EXTRA'] }, approval)), refused('GAUGE_PLAN_CHANGED'), 'another variable');
     assert.deepEqual(outcome(await w.client.applySession({ ...one, nonce: two.nonce }, approval)), refused('GAUGE_PLAN_CHANGED'), 'another nonce');
-    assert.deepEqual(outcome(await w.client.applySession({ ...one, digest: two.digest }, approval)), { ok: true }, 'a digest that the caller sends is ignored: the core works it out itself');
+    assert.deepEqual(outcome(await w.client.applySession({ ...one, digest: two.digest }, approval)), refused('GAUGE_PLAN_CHANGED'), 'the digest is part of the plan that the Gauge read, so another digest is another plan');
+    assert.deepEqual(outcome(await w.client.applySession(one, approval)), { ok: true }, 'and the plan as it was issued still applies, since no refusal used the approval up');
     assert.equal(w.harness.launches(), 1);
   });
 

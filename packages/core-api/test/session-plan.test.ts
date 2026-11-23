@@ -90,3 +90,31 @@ test('the look-alike spaces, the blank letters, and the combining marks are esca
   const lines = startSteps({ ...BASE, folder: '/work/a\u00a0b\u3164' });
   assert.equal(lines[2], 'folder: /work/a\\u{a0}b\\u{3164}');
 });
+
+test('a start plan for the person says when the Gauge named the folder in another way than the real one, and a plan for a Gauge never does', () => {
+  const real = '/real/alpha', named = '/link/alpha';
+  const steps = startSteps({ ...BASE, folder: real, requestedFolder: named });
+  assert.deepEqual(steps.slice(0, 4), [
+    'Gauge fixture-sessioner asks for a new session of the engine fixture-engine (Fixture Engine)',
+    'program: /usr/bin/fake',
+    'folder: /real/alpha',
+    'the Gauge named this folder as /link/alpha',
+  ]);
+  assert.equal(steps.length, startSteps(BASE).length + 1, 'one line is added, and no other');
+  assert.deepEqual(startSteps({ ...BASE, folder: real, requestedFolder: real }), startSteps({ ...BASE, folder: real }), 'the same name says nothing more');
+  assert.deepEqual(startSteps({ ...BASE, folder: named }), startSteps({ ...BASE, folder: named, requestedFolder: named }));
+  assert.equal(startSteps({ ...BASE, folder: real, requestedFolder: 'a\nb' })[3], 'the Gauge named this folder as a\\u{a}b', 'the name is escaped');
+});
+
+test('a stop plan for the person says when the session was asked for in another folder name than the real one', () => {
+  const input = { gauge: 'fixture-sessioner', session: 's-1', engine: 'fixture-engine', folder: '/real/alpha', force: false, ended: false, timeoutMs: 5000 };
+  assert.deepEqual(stopSteps({ ...input, requestedFolder: '/link/alpha' }), [
+    'Gauge fixture-sessioner asks to stop session s-1 of the engine fixture-engine',
+    'folder: /real/alpha',
+    'the session was asked for in the folder /link/alpha',
+    'send the stop signal to the program and everything it started, and wait up to 5000 ms for them to go',
+    'if they do not go in time, the session stays stopping and the core refuses with ENGINE_STOP_TIMEOUT',
+  ]);
+  assert.deepEqual(stopSteps({ ...input, requestedFolder: '/real/alpha' }), stopSteps(input));
+  assert.equal(stopSteps({ ...input, requestedFolder: 'a\nb' })[2], 'the session was asked for in the folder a\\u{a}b');
+});

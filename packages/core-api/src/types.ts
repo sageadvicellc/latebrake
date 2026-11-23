@@ -6,7 +6,7 @@ import type { SessionFailure } from '../../engine-sessions/src/session.js';
 import type { SessionState } from '../../engine-sessions/src/states.js';
 import type { Billing, NotFoundReason, StartFailedReason } from '../../engine-sessions/src/vocab.js';
 import type { JobReason, JobSession, NotInteractiveReason } from '../../jobs/src/definition.js';
-import type { RunMember, RunSessionPlan, RunSessionState } from '../../jobs/src/runs.js';
+import type { RunMember, RunSessionPlan as HostRunSessionPlan, RunSessionState } from '../../jobs/src/runs.js';
 
 /** The wire names of the calls the core offers. Wire identifiers keep the `bowerloom` prefix until the rename. */
 export type CoreMethod =
@@ -208,12 +208,15 @@ export type SessionAction = (typeof SESSION_ACTIONS)[number];
 export type SessionModel = ModelChoice;
 
 /**
- * What a start or a stop of a session would do, shown to the person before anything changes. `gauge` is the Gauge that asked. `engine` and `folder` are the engine and the real folder of the session
- * (a link is followed, so two names for one folder are one folder). The fields of a start: `program` is the real path of the program, `model` is the choice (or `null` for the engine's own default),
- * `billing` is where the tokens are billed, `variables` are the names that pass to the program (those the engine declares and those the person allowed, sorted), and `sharedWith` are the engines
- * that already run in the folder (sorted): a start with some needs a second approval. The fields of a stop: `session` is the session to stop and `force` is true when it is stopping already,
- * and the stop sends the signal that cannot be ignored. A field that the action does not use is `null`, `[]`, or `false`. `digest` is the SHA-256 of the plan, and `nonce` is issued by the core and is
- * exactly 64 lowercase hexadecimal characters. A Gauge never makes an approval.
+ * What a start or a stop of a session would do. The core makes two views of one plan, which differ in four fields only. The person who approves reads the full plan. A Gauge reads a plan whose `folder` is the folder
+ * as it asked for it (so it learns no path behind a link), whose `program` is the program as the engine is configured (the same reason), whose `sharedWith` holds only the engines that the Gauge may read (`sessions.read`),
+ * and whose `steps` are the text of those values. `digest` is the digest of the full plan, so it is the same in both views, and an approval of the full plan is an approval of what a Gauge applies.
+ *
+ * `gauge` is the Gauge that asked. `engine` is the engine of the session. The fields of a start: `folder` (the real folder in the full plan, with a link followed, so two names for one folder are one folder), `program` (the real
+ * path of the program in the full plan), `model` is the choice (or `null` for the engine's own default), `billing` is where the tokens are billed, `variables` are the names that pass to the program (those the engine declares and
+ * those the person allowed, sorted), and `sharedWith` are the engines that already run in the folder (sorted): a start with some needs a second approval. The fields of a stop: `session` is the session to stop and `force` is true when it
+ * is stopping already, and the stop sends the signal that cannot be ignored. A field that the action does not use is `null`, `[]`, or `false`. `digest` is a keyed hash of the full plan and the nonce, which only the core can work out:
+ * a Gauge cannot test a guess of a hidden path or a hidden engine against it. `nonce` is issued by the core and is exactly 64 lowercase hexadecimal characters. A Gauge never makes an approval.
  */
 export interface SessionPlan {
   readonly action: SessionAction;
@@ -240,7 +243,7 @@ export interface SessionApplied {
   readonly state: SessionState;
 }
 
-/** What a read of a session gives. It holds no output of the engine: reading output is a stream, and needs the `sessions.stream` permission. */
+/** What a read of a session gives. It holds no output of the engine: reading output is a stream, and needs the `sessions.stream` permission. `folder` is the folder as the session was asked for, and never the real folder behind a link. */
 export interface SessionSummary {
   readonly id: string;
   readonly engine: string;
@@ -295,9 +298,12 @@ export interface JobApplied {
   readonly job: string;
 }
 
+/** One session of a run plan. The person reads the real program, the real folder, and every engine that shares the folder. A Gauge reads the program as configured, the folder as the job names it, and the engines it may read (see `SessionPlan`). */
+export type RunPlanSession = Omit<HostRunSessionPlan, 'requestedFolder' | 'configuredProgram'>;
+
 /**
- * What a run would do, shown to the person before anything starts: every session of the run, in the order of the job, with its real program, its real folder, and what it shares. `shared` is true when any session
- * shares its folder with another engine, and then the run needs the second approval, once for the whole run. `digest` binds the plan to the job as it is now and to the state of the host. A run starts
+ * What a run would do, shown to the person before anything starts: every session of the run, in the order of the job, with its real program, its real folder, and what it shares (a Gauge reads the trimmed view of `RunPlanSession`). `shared` is true when any session
+ * shares its folder with another engine, and then the run needs the second approval, once for the whole run (in a Gauge's view, only when it may read an engine that shares). `digest` is a keyed hash of the full plan and the nonce, and it binds the plan to the job as it is now and to the state of the host. A run starts
  * through this one plan: an engine never starts another engine, and no call adds a session to a run.
  */
 export interface RunPlan {
@@ -306,7 +312,7 @@ export interface RunPlan {
   readonly job: string;
   readonly title: string;
   readonly shared: boolean;
-  readonly sessions: readonly RunSessionPlan[];
+  readonly sessions: readonly RunPlanSession[];
   readonly steps: readonly string[];
   readonly digest: string;
   readonly nonce: string;

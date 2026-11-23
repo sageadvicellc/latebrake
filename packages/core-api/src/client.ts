@@ -105,9 +105,10 @@ export interface CoreClient {
   /** Applies a layout plan. Like every plan, it needs the person's approval of this exact plan. Without one the core refuses with `GAUGE_PLAN_NOT_APPROVED`, and with a changed plan with `GAUGE_PLAN_CHANGED`. */
   applyLayout(plan: LayoutPlan, approval?: string): Promise<CoreResult<LayoutApplied>>;
   /**
-   * A Gauge asks for a plan to start a session of an engine in a folder. It needs the `sessions.start` grant for that engine. The plan lists the engine, the real program, the real folder, the model
-   * choice, the billing source, and the variables that pass, and the engines already in the folder. Nothing starts until the plan is applied with the person's approval, and a plan whose folder is
-   * shared with another engine needs a second approval too. A start past the session cap is refused with `ENGINE_LIMIT`.
+   * A Gauge asks for a plan to start a session of an engine in a folder. It needs the `sessions.start` grant for that engine. The plan lists the engine, the program, the folder, the model
+   * choice, the billing source, and the variables that pass, and the engines already in the folder. The folder is the folder as it was asked for here (the client refuses a plan for another folder), and the program is the program as the
+   * engine is configured: a Gauge never reads the real path behind a link. It reads only the engines in the folder that it may read (`sessions.read`). The person reads the real folder, the real program, and every engine. Nothing
+   * starts until the plan is applied with the person's approval, and a plan whose folder is shared with another engine needs a second approval too. A start past the session cap is refused with `ENGINE_LIMIT`.
    */
   planSessionStart(gauge: string, request: SessionStartRequest): Promise<CoreResult<SessionPlan>>;
   /** A Gauge asks for a plan to stop a session. It needs the `sessions.stop` grant for the engine of the session. A session that is stopping already gets a plan that kills it. */
@@ -138,8 +139,8 @@ export interface CoreClient {
   /** Applies a job plan. Like every plan it needs the person's approval of this exact plan: without one the core refuses with `GAUGE_PLAN_NOT_APPROVED`, with a changed plan or a changed job `GAUGE_PLAN_CHANGED`. */
   applyJob(plan: JobPlan, approval?: string): Promise<CoreResult<JobApplied>>;
   /**
-   * Asks for a plan to run a job. It needs the `jobs.run` grant, and the `sessions.start` grant for the engine of every session of the job. The plan lists every session of the run, and the run starts through
-   * this one plan. v0.9.1 runs are interactive, and this client has no way to ask for an unattended run or a schedule. A core refuses a raw request that carries an `unattended` or a `schedule` key with `GAUGE_JOB_NOT_INTERACTIVE`,
+   * Asks for a plan to run a job. It needs the `jobs.run` grant, and the `sessions.start` grant for the engine of every session of the job. The plan lists every session of the run (the folder as the job names it, the program as the engine is configured, and the engines that share the folder that the Gauge may read), and the run starts through
+   * this one plan. The person reads the real folders, the real programs, and every engine. v0.9.1 runs are interactive, and this client has no way to ask for an unattended run or a schedule. A core refuses a raw request that carries an `unattended` or a `schedule` key with `GAUGE_JOB_NOT_INTERACTIVE`,
    * and any other key it does not know with `GAUGE_JOB_INVALID`. A refusal of a session names it (`member`).
    */
   planRun(gauge: string, job: string): Promise<CoreResult<RunPlan>>;
@@ -605,6 +606,8 @@ export function createCoreClient(core: Core): CoreClient {
         if (!plan) throw new CoreProtocolError(method, 'result is not a session plan');
         if (plan.action !== 'start') throw new CoreProtocolError(method, `result is a plan for another action: ${shown(plan.action)}`);
         if (plan.gauge !== gauge || plan.engine !== engine) throw new CoreProtocolError(method, 'result is a plan for another Gauge or engine');
+        // A Gauge reads the folder as it asked for it, so a core that answers with the real folder behind a link breaks the contract.
+        if (plan.folder !== folder) throw new CoreProtocolError(method, 'result is a plan for another folder than the one that was asked for');
         if ((plan.model === null) !== (model === undefined || model === null) || (plan.model !== null && model !== undefined && model !== null && (plan.model.provider !== model.provider || plan.model.model !== model.model))) {
           throw new CoreProtocolError(method, 'result is a plan for another model choice');
         }
