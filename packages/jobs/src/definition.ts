@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { looksLikeSecret } from '../../gauge-manifest/src/secrets.js';
 import { checkEngineId, checkFolder, checkModel, readList, type ModelChoice } from '../../engine-sessions/src/request.js';
 import { hasUnsafeChar } from '../../engine-sessions/src/text.js';
+import { MAX_START_GROUP } from '../../engine-sessions/src/vocab.js';
 
 /**
  * The job definition: what a Gauge sends and what the core stores. A job is a saved definition of AI work: a title and one or more sessions. Each session has a label (its name inside the job), an engine, a harness,
@@ -9,7 +10,7 @@ import { hasUnsafeChar } from '../../engine-sessions/src/text.js';
  */
 
 /** The most sessions in one job. It is the most that the Engine Host starts as one group. */
-export const MAX_JOB_SESSIONS = 8;
+export const MAX_JOB_SESSIONS = MAX_START_GROUP;
 export const MAX_TITLE_LENGTH = 80;
 export const MAX_LABEL_LENGTH = 32;
 export const MAX_TASK_LENGTH = 4096;
