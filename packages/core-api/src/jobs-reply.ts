@@ -5,7 +5,7 @@ import { BILLING_SOURCES, type Billing } from '../../engine-sessions/src/vocab.j
 import { MAX_JOB_SESSIONS, canonicalDefinition, checkDefinition, checkTaskText, hashDefinition, isLabel, isTitle, type JobDefinition } from '../../jobs/src/definition.js';
 import { checkJobId, isRunId } from '../../jobs/src/ids.js';
 import type { RunSessionPlan } from '../../jobs/src/runs.js';
-import { HEX_64, denseTexts, isRecord, isStrictlyIncreasing, ownData } from './reading.js';
+import { HEX_64, MAX_PROGRAM_LENGTH, denseTexts, isEngineName, isRecord, isVariableName, orderedNames, ownData } from './reading.js';
 import { JOB_KINDS, type JobKind, type JobListing, type JobPlan, type JobRecord, type RunPlan, type RunSessionSummary, type RunSummary } from './types.js';
 
 /**
@@ -13,22 +13,13 @@ import { JOB_KINDS, type JobKind, type JobListing, type JobPlan, type JobRecord,
  * `undefined` into a protocol error. A reader that holds a definition checks it again with the one check of `packages/jobs`, so a core that stores a definition the check refuses is found here.
  */
 
-const KINDS: readonly string[] = JOB_KINDS;
-const BILLING_LIST: readonly string[] = BILLING_SOURCES;
-const SESSION_STATE_LIST: readonly string[] = SESSION_STATES;
-const MAX_PROGRAM_LENGTH = 4096;
+const isJobKind = (value: unknown): value is JobKind => typeof value === 'string' && (JOB_KINDS as readonly string[]).includes(value);
+const isBilling = (value: unknown): value is Billing => typeof value === 'string' && (BILLING_SOURCES as readonly string[]).includes(value);
+const isRunState = (value: unknown): value is RunSessionSummary['state'] => typeof value === 'string' && (value === 'forgotten' || value === 'hidden' || (SESSION_STATES as readonly string[]).includes(value));
 const MAX_TITLE_OF_ENGINE = 64;
-const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const nullableHash = (value: unknown): string | null | undefined => (value === null || (typeof value === 'string' && HEX_64.test(value)) ? value : undefined);
 const hex = (value: unknown): value is string => typeof value === 'string' && HEX_64.test(value);
-const isEngineName = (name: string): boolean => checkEngineId(name).ok;
-const isVariableName = (name: string): boolean => name.length <= 64 && VARIABLE_NAME.test(name);
-/** A list of names that is dense, has no repeat, and is in strict order. Gives a new list, or `undefined`. */
-function orderedNames(value: unknown, valid: (name: string) => boolean): string[] | undefined {
-  const names = denseTexts(value);
-  return names !== undefined && names.every(valid) && isStrictlyIncreasing(names) ? names : undefined;
-}
 /** The steps of a plan: a dense list of text, at least one, with no line break and no hidden character. */
 function stepsOf(value: unknown): string[] | undefined {
   const steps = denseTexts(value);
@@ -63,22 +54,28 @@ export function jobPlanOf(value: unknown): JobPlan | undefined {
   if (!isRecord(value)) return undefined;
   const action = ownData(value, 'action'), kind = ownData(value, 'kind'), gauge = ownData(value, 'gauge'), job = ownData(value, 'job'), definition = ownData(value, 'definition');
   const baseHash = nullableHash(ownData(value, 'baseHash')), nextHash = nullableHash(ownData(value, 'nextHash')), steps = stepsOf(ownData(value, 'steps')), digest = ownData(value, 'digest'), nonce = ownData(value, 'nonce');
-  if (action !== 'job' || typeof kind !== 'string' || !KINDS.includes(kind) || !checkEngineId(gauge).ok || typeof gauge !== 'string') return undefined;
+  if (action !== 'job' || !isJobKind(kind) || !checkEngineId(gauge).ok || typeof gauge !== 'string') return undefined;
   if (baseHash === undefined || nextHash === undefined || steps === undefined || !hex(digest) || !hex(nonce)) return undefined;
-  const kindOf = kind as JobKind;
-  if (kindOf === 'create' ? job !== null : !checkJobId(job).ok || typeof job !== 'string') return undefined;
+  // A create has no job yet. An update and a delete name one.
+  let jobId: string | null = null;
+  if (kind === 'create') {
+    if (job !== null) return undefined;
+  } else {
+    if (!checkJobId(job).ok || typeof job !== 'string') return undefined;
+    jobId = job;
+  }
   let read: JobDefinition | null = null;
-  if (kindOf === 'delete') {
+  if (kind === 'delete') {
     if (definition !== null || nextHash !== null) return undefined;
   } else {
     const checked = checkDefinition(definition);
     if (!checked.ok || nextHash !== hashDefinition(checked.value)) return undefined;
     read = checked.value;
   }
-  if ((kindOf === 'create') !== (baseHash === null)) return undefined;
+  if ((kind === 'create') !== (baseHash === null)) return undefined;
   if (steps[steps.length - 1] !== `bind the change to job ${baseHash ?? 'none'} and result ${nextHash ?? 'none'}`) return undefined;
   return Object.freeze({
-    action, kind: kindOf, gauge, job: job as string | null, definition: read, baseHash, nextHash, steps: Object.freeze(steps), digest, nonce,
+    action, kind, gauge, job: jobId, definition: read, baseHash, nextHash, steps: Object.freeze(steps), digest, nonce,
   });
 }
 
@@ -94,10 +91,10 @@ function runSessionPlanOf(value: unknown): RunSessionPlan | undefined {
   if (typeof program !== 'string' || program === '' || program.length > MAX_PROGRAM_LENGTH || hasUnsafeChar(program)) return undefined;
   if (rawModel === undefined) return undefined;
   const model = checkModel(rawModel);
-  if (!model.ok || typeof billing !== 'string' || !BILLING_LIST.includes(billing) || variables === undefined || sharedWith === undefined) return undefined;
+  if (!model.ok || !isBilling(billing) || variables === undefined || sharedWith === undefined) return undefined;
   if (checkTaskText(task) !== undefined || typeof task !== 'string') return undefined;
   return Object.freeze({
-    label, engine, engineTitle, harness, program, folder, model: model.value, billing: billing as Billing, variables: Object.freeze(variables), sharedWith: Object.freeze(sharedWith), task,
+    label, engine, engineTitle, harness, program, folder, model: model.value, billing, variables: Object.freeze(variables), sharedWith: Object.freeze(sharedWith), task,
   });
 }
 
@@ -121,12 +118,11 @@ export function runPlanOf(value: unknown): RunPlan | undefined {
 function runSessionSummaryOf(value: unknown): RunSessionSummary | undefined {
   if (!isRecord(value) || Reflect.ownKeys(value).length !== 4) return undefined;
   const label = ownData(value, 'label'), engine = ownData(value, 'engine'), session = ownData(value, 'session'), state = ownData(value, 'state');
-  if (!isLabel(label) || !checkEngineId(engine).ok || typeof engine !== 'string' || typeof state !== 'string') return undefined;
-  if (state !== 'forgotten' && state !== 'hidden' && !SESSION_STATE_LIST.includes(state)) return undefined;
+  if (!isLabel(label) || !checkEngineId(engine).ok || typeof engine !== 'string' || !isRunState(state)) return undefined;
   // A session that the Gauge may not read has no id, and one that it may read has one: the answer says nothing about a session that it hides.
   if ((state === 'hidden') !== (session === null)) return undefined;
   if (session !== null && (!checkSessionId(session).ok || typeof session !== 'string')) return undefined;
-  return Object.freeze({ label, engine, session, state: state as RunSessionSummary['state'] });
+  return Object.freeze({ label, engine, session, state });
 }
 
 /** Reads a run as a group of its sessions: one to eight, with distinct labels. */

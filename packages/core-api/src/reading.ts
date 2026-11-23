@@ -1,4 +1,4 @@
-import { readList } from '../../engine-sessions/src/request.js';
+import { MAX_NAME_LENGTH, checkEngineId, readList } from '../../engine-sessions/src/request.js';
 
 /** The small readers that the client uses for every reply. They read own data properties, once, and never run code of the value. */
 
@@ -44,3 +44,17 @@ export function plainCopy(value: unknown, depth = 0): unknown {
   }
   return copy;
 }
+
+/** A list of names that is dense, has no repeat, and is in strict order, each one valid. Gives a new list, or `undefined`. */
+export function orderedNames(value: unknown, valid: (name: string) => boolean): string[] | undefined {
+  const names = denseTexts(value);
+  return names !== undefined && names.every(valid) && isStrictlyIncreasing(names) ? names : undefined;
+}
+
+const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** An engine id: the shape that the Engine Host gives. */
+export const isEngineName = (name: string): boolean => checkEngineId(name).ok;
+/** The name of an environment variable that a plan lists. */
+export const isVariableName = (name: string): boolean => name.length <= MAX_NAME_LENGTH && VARIABLE_NAME.test(name);
+/** The longest program path that a plan may show. */
+export const MAX_PROGRAM_LENGTH = 4096;

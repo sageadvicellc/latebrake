@@ -2,11 +2,11 @@ import { isGaugeCode, type GaugeCode } from '../../gauge-errors/src/index.js';
 import { PERMISSION_NAMES, isAuditReason, isGrantReason, isManifestReason, isPermission, isTracesPermission, type PermissionName } from '../../gauge-manifest/src/index.js';
 import { MAX_LAYOUT_BYTES, MAX_REVISIONS, canonicalText, isLayoutReason, isProtectedReason, layoutOf, parseLayoutText, sha256Hex, type Layout } from '../../gauge-layout/src/index.js';
 import { MAX_LIST_LENGTH, MAX_NAME_LENGTH, checkEngineId, checkFolder, checkModel, checkSessionId, isRequestReason, readList } from '../../engine-sessions/src/request.js';
-import { isJobReason, isNotInteractiveReason } from '../../jobs/src/definition.js';
-import { HEX_64, denseTexts, isRecord, isStrictlyIncreasing, isText, ownData, plainCopy } from './reading.js';
+import { HEX_64, MAX_PROGRAM_LENGTH, denseTexts, isEngineName, isRecord, isStrictlyIncreasing, isText, isVariableName, orderedNames, ownData, plainCopy } from './reading.js';
 import { jobListingOf, jobPlanOf, jobRecordOf, runPlanOf, runSummaryOf, sameDefinition } from './jobs-reply.js';
-import { checkDefinition } from '../../jobs/src/definition.js';
-import { MAX_JOBS, checkJobId } from '../../jobs/src/ids.js';
+import { MAX_JOB_SESSIONS, checkDefinition, isJobReason, isLabel, isNotInteractiveReason } from '../../jobs/src/definition.js';
+import { MAX_JOBS, checkJobId, isRunId } from '../../jobs/src/ids.js';
+import type { RunMember } from '../../jobs/src/runs.js';
 import { SESSION_FAILURES, type SessionFailure } from '../../engine-sessions/src/session.js';
 import { SESSION_STATES, type SessionState } from '../../engine-sessions/src/states.js';
 import { hasPlanUnsafeChar, hasUnsafeChar } from '../../engine-sessions/src/text.js';
@@ -16,7 +16,7 @@ import {
   type AuditEntry, type AuditRead, type Core, type CoreMethod, type CoreResult, type GaugeApplied, type GaugePlan, type GaugeSummary, type GrantApplied, type GrantEntry, type GrantPlan, type GrantRevoked,
   type LayoutApplied, type LayoutKind, type LayoutPlan, type LayoutRevisionEntry, type LayoutSafe, type LayoutState, type PermissionCheck, type PlanAction,
   type SessionAction, type SessionApplied, type SessionModel, type SessionPlan, type SessionSummary,
-  type JobApplied, type JobKind, type JobListing, type JobPlan, type JobRecord, type RunPlan, type RunSummary,
+  type JobApplied, type JobKind, type JobListing, type JobPlan, type JobRecord, type RefusalExtras, type RunPlan, type RunSummary,
 } from './types.js';
 
 /** The core broke the contract: a reply of the wrong shape, or a code outside the registry. This is a bug, not a refusal. It names the method that failed. */
@@ -139,12 +139,15 @@ export interface CoreClient {
   applyJob(plan: JobPlan, approval?: string): Promise<CoreResult<JobApplied>>;
   /**
    * Asks for a plan to run a job. It needs the `jobs.run` grant, and the `sessions.start` grant for the engine of every session of the job. The plan lists every session of the run, and the run starts through
-   * this one plan. v0.9.1 runs are interactive: a request for an unattended run is refused with `GAUGE_JOB_NOT_INTERACTIVE`.
+   * this one plan. v0.9.1 runs are interactive, and this client has no way to ask for an unattended run or a schedule. A core refuses a raw request that carries an `unattended` or a `schedule` key with `GAUGE_JOB_NOT_INTERACTIVE`,
+   * and any other key it does not know with `GAUGE_JOB_INVALID`. A refusal of a session names it (`member`).
    */
   planRun(gauge: string, job: string): Promise<CoreResult<RunPlan>>;
   /**
    * Applies a run plan: every session of the run starts, or none stays running. It needs the person's approval (`approval`), and a plan with `shared` needs the second approval too (`sharedApproval`), once for the whole run.
-   * When a session fails to start, the others are stopped and the refusal is the failure of the first session in the order of the plan. When a session that started cannot be stopped, the refusal is `GAUGE_RUN_ROLLBACK_FAILED`.
+   * The call waits until every session has said that it runs. When a session fails, ends before it says it runs, or does not say so in time, the others are stopped and the refusal is that first failure (`ENGINE_START_FAILED` with its
+   * reason), with `member` (the session) and `run` (the id of the run, which stays recorded and reads as a group that ended). When a session that started cannot be stopped, the refusal is `GAUGE_RUN_ROLLBACK_FAILED` with the same `run` and
+   * `member` and the reason of the first failure as `cause`: that session is left running, and the person stops it.
    * A start gives the run as a group of its sessions.
    */
   applyRun(plan: RunPlan, approval?: string, sharedApproval?: string): Promise<CoreResult<RunSummary>>;
@@ -309,8 +312,6 @@ const BILLING_LIST: readonly string[] = BILLING_SOURCES;
 const FAILURE_LIST: readonly string[] = SESSION_FAILURES;
 /** The states a start can give back: any state past `ready`, since the program may have moved on already. */
 const STARTED_STATES: readonly string[] = ['starting', 'running', 'waiting', 'stopping', 'stopped', 'failed'];
-const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const MAX_PROGRAM_LENGTH = 4096;
 
 /** Reads a model choice of a reply. A field that is missing is not `null`: the choice is `null` or an object, and anything else reads as `undefined`. */
 const modelIn = (value: unknown): SessionModel | null | undefined => {
@@ -318,14 +319,6 @@ const modelIn = (value: unknown): SessionModel | null | undefined => {
   const checked = checkModel(value);
   return checked.ok ? checked.value : undefined;
 };
-/** A list of engine ids or of variable names that is dense, has no repeat, and is in strict order. Gives a new list, or `undefined`. */
-function orderedNames(value: unknown, valid: (name: string) => boolean): string[] | undefined {
-  const names = denseTexts(value);
-  return names !== undefined && names.every(valid) && isStrictlyIncreasing(names) ? names : undefined;
-}
-const isEngineName = (name: string): boolean => checkEngineId(name).ok;
-const isVariableName = (name: string): boolean => name.length <= MAX_NAME_LENGTH && VARIABLE_NAME.test(name);
-
 /** Builds a session plan from a value, or gives back `undefined` when it is not one. Each field is read once, from own properties, and the fields of the other action must be empty. */
 function sessionPlanOf(value: unknown): SessionPlan | undefined {
   if (!isRecord(value)) return undefined;
@@ -429,32 +422,39 @@ export function createCoreClient(core: Core): CoreClient {
       if (ok === false) {
         const code = refusal(method, own(reply, 'code'));
         const reason = own(reply, 'reason');
+        const extras = refusalExtras(method, code, reply);
+        const done = <R extends object>(plain: R): R & RefusalExtras => ({ ...plain, ...extras });
         // The reason is typed by the code. A grant reason goes with `GAUGE_GRANT_MISSING` only, an audit reason is required with `GAUGE_AUDIT_FAILED`, and a manifest reason goes with every other code.
         if (code === 'GAUGE_GRANT_MISSING') {
-          if (reason === undefined) return { ok: false, code };
-          if (isGrantReason(reason)) return { ok: false, code, reason };
+          if (reason === undefined) return done({ ok: false, code } as const);
+          if (isGrantReason(reason)) return done({ ok: false, code, reason } as const);
         } else if (code === 'GAUGE_AUDIT_FAILED') {
-          if (isAuditReason(reason)) return { ok: false, code, reason };
+          if (isAuditReason(reason)) return done({ ok: false, code, reason } as const);
         } else if (code === 'GAUGE_LAYOUT_INVALID') {
-          if (isLayoutReason(reason)) return { ok: false, code, reason };
+          if (isLayoutReason(reason)) return done({ ok: false, code, reason } as const);
         } else if (code === 'GAUGE_PROTECTED') {
-          if (reason === undefined) return { ok: false, code };
-          if (isProtectedReason(reason)) return { ok: false, code, reason };
+          if (reason === undefined) return done({ ok: false, code } as const);
+          if (isProtectedReason(reason)) return done({ ok: false, code, reason } as const);
         } else if (code === 'ENGINE_REQUEST_INVALID') {
-          if (isRequestReason(reason)) return { ok: false, code, reason };
+          if (isRequestReason(reason)) return done({ ok: false, code, reason } as const);
         } else if (code === 'ENGINE_NOT_FOUND') {
-          if (isNotFoundReason(reason)) return { ok: false, code, reason };
+          if (isNotFoundReason(reason)) return done({ ok: false, code, reason } as const);
         } else if (code === 'ENGINE_START_FAILED') {
-          if (isStartFailedReason(reason)) return { ok: false, code, reason };
+          if (isStartFailedReason(reason)) return done({ ok: false, code, reason } as const);
         } else if (code === 'GAUGE_JOB_INVALID') {
-          if (isJobReason(reason)) return { ok: false, code, reason };
+          if (isJobReason(reason)) return done({ ok: false, code, reason } as const);
         } else if (code === 'GAUGE_JOB_NOT_INTERACTIVE') {
-          if (isNotInteractiveReason(reason)) return { ok: false, code, reason };
+          if (isNotInteractiveReason(reason)) return done({ ok: false, code, reason } as const);
+        } else if (code === 'GAUGE_RUN_ROLLBACK_FAILED') {
+          const run = extras.run, member = extras.member, cause = ownData(reply, 'cause');
+          // A failed undo always says which run, which session, and why the start failed.
+          if (reason === undefined && run !== undefined && member !== undefined && isStartFailedReason(cause)) return { ok: false, code, run, member, cause };
+          throw new CoreProtocolError(method, 'a rollback refusal holds the run, the session, and a cause of the closed set');
         } else if (isEngineCode(code) || isJobCode(code)) {
-          if (reason === undefined) return { ok: false, code };
+          if (reason === undefined) return done({ ok: false, code } as const);
         } else {
-          if (reason === undefined) return { ok: false, code };
-          if (isManifestReason(reason)) return { ok: false, code, reason };
+          if (reason === undefined) return done({ ok: false, code } as const);
+          if (isManifestReason(reason)) return done({ ok: false, code, reason } as const);
         }
         throw new CoreProtocolError(method, reason === undefined ? 'refusal has no reason, and its code needs one' : `refusal reason is not one of the closed set: ${shown(reason)}`);
       }
@@ -464,6 +464,26 @@ export function createCoreClient(core: Core): CoreClient {
       if (error instanceof CoreProtocolError) throw error;
       throw new CoreProtocolError(method, `reply could not be read: ${shown(error instanceof Error ? error.message : error)}`);
     }
+  }
+  /**
+   * Reads what a refusal of a run call carries besides its code and its reason: the session it is about (`member`), the run that a failed apply left (`run`), and nothing else (a `cause` goes with the rollback code only).
+   * `member` goes with an engine code or the rollback code of `runs.plan` and `runs.apply`, and `run` with `ENGINE_START_FAILED` or the rollback code of `runs.apply`, together with a `member`.
+   */
+  function refusalExtras(method: CoreMethod, code: GaugeCode, reply: Record<string, unknown>): RefusalExtras {
+    const member = ownData(reply, 'member'), run = ownData(reply, 'run'), cause = ownData(reply, 'cause');
+    const fail = (what: string): CoreProtocolError => new CoreProtocolError(method, `refusal ${what}`);
+    const engineLike = code === 'GAUGE_RUN_ROLLBACK_FAILED' || code === 'ENGINE_REQUEST_INVALID' || code === 'ENGINE_NOT_FOUND' || code === 'ENGINE_START_FAILED' || isEngineCode(code);
+    if (cause !== undefined && code !== 'GAUGE_RUN_ROLLBACK_FAILED') throw fail('holds a cause, and only a rollback refusal may');
+    if (member === undefined && run === undefined) return {};
+    if ((method !== 'bowerloom.runs.plan' && method !== 'bowerloom.runs.apply') || !engineLike) throw fail('holds a session or a run that its code and call do not allow');
+    if (run !== undefined && (method !== 'bowerloom.runs.apply' || (code !== 'ENGINE_START_FAILED' && code !== 'GAUGE_RUN_ROLLBACK_FAILED') || !isRunId(run) || member === undefined)) throw fail('holds a run that does not belong to it');
+    let named: RunMember | undefined;
+    if (member !== undefined) {
+      const index = isRecord(member) && Reflect.ownKeys(member).length === 2 ? ownData(member, 'index') : undefined, label = isRecord(member) ? ownData(member, 'label') : undefined;
+      if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0 || index >= MAX_JOB_SESSIONS || !isLabel(label)) throw fail('holds a session that is not a place and a label');
+      named = Object.freeze({ index, label });
+    }
+    return { ...(named === undefined ? {} : { member: named }), ...(typeof run === 'string' ? { run } : {}) };
   }
   function refusal(method: CoreMethod, code: unknown): GaugeCode {
     if (typeof code !== 'string') throw new CoreProtocolError(method, `refusal code is not a string: ${shown(code)}`);
@@ -689,8 +709,8 @@ export function createCoreClient(core: Core): CoreClient {
       if (!isRecord(sent) || typeof job !== 'string') throw new TypeError('applyRun: the plan needs an own job');
       const asked = items?.map(item => (isRecord(item) ? [ownData(item, 'label'), ownData(item, 'engine')] : [undefined, undefined]));
       if (asked === undefined || asked.length === 0 || asked.some(([label, engine]) => typeof label !== 'string' || typeof engine !== 'string')) throw new TypeError('applyRun: the plan needs own sessions with a label and an engine');
-      return ask('bowerloom.runs.apply', { plan: sent, ...(approval === undefined ? {} : { approval }), ...(sharedApproval === undefined ? {} : { sharedApproval }) }, (method, result) => {
-        const summary = runSummaryOf(result);
+      const result = await ask('bowerloom.runs.apply', { plan: sent, ...(approval === undefined ? {} : { approval }), ...(sharedApproval === undefined ? {} : { sharedApproval }) }, (method, answer) => {
+        const summary = runSummaryOf(answer);
         if (!summary) throw new CoreProtocolError(method, 'result is not a run');
         // The run answers the plan: the same job, and the same sessions in the same order.
         if (summary.job !== job || summary.sessions.length !== asked.length || summary.sessions.some((session, index) => session.label !== asked[index]?.[0] || session.engine !== asked[index]?.[1])) {
@@ -698,6 +718,9 @@ export function createCoreClient(core: Core): CoreClient {
         }
         return summary;
       });
+      // A refusal that names a session names one of the plan that was sent: its place holds that label.
+      if (!result.ok && result.member !== undefined && asked[result.member.index]?.[0] !== result.member.label) throw new CoreProtocolError('bowerloom.runs.apply', 'refusal names a session that the plan does not hold');
+      return result;
     },
     listRuns: gauge => ask('bowerloom.runs.list', { gauge }, (method, result) => {
       const items = readList(result, MAX_SESSIONS_LISTED);

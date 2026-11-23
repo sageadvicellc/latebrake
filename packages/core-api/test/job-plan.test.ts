@@ -28,17 +28,31 @@ test('a create plan reads exactly like this', () => {
     'session 2, checker: engine fixture-other, harness strict-harness, folder /work/beta, model local-llama qwen-7b',
     'task of session 2, 9 characters: Check it.',
     'a job is a saved definition: creating it starts no session, and a run needs a plan of its own',
+    'the harness of each session is recorded and shown here, and nothing applies it to an engine yet',
     'the core makes the id of the job when you approve',
     `bind the change to job none and result ${HASH_B}`,
   ]);
 });
 
-test('an update plan names the job and the title that it replaces, and a delete plan says that runs go on', () => {
+test('an update plan names the job and the title that it replaces, shows the new title and both counts, and a delete plan says that runs go on', () => {
   const update = jobSteps({ kind: 'update', gauge: 'fixture-jobber', job: 'job-1', before: defined({}, 'Old.'), definition: defined(), baseHash: HASH_A, nextHash: HASH_B });
-  assert.equal(update[0], 'Gauge fixture-jobber asks to replace the job job-1, Morning review, with the job below');
+  assert.deepEqual(update.slice(0, 3), [
+    'Gauge fixture-jobber asks to replace the job job-1, Morning review, with the job below',
+    'new title: Morning review',
+    'the job held 2 sessions and will hold 2 sessions',
+  ]);
   assert.equal(update[update.length - 1], `bind the change to job ${HASH_A} and result ${HASH_B}`);
   assert.ok(update.includes('the job keeps its id, and a run that began already is not changed'));
+  assert.ok(update.includes('the harness of each session is recorded and shown here, and nothing applies it to an engine yet'));
   assert.ok(!update.includes('the core makes the id of the job when you approve'));
+  const one = checkDefinition({ title: 'Brand new title\u0301', sessions: [{ label: 'writer', engine: 'fixture-engine', harness: 'plain-harness', folder: '/work/alpha', model: null, task: 'Do it.' }] });
+  assert.ok(one.ok);
+  const renamed = jobSteps({ kind: 'update', gauge: 'fixture-jobber', job: 'job-1', before: defined(), definition: one.value, baseHash: HASH_A, nextHash: HASH_B });
+  assert.deepEqual(renamed.slice(0, 3), [
+    'Gauge fixture-jobber asks to replace the job job-1, Morning review, with the job below',
+    'new title: Brand new title\\u{301}',
+    'the job held 2 sessions and will hold 1 session',
+  ]);
   const remove = jobSteps({ kind: 'delete', gauge: 'fixture-jobber', job: 'job-1', before: defined(), definition: null, baseHash: HASH_A, nextHash: null });
   assert.deepEqual(remove, [
     'Gauge fixture-jobber asks to delete the job job-1, Morning review',
@@ -96,7 +110,9 @@ test('a run plan reads exactly like this, with every session in the order of the
     'each program gets its variables only, and starts with an argument list and never through a shell',
     'the core never answers a permission prompt of an engine: you answer each yourself',
     'the core does not send a task to an engine: you give it in the pane of the engine',
-    'if one session fails to start, the core stops the sessions that started and gives the failure',
+    'the harness of each session is recorded and shown here, and nothing applies it to an engine yet',
+    'the run waits until every session has said that it runs, and a session that has not said so when the start timeout of the host ends counts as failed',
+    'if one session fails, or ends before it says it runs, the core stops the sessions that started and reports the first failure only; a session that cannot be stopped is left running, and you stop it yourself',
     'the run is interactive: you watch it, and nothing is scheduled and nothing runs unattended',
     'start every program in its folder at once, and keep each session until it stops or fails',
   ]);

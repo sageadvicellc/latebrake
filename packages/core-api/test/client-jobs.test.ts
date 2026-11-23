@@ -355,11 +355,76 @@ test('a refusal keeps its code, and the reason must belong to the code', async (
   const refused = (reply: unknown, call: (client: ReturnType<typeof createCoreClient>) => Promise<unknown>) => call(createCoreClient(scripted(reply)));
   for (const reason of JOB_REASONS) assert.deepEqual(await refused({ ok: false, code: 'GAUGE_JOB_INVALID', reason }, client => client.planJobCreate('g', DEFINITION)), { ok: false, code: 'GAUGE_JOB_INVALID', reason });
   for (const reason of NOT_INTERACTIVE_REASONS) assert.deepEqual(await refused({ ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE', reason }, client => client.planRun('g', 'job-1')), { ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE', reason });
-  for (const code of ['GAUGE_JOB_UNKNOWN', 'GAUGE_JOB_LIMIT', 'GAUGE_RUN_UNKNOWN', 'GAUGE_RUN_ROLLBACK_FAILED']) assert.deepEqual(await refused({ ok: false, code }, client => client.getJob('g', 'job-1')), { ok: false, code });
+  for (const code of ['GAUGE_JOB_UNKNOWN', 'GAUGE_JOB_LIMIT', 'GAUGE_RUN_UNKNOWN']) assert.deepEqual(await refused({ ok: false, code }, client => client.getJob('g', 'job-1')), { ok: false, code });
   const mismatches: readonly unknown[] = [
     { ok: false, code: 'GAUGE_JOB_INVALID' }, { ok: false, code: 'GAUGE_JOB_INVALID', reason: 'schedule' }, { ok: false, code: 'GAUGE_JOB_INVALID', reason: 'toString' },
     { ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE' }, { ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE', reason: 'title' }, { ok: false, code: 'GAUGE_JOB_UNKNOWN', reason: 'job' },
     { ok: false, code: 'GAUGE_JOB_LIMIT', reason: 'schedule' }, { ok: false, code: 'GAUGE_RUN_UNKNOWN', reason: 'x' }, { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', reason: 'x' },
   ];
   for (const reply of mismatches) await assert.rejects(refused(reply, client => client.planJobCreate('g', DEFINITION)), protocolError('bowerloom.jobs.plan'), JSON.stringify(reply));
+});
+
+// The session that a refusal is about, the run that a failed apply leaves behind, and the cause of an undo that failed.
+
+test('a refusal of a run names the session, and a failed apply names the run: they are passed on when they are right', async () => {
+  const member = { index: 0, label: 'writer' };
+  const plan = await createCoreClient(scripted({ ok: false, code: 'ENGINE_LIMIT', member })).planRun('fixture-jobber', 'job-1');
+  assert.deepEqual(plan, { ok: false, code: 'ENGINE_LIMIT', member });
+  const notFound = await createCoreClient(scripted({ ok: false, code: 'ENGINE_NOT_FOUND', reason: 'engine', member })).planRun('fixture-jobber', 'job-1');
+  assert.deepEqual(notFound, { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'engine', member });
+  for (const reason of ['exited', 'stopped', 'illegal_claim', 'timed_out']) {
+    const failed = await createCoreClient(scripted({ ok: false, code: 'ENGINE_START_FAILED', reason, member, run: 'run-1' })).applyRun(RUN, 'approval-1');
+    assert.deepEqual(failed, { ok: false, code: 'ENGINE_START_FAILED', reason, member, run: 'run-1' }, reason);
+  }
+  const rollback = await createCoreClient(scripted({ ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run: 'run-1', member, cause: 'exited' })).applyRun(RUN, 'approval-1');
+  assert.deepEqual(rollback, { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run: 'run-1', member, cause: 'exited' });
+  assert.deepEqual(await createCoreClient(scripted({ ok: false, code: 'ENGINE_FOLDER_SHARED', member })).applyRun(RUN, 'approval-1'), { ok: false, code: 'ENGINE_FOLDER_SHARED', member });
+});
+
+test('a rollback refusal must hold the run, the session, and a cause of the closed set, and nothing else may hold a cause', async () => {
+  const member = { index: 0, label: 'writer' };
+  const apply = (reply: unknown) => createCoreClient(scripted(reply)).applyRun(RUN, 'approval-1');
+  const bad: readonly unknown[] = [
+    { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED' },
+    { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run: 'run-1', member },
+    { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run: 'run-1', cause: 'exited' },
+    { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', member, cause: 'exited' },
+    { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run: 'run-1', member, cause: 'toString' },
+    { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run: 'run-1', member, cause: 'exited', reason: 'exited' },
+    { ok: false, code: 'ENGINE_START_FAILED', reason: 'exited', member, run: 'run-1', cause: 'exited' },
+    { ok: false, code: 'GAUGE_PLAN_CHANGED', cause: 'exited' },
+  ];
+  for (const reply of bad) await assert.rejects(apply(reply), protocolError('bowerloom.runs.apply'), JSON.stringify(reply));
+});
+
+test('the session and the run of a refusal are checked: the place and the label, where they may appear, and for the plan that was sent', async () => {
+  const member = { index: 0, label: 'writer' };
+  const apply = (reply: unknown) => createCoreClient(scripted(reply)).applyRun(RUN, 'approval-1');
+  const badMembers: readonly unknown[] = [
+    { index: 1, label: 'writer' }, { index: 0, label: 'other' }, { index: -1, label: 'writer' }, { index: 8, label: 'writer' }, { index: 0.5, label: 'writer' }, { index: '0', label: 'writer' }, { index: 0, label: 'Writer' },
+    { index: 0 }, { label: 'writer' }, { index: 0, label: 'writer', extra: 1 }, null, 'writer', [],
+  ];
+  for (const bad of badMembers) await assert.rejects(apply({ ok: false, code: 'ENGINE_START_FAILED', reason: 'exited', member: bad, run: 'run-1' }), protocolError('bowerloom.runs.apply'), JSON.stringify(bad));
+  for (const run of ['Run 1', '', 7, null, 'x'.repeat(65)]) await assert.rejects(apply({ ok: false, code: 'ENGINE_START_FAILED', reason: 'exited', member, run }), protocolError('bowerloom.runs.apply'), JSON.stringify(run));
+  // A run belongs to a failed start, and a session belongs to a run call.
+  await assert.rejects(apply({ ok: false, code: 'ENGINE_LIMIT', member, run: 'run-1' }), protocolError('bowerloom.runs.apply'), 'a run id on a refusal of another kind');
+  await assert.rejects(createCoreClient(scripted({ ok: false, code: 'ENGINE_START_FAILED', reason: 'shutting_down', member, run: 'run-1' })).planRun('fixture-jobber', 'job-1'), protocolError('bowerloom.runs.plan'), 'a plan has no run yet');
+  await assert.rejects(createCoreClient(scripted({ ok: false, code: 'ENGINE_LIMIT', member })).getRun('fixture-jobber', 'run-1'), protocolError('bowerloom.runs.get'));
+  await assert.rejects(createCoreClient(scripted({ ok: false, code: 'ENGINE_LIMIT', member })).planSessionStart('fixture-jobber', { engine: 'fixture-engine', folder: '/work/alpha' }), protocolError('bowerloom.sessions.plan'));
+  await assert.rejects(createCoreClient(scripted({ ok: false, code: 'GAUGE_JOB_LIMIT', member })).planJobCreate('g', DEFINITION), protocolError('bowerloom.jobs.plan'));
+});
+
+test('the session of a plan refusal is checked on its own, where no plan was sent: the place, the label, the code, and a run that has no session', async () => {
+  const planning = (reply: unknown) => createCoreClient(scripted(reply)).planRun('fixture-jobber', 'job-1');
+  const good = { index: 7, label: 'writer' };
+  assert.deepEqual(await planning({ ok: false, code: 'ENGINE_LIMIT', member: good }), { ok: false, code: 'ENGINE_LIMIT', member: good }, 'the last place of a job');
+  for (const index of [-1, 8, 0.5, Number.NaN, Infinity, 2 ** 40]) await assert.rejects(planning({ ok: false, code: 'ENGINE_LIMIT', member: { index, label: 'writer' } }), protocolError('bowerloom.runs.plan'), String(index));
+  await assert.rejects(planning({ ok: false, code: 'ENGINE_LIMIT', member: { index: 0, label: 'Writer' } }), protocolError('bowerloom.runs.plan'));
+  for (const code of ['GAUGE_JOB_UNKNOWN', 'GAUGE_GRANT_MISSING', 'GAUGE_PLAN_CHANGED', 'GAUGE_JOB_INVALID']) {
+    await assert.rejects(planning({ ok: false, code, member: good, ...(code === 'GAUGE_JOB_INVALID' ? { reason: 'request' } : {}) }), protocolError('bowerloom.runs.plan'), `${code} is not a refusal about a session`);
+  }
+  const apply = (reply: unknown) => createCoreClient(scripted(reply)).applyRun(RUN, 'approval-1');
+  await assert.rejects(apply({ ok: false, code: 'ENGINE_START_FAILED', reason: 'exited', run: 'run-1' }), protocolError('bowerloom.runs.apply'), 'a run with no session');
+  await assert.rejects(apply({ ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run: 'run-1', cause: 'exited' }), protocolError('bowerloom.runs.apply'));
+  await assert.rejects(apply({ ok: false, code: 'ENGINE_NOT_FOUND', reason: 'engine', member: { index: 0, label: 'writer' }, run: 'run-1' }), protocolError('bowerloom.runs.apply'), 'a run belongs to a failed start only');
 });

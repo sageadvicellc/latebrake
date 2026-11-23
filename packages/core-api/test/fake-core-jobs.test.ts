@@ -112,7 +112,7 @@ test('a run whose session fails to start gives the failure of that session throu
   await waitFor(() => m.launcher.programs[0]?.signals.includes('term') === true && m.launcher.programs[2]?.signals.includes('term') === true, 'the stop of the others');
   m.launcher.programs[0]?.exit(null, 'SIGTERM');
   m.launcher.programs[2]?.exit(null, 'SIGTERM');
-  assert.deepEqual(await applying, { ok: false, code: 'ENGINE_START_FAILED', reason: 'program_missing' });
+  assert.deepEqual(await applying, { ok: false, code: 'ENGINE_START_FAILED', reason: 'program_missing', member: { index: 1, label: 'b' }, run: 'run-1' });
   const run = must(await m.client.getRun(GAUGE, 'run-1'));
   assert.deepEqual(run.sessions.map(session => session.state), ['stopped', 'failed', 'stopped']);
   // The approval was used up, so the same plan is not applied again.
@@ -127,7 +127,7 @@ test('a run whose started session cannot be stopped gives GAUGE_RUN_ROLLBACK_FAI
   const applying = m.client.applyRun(plan, m.fake.approve(plan.nonce));
   m.launcher.programs[0]?.spawn();
   m.launcher.programs[1]?.fail('no program', 'ENOENT');
-  assert.deepEqual(await applying, { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED' });
+  assert.deepEqual(await applying, { ok: false, code: 'GAUGE_RUN_ROLLBACK_FAILED', run: 'run-1', member: { index: 1, label: 'b' }, cause: 'program_missing' });
   assert.deepEqual(must(await m.client.getRun(GAUGE, 'run-1')).sessions.map(session => session.state), ['stopping', 'failed']);
   m.launcher.programs[0]?.exit(null, 'SIGKILL');
   assert.deepEqual(must(await m.client.getRun(GAUGE, 'run-1')).sessions.map(session => session.state), ['stopped', 'failed']);
@@ -142,6 +142,7 @@ test('the default ids of a job and of a run are random: a prefix and sixteen hex
   const plan = must(await m.client.planRun(GAUGE, one));
   const applying = m.client.applyRun(plan, m.fake.approve(plan.nonce));
   m.launcher.programs[0]?.spawn();
+  m.launcher.programs[0]?.line('state:running');
   const run = must(await applying);
   assert.match(run.id, /^run-[0-9a-f]{16}$/);
 });
@@ -219,7 +220,7 @@ test('a core that was not given a host holds no engine, so a run is refused as a
   const made = await client.planJobCreate(GAUGE, { title: 'x', sessions: [entry('a', 'fixture-engine', '/w/a')] });
   assert.ok(made.ok);
   const job = must(await client.applyJob(made.value, fake.approve(made.value.nonce))).job;
-  assert.deepEqual(await client.planRun(GAUGE, job), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'engine' });
+  assert.deepEqual(await client.planRun(GAUGE, job), { ok: false, code: 'ENGINE_NOT_FOUND', reason: 'engine', member: { index: 0, label: 'a' } });
   const core: Core = fake;
   assert.equal(typeof core.call, 'function');
 });

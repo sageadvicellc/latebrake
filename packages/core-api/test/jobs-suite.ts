@@ -31,7 +31,8 @@ export interface JobsHarness {
 /** The engines the suite uses: those of the sessions suite, and an engine that says things that no engine may do. The cap of the core is the default of 4. */
 export const JOB_ENGINES: readonly SessionEngineFixture[] = [
   ...SESSION_ENGINES,
-  { id: 'fixture-chatty', steps: [{ say: 'state:running' }, { say: 'start:fixture-other' }, { say: 'run:job-1' }, { say: '{"start":"fixture-other","folder":"/tmp"}' }, { say: 'state:waiting' }, { hold: true }] },
+  // It claims running, and then a claim that no line may make, written as a request to start another engine. The host's rule for a claim turns that into a fault, and kills the program.
+  { id: 'fixture-chatty', steps: [{ say: 'state:running' }, { say: 'state:start:fixture-other' }, { hold: true }] },
 ];
 
 const FILE = 'export default 1;';
@@ -55,8 +56,13 @@ export const JOB_FOLDERS: readonly GaugeFolder[] = [
 ];
 
 const HEX = /^[0-9a-f]{64}$/;
-const outcome = (result: { ok: boolean; code?: string; reason?: string }) => (result.ok ? { ok: true } : result.reason === undefined ? { ok: false, code: result.code } : { ok: false, code: result.code, reason: result.reason });
+const outcome = (result: { ok: boolean; code?: string; reason?: string; member?: unknown; run?: unknown; cause?: unknown }) => (result.ok ? { ok: true } : {
+  ok: false, code: result.code, ...(result.reason === undefined ? {} : { reason: result.reason }), ...(result.member === undefined ? {} : { member: result.member }), ...(result.run === undefined ? {} : { run: result.run }),
+  ...(result.cause === undefined ? {} : { cause: result.cause }),
+});
 const refused = (code: string, reason?: string) => (reason === undefined ? { ok: false, code } : { ok: false, code, reason });
+/** A refusal of a run call that names the session it is about: its place in the job and its label. */
+const refusedAt = (code: string, reason: string | undefined, index: number, label: string) => ({ ...refused(code, reason), member: { index, label } });
 const pause = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 const entry = (label: string, engine: string, folder: string, extra: Record<string, unknown> = {}) => ({ label, engine, harness: 'plain-harness', folder, model: null, task: `Task of ${label}.`, ...extra });
@@ -175,6 +181,7 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
       `session 1, writer: engine fixture-engine, harness plain-harness, folder ${folder}, the model is the default of the engine`,
       'task of session 1, 15 characters: Task of writer.',
       'a job is a saved definition: creating it starts no session, and a run needs a plan of its own',
+      'the harness of each session is recorded and shown here, and nothing applies it to an engine yet',
       'the core makes the id of the job when you approve',
       `bind the change to job none and result ${plan.nextHash}`,
     ]);
@@ -378,6 +385,40 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     assert.equal(must(await w.client.listJobs(GAUGE)).length, 64);
   });
 
+  test(`${name}: a schedule or an unattended flag in a later session is found before the reason of an invalid first session`, async t => {
+    const w = await prepare(t);
+    const folder = w.harness.folder('alpha');
+    const first = entry('A b', 'Engine', 'relative', { task: '' });
+    assert.deepEqual(outcome(await w.client.planJobCreate(GAUGE, definition('x', [first, entry('second', 'fixture-engine', folder, { schedule: 'daily' })]))), refused('GAUGE_JOB_NOT_INTERACTIVE', 'schedule'));
+    assert.deepEqual(outcome(await w.client.planJobCreate(GAUGE, definition('x', [first, entry('second', 'fixture-engine', folder, { unattended: true })]))), refused('GAUGE_JOB_NOT_INTERACTIVE', 'unattended'));
+    assert.deepEqual(outcome(await w.client.planJobCreate(GAUGE, definition('', [first, entry('second', 'fixture-engine', folder, { unattended: true }), entry('third', 'fixture-other', folder, { schedule: 'x' })]))), refused('GAUGE_JOB_NOT_INTERACTIVE', 'schedule'));
+  });
+
+  test(`${name}: a raw call that plans a job or a run, or applies a run, is refused for a key that it does not know, and a schedule key is not interactive, after the grant check`, async t => {
+    const w = await prepare(t);
+    await bring(w, 'bare-folder', 'fixture-bare', []);
+    const job = await jobWith(w, 'Review', [entry('writer', 'fixture-engine', w.harness.folder('alpha'))]);
+    const plan = await runPlan(w, job);
+    const definitionOf = definition('x', [entry('writer', 'fixture-engine', w.harness.folder('beta'))]);
+    const calls: readonly (readonly [string, Record<string, unknown>])[] = [
+      ['bowerloom.jobs.plan', { kind: 'create', gauge: GAUGE, definition: definitionOf }],
+      ['bowerloom.runs.plan', { gauge: GAUGE, job }],
+      ['bowerloom.runs.apply', { plan, approval: 'x' }],
+    ];
+    for (const [method, params] of calls) {
+      assert.deepEqual(await w.core.call(method as never, { ...params, schedule: 'daily' }), { ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE', reason: 'schedule' }, `${method}: schedule`);
+      assert.deepEqual(await w.core.call(method as never, { ...params, unattended: false }), { ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE', reason: 'unattended' }, `${method}: unattended`);
+      assert.deepEqual(await w.core.call(method as never, { ...params, schedule: 'daily', unattended: true }), { ok: false, code: 'GAUGE_JOB_NOT_INTERACTIVE', reason: 'schedule' }, `${method}: both`);
+      assert.deepEqual(await w.core.call(method as never, { ...params, surprise: 1 }), { ok: false, code: 'GAUGE_JOB_INVALID', reason: 'request' }, `${method}: another key`);
+      assert.deepEqual(await w.core.call(method as never, { ...params, [Symbol('x')]: 1 }), { ok: false, code: 'GAUGE_JOB_INVALID', reason: 'request' }, `${method}: a symbol key`);
+    }
+    // A Gauge with no grant gets the grant refusal, whatever keys it sends.
+    assert.deepEqual(await w.core.call('bowerloom.runs.plan', { gauge: 'fixture-bare', job, schedule: 'x' }), { ok: false, code: 'GAUGE_GRANT_MISSING', reason: 'not_declared' });
+    assert.deepEqual(await w.core.call('bowerloom.jobs.plan', { kind: 'create', gauge: 'fixture-bare', definition: definitionOf, surprise: 1 }), { ok: false, code: 'GAUGE_GRANT_MISSING', reason: 'not_declared' });
+    assert.equal(w.harness.launches(), 0);
+    assert.equal(must(await w.client.listJobs(GAUGE)).length, 1);
+  });
+
   // Runs
 
   test(`${name}: a run plan lists every session of the job, and a plan starts nothing`, async t => {
@@ -423,7 +464,9 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
       'each program gets its variables only, and starts with an argument list and never through a shell',
       'the core never answers a permission prompt of an engine: you answer each yourself',
       'the core does not send a task to an engine: you give it in the pane of the engine',
-      'if one session fails to start, the core stops the sessions that started and gives the failure',
+      'the harness of each session is recorded and shown here, and nothing applies it to an engine yet',
+      'the run waits until every session has said that it runs, and a session that has not said so when the start timeout of the host ends counts as failed',
+      'if one session fails, or ends before it says it runs, the core stops the sessions that started and reports the first failure only; a session that cannot be stopped is left running, and you stop it yourself',
       'the run is interactive: you watch it, and nothing is scheduled and nothing runs unattended',
       'start every program in its folder at once, and keep each session until it stops or fails',
     ]);
@@ -495,7 +538,11 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     assert.equal(one.digest, two.digest);
     assert.deepEqual(outcome(await w.client.applyRun(one, await w.harness.approve(two))), refused('GAUGE_PLAN_CHANGED'));
     const mine = await runPlan(w, job);
-    assert.deepEqual(outcome(await w.client.applyRun({ ...mine, gauge: 'fixture-second' }, await w.harness.approve(mine))), refused('GAUGE_PLAN_CHANGED'));
+    const approval = await w.harness.approve(mine);
+    assert.deepEqual(outcome(await w.client.applyRun({ ...mine, gauge: 'fixture-second' }, approval)), refused('GAUGE_PLAN_CHANGED'));
+    // The same swap with the first line of the steps rewritten for the other Gauge, so the swap does not rest on the text of the steps alone.
+    const steps = [(mine.steps[0] ?? '').replace('fixture-jobber', 'fixture-second'), ...mine.steps.slice(1)];
+    assert.deepEqual(outcome(await w.client.applyRun({ ...mine, gauge: 'fixture-second', steps }, approval)), refused('GAUGE_PLAN_CHANGED'));
     assert.equal(w.harness.launches(), 0);
   });
 
@@ -551,33 +598,37 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     assert.equal(w.harness.launches(), 0);
   });
 
-  test(`${name}: an engine never starts another engine, and a run never grows: what a program says changes no launch and no session`, async t => {
+  test(`${name}: an engine never starts another engine, and a run never grows: a program that claims a request to start another engine faults, is killed, and starts nothing`, async t => {
     const w = await prepare(t);
     const job = await jobWith(w, 'Chatty', [entry('talker', 'fixture-chatty', w.harness.folder('alpha')), entry('quiet', 'fixture-other', w.harness.folder('beta'))]);
     const run = must((await startRun(w, job)).result);
-    // The chatty engine claims waiting last, so every line before it has been read when its session reads waiting.
+    // The chatty engine says that it runs, and then claims `start:fixture-other` as a state. No line may claim that, so its session fails and its program is killed. The quiet session goes on.
     const until = Date.now() + 5000;
-    while ((await stateOf(w, run.id))[0] !== 'waiting') {
-      if (Date.now() > until) throw new Error('the chatty session did not reach waiting');
+    while ((await stateOf(w, run.id))[0] !== 'failed') {
+      if (Date.now() > until) throw new Error('the chatty session did not fail');
       await pause(10);
     }
-    assert.equal(w.harness.launches(), 2);
+    assert.deepEqual(await stateOf(w, run.id), ['failed', 'running']);
+    const chatty = must(await w.client.getSession(GAUGE, must(await w.client.getRun(GAUGE, run.id)).sessions[0]?.session ?? ''));
+    assert.equal(chatty.failure, 'illegal_move');
+    assert.equal(w.harness.launches(), 2, 'nothing was started by the claim');
     assert.equal(must(await w.client.getRun(GAUGE, run.id)).sessions.length, 2);
     assert.equal(must(await w.client.listRuns(GAUGE)).length, 1);
     assert.deepEqual(must(await w.client.listSessions(GAUGE, 'fixture-other')).length, 1, 'no session of another engine was added');
+    // The close of the harness fails the test when a program of the chatty engine is still alive: it was killed.
   });
 
   test(`${name}: two sessions of one engine in one folder are the pair rule, at plan time, and the cap counts the whole run`, async t => {
     const w = await prepare(t);
     const alpha = w.harness.folder('alpha');
     const pair = await jobWith(w, 'Pair', [entry('one', 'fixture-engine', alpha), entry('two', 'fixture-engine', alpha)]);
-    assert.deepEqual(outcome(await w.client.planRun(GAUGE, pair)), refused('ENGINE_PAIR_BUSY'));
+    assert.deepEqual(outcome(await w.client.planRun(GAUGE, pair)), refusedAt('ENGINE_PAIR_BUSY', undefined, 1, 'two'));
     const five = await jobWith(w, 'Five', ['fixture-engine', 'fixture-other', 'fixture-stubborn', 'fixture-asking', 'fixture-chooser'].map((engine, index) => entry(`s-${index}`, engine, w.harness.folder(`f${index}`))));
-    assert.deepEqual(outcome(await w.client.planRun(GAUGE, five)), refused('ENGINE_LIMIT'));
+    assert.deepEqual(outcome(await w.client.planRun(GAUGE, five)), refusedAt('ENGINE_LIMIT', undefined, 4, 's-4'));
     const four = await jobWith(w, 'Four', ['fixture-engine', 'fixture-other', 'fixture-stubborn', 'fixture-asking'].map((engine, index) => entry(`s-${index}`, engine, w.harness.folder(`g${index}`))));
     must((await startRun(w, four)).result);
     const one = await jobWith(w, 'One', [entry('solo', 'fixture-chooser', w.harness.folder('h'))]);
-    assert.deepEqual(outcome(await w.client.planRun(GAUGE, one)), refused('ENGINE_LIMIT'), 'the places of a run that began are taken');
+    assert.deepEqual(outcome(await w.client.planRun(GAUGE, one)), refusedAt('ENGINE_LIMIT', undefined, 0, 'solo'), 'the places of a run that began are taken');
     assert.equal(w.harness.launches(), 4);
   });
 
@@ -588,10 +639,10 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     const unknown = await jobWith(w, 'Unknown', [entry('a', 'fixture-unknown', folder)]);
     const model = await jobWith(w, 'Model', [entry('a', 'fixture-engine', folder, { model: { provider: 'p', model: 'm' } })]);
     const notFolder = await jobWith(w, 'No folder', [entry('a', 'fixture-engine', `${folder}/does-not-exist`)]);
-    assert.deepEqual(outcome(await w.client.planRun(GAUGE, missing)), refused('ENGINE_NOT_FOUND', 'program_missing'));
-    assert.deepEqual(outcome(await w.client.planRun(GAUGE, unknown)), refused('ENGINE_NOT_FOUND', 'engine'));
-    assert.deepEqual(outcome(await w.client.planRun(GAUGE, model)), refused('MODEL_NOT_FOR_ENGINE'));
-    assert.deepEqual(outcome(await w.client.planRun(GAUGE, notFolder)), refused('ENGINE_REQUEST_INVALID', 'folder'));
+    assert.deepEqual(outcome(await w.client.planRun(GAUGE, missing)), refusedAt('ENGINE_NOT_FOUND', 'program_missing', 0, 'a'));
+    assert.deepEqual(outcome(await w.client.planRun(GAUGE, unknown)), refusedAt('ENGINE_NOT_FOUND', 'engine', 0, 'a'));
+    assert.deepEqual(outcome(await w.client.planRun(GAUGE, model)), refusedAt('MODEL_NOT_FOR_ENGINE', undefined, 0, 'a'));
+    assert.deepEqual(outcome(await w.client.planRun(GAUGE, notFolder)), refusedAt('ENGINE_REQUEST_INVALID', 'folder', 0, 'a'));
   });
 
   test(`${name}: a run in a folder that another engine uses needs the second approval, once for the whole run`, async t => {
@@ -603,12 +654,12 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     assert.deepEqual(plan.sessions.map(session => session.sharedWith), [['fixture-other'], ['fixture-engine']]);
     assert.ok(plan.steps.includes('a second approval is needed, once for the whole run, for the shared folder'));
     const approval = await w.harness.approve(plan);
-    assert.deepEqual(outcome(await w.client.applyRun(plan, approval)), refused('ENGINE_FOLDER_SHARED'));
+    assert.deepEqual(outcome(await w.client.applyRun(plan, approval)), refusedAt('ENGINE_FOLDER_SHARED', undefined, 0, 'writer'));
     assert.equal(w.harness.launches(), 0, 'nothing starts without the second approval');
     const other = await runPlan(w, job);
     const wrongShared = await w.harness.approveShared(other);
     const again = await w.harness.approve(plan);
-    assert.deepEqual(outcome(await w.client.applyRun(plan, again, wrongShared)), refused('ENGINE_FOLDER_SHARED'), 'the second approval of another plan is not this plan\'s');
+    assert.deepEqual(outcome(await w.client.applyRun(plan, again, wrongShared)), refusedAt('ENGINE_FOLDER_SHARED', undefined, 0, 'writer'), 'the second approval of another plan is not this plan\'s');
     assert.equal(w.harness.launches(), 0);
     const fresh = await runPlan(w, job);
     const first = await w.harness.approve(fresh), second = await w.harness.approveShared(fresh);
@@ -616,6 +667,15 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     const run = must(await w.client.applyRun(fresh, first, second));
     assert.equal(run.sessions.length, 2);
     assert.equal(w.harness.launches(), 2);
+  });
+
+  test(`${name}: the refusal for the second approval names the first session that shares its folder, and not the first session of the run`, async t => {
+    const w = await prepare(t);
+    const job = await jobWith(w, 'Shared', [entry('alone', 'fixture-stubborn', w.harness.folder('alone')), entry('writer', 'fixture-engine', w.harness.folder('alpha')), entry('checker', 'fixture-other', w.harness.folder('alpha'))]);
+    const plan = await runPlan(w, job);
+    assert.deepEqual(plan.sessions.map(session => session.sharedWith), [[], ['fixture-other'], ['fixture-engine']]);
+    assert.deepEqual(outcome(await w.client.applyRun(plan, await w.harness.approve(plan))), refusedAt('ENGINE_FOLDER_SHARED', undefined, 1, 'writer'));
+    assert.equal(w.harness.launches(), 0);
   });
 
   test(`${name}: a run that shares nothing cannot be given a second approval`, async t => {
@@ -683,14 +743,21 @@ export function runJobsSuite(name: string, makeHarness: (folders: readonly Gauge
     const approval = await w.harness.approve(plan);
     // The folder is there when the plan is made and when the core plans again, and it cannot be searched when the program starts.
     fs.chmodSync(locked, 0o000);
+    // A file system that ignores modes (some network or removable volumes) cannot lock a folder: the test is skipped, with the folder put back as it was.
+    const locks = ((): boolean => { try { fs.accessSync(locked, fs.constants.X_OK); return false; } catch { return true; } })();
+    if (!locks) {
+      fs.chmodSync(locked, 0o755);
+      return t.skip('this file system does not enforce the mode of a folder');
+    }
     try {
       const result = await w.client.applyRun(plan, approval);
-      assert.deepEqual(outcome(result), refused('ENGINE_START_FAILED', 'folder_unusable'));
+      assert.deepEqual(outcome(result), { ...refusedAt('ENGINE_START_FAILED', 'folder_unusable', 1, 'second'), run: 'run-1' });
     } finally {
       fs.chmodSync(locked, 0o755);
     }
     const runs = must(await w.client.listRuns(GAUGE));
     assert.equal(runs.length, 1, 'the run is recorded');
+    assert.equal(runs[0]?.id, 'run-1', 'and the failed reply gave its id');
     assert.deepEqual(runs[0]?.sessions.map(session => session.state), ['stopped', 'failed', 'stopped']);
     // Every place is free again.
     const again = await w.client.planRun(GAUGE, job);

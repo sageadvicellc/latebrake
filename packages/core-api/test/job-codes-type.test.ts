@@ -9,7 +9,7 @@ test('the type that ties the job and run codes to the registry holds, and it fai
   // @ts-expect-error a list that lacks a code is not the same set
   const missing: Exactly<'GAUGE_JOB_A' | 'GAUGE_RUN_B', 'GAUGE_JOB_A'> = true;
   assert.deepEqual([holds, missing], [true, true]);
-  assert.equal(JOB_CODES.length, 4);
-  // The two codes that always carry a reason are the rest of the registry's job codes.
-  assert.deepEqual(GAUGE_CODES.filter(code => code.startsWith('GAUGE_JOB_') || code.startsWith('GAUGE_RUN_')).sort(), [...JOB_CODES, 'GAUGE_JOB_INVALID', 'GAUGE_JOB_NOT_INTERACTIVE'].sort());
+  assert.equal(JOB_CODES.length, 3);
+  // The two codes that always carry a reason, and the rollback code, are the rest of the registry's job codes.
+  assert.deepEqual(GAUGE_CODES.filter(code => code.startsWith('GAUGE_JOB_') || code.startsWith('GAUGE_RUN_')).sort(), [...JOB_CODES, 'GAUGE_JOB_INVALID', 'GAUGE_JOB_NOT_INTERACTIVE', 'GAUGE_RUN_ROLLBACK_FAILED'].sort());
 });

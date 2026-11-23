@@ -6,7 +6,7 @@ import type { SessionFailure } from '../../engine-sessions/src/session.js';
 import type { SessionState } from '../../engine-sessions/src/states.js';
 import type { Billing, NotFoundReason, StartFailedReason } from '../../engine-sessions/src/vocab.js';
 import type { JobReason, JobSession, NotInteractiveReason } from '../../jobs/src/definition.js';
-import type { RunSessionPlan, RunSessionState } from '../../jobs/src/runs.js';
+import type { RunMember, RunSessionPlan, RunSessionState } from '../../jobs/src/runs.js';
 
 /** The wire names of the calls the core offers. Wire identifiers keep the `bowerloom` prefix until the rename. */
 export type CoreMethod =
@@ -334,7 +334,7 @@ export interface RunSummary {
 /** The raw answer of a core: a result, or a refusal with a code. The client checks the code against the registry. */
 export type CoreReply =
   | { readonly ok: true; readonly result: unknown }
-  | { readonly ok: false; readonly code: string; readonly reason?: string };
+  | { readonly ok: false; readonly code: string; readonly reason?: string; readonly member?: unknown; readonly run?: unknown; readonly cause?: unknown };
 
 /**
  * The seam. The fake core and the real core both have this shape, and a Gauge reaches either one only through a client built on it.
@@ -373,14 +373,25 @@ export type EngineCodesMatchRegistry = Exactly<EngineCode | EngineReasonCode, Ex
 export type EngineReasonCode = 'ENGINE_REQUEST_INVALID' | 'ENGINE_NOT_FOUND' | 'ENGINE_START_FAILED';
 
 /** The job and run codes that never carry a reason. `GAUGE_JOB_INVALID` and `GAUGE_JOB_NOT_INTERACTIVE` always carry one. */
-export const JOB_CODES = Object.freeze(['GAUGE_JOB_UNKNOWN', 'GAUGE_JOB_LIMIT', 'GAUGE_RUN_UNKNOWN', 'GAUGE_RUN_ROLLBACK_FAILED'] as const);
+export const JOB_CODES = Object.freeze(['GAUGE_JOB_UNKNOWN', 'GAUGE_JOB_LIMIT', 'GAUGE_RUN_UNKNOWN'] as const);
 export type JobCode = (typeof JOB_CODES)[number];
 /** The job codes that always carry a reason. */
 export type JobReasonCode = 'GAUGE_JOB_INVALID' | 'GAUGE_JOB_NOT_INTERACTIVE';
-/** A compile-time check that ties the job codes of this package to the registry: it is `true` only when `JOB_CODES` and `JobReasonCode` are exactly the registry codes that start with `GAUGE_JOB_` or `GAUGE_RUN_`. */
-export type JobCodesMatchRegistry = Exactly<JobCode | JobReasonCode, Extract<GaugeCode, `GAUGE_JOB_${string}` | `GAUGE_RUN_${string}`>>;
+/** The run code that carries a run, a session, and a cause, and no reason. */
+export type RunRollbackCode = 'GAUGE_RUN_ROLLBACK_FAILED';
+/** A compile-time check that ties the job codes of this package to the registry: it is `true` only when `JOB_CODES`, `JobReasonCode`, and `RunRollbackCode` are exactly the registry codes that start with `GAUGE_JOB_` or `GAUGE_RUN_`. */
+export type JobCodesMatchRegistry = Exactly<JobCode | JobReasonCode | RunRollbackCode, Extract<GaugeCode, `GAUGE_JOB_${string}` | `GAUGE_RUN_${string}`>>;
 
-export type CoreRefusal =
+/**
+ * What a refusal of a run call may carry besides its code and reason. `member` is the session that the refusal is about: its place in the plan and its label, for a refusal of a plan (the first session that cannot start) and of an apply.
+ * `run` is the id of the run that a failed apply left behind: the run stays recorded and reads as a group that ended, so the id is how a Gauge finds it. Both are closed values.
+ */
+export interface RefusalExtras {
+  readonly member?: RunMember;
+  readonly run?: string;
+}
+
+export type CoreRefusal = (
   | { readonly ok: false; readonly code: EngineCode; readonly reason?: never }
   | { readonly ok: false; readonly code: 'ENGINE_REQUEST_INVALID'; readonly reason: RequestReason }
   | { readonly ok: false; readonly code: 'ENGINE_NOT_FOUND'; readonly reason: NotFoundReason }
@@ -392,4 +403,6 @@ export type CoreRefusal =
   | { readonly ok: false; readonly code: 'GAUGE_JOB_INVALID'; readonly reason: JobReason }
   | { readonly ok: false; readonly code: 'GAUGE_JOB_NOT_INTERACTIVE'; readonly reason: NotInteractiveReason }
   | { readonly ok: false; readonly code: JobCode; readonly reason?: never }
-  | { readonly ok: false; readonly code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | EngineReasonCode | JobCode | JobReasonCode>; readonly reason?: ManifestReason };
+  | { readonly ok: false; readonly code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED' | 'GAUGE_LAYOUT_INVALID' | 'GAUGE_PROTECTED' | EngineCode | EngineReasonCode | JobCode | JobReasonCode | RunRollbackCode>; readonly reason?: ManifestReason }
+) & RefusalExtras
+  | { readonly ok: false; readonly code: RunRollbackCode; readonly reason?: never; readonly run: string; readonly member: RunMember; readonly cause: StartFailedReason };
