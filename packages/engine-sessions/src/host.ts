@@ -3,21 +3,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Launched, Launcher } from './launcher.js';
 import {
-  MAX_NAME_LENGTH, checkEngineId, checkFolder, checkModel, checkSessionId, checkVariables, type ModelChoice, type RequestReason,
+  MAX_NAME_LENGTH, MAX_VARIABLES, checkEngineId, checkFolder, checkModel, checkSessionId, checkVariables, isLoaderVariable, isRefusedVariable, type ModelChoice, type RequestReason,
 } from './request.js';
-import { createSession, type FaultEntry, type Session, type SessionFailure } from './session.js';
+import { createSession, report, type FaultEntry, type Session, type SessionFailure } from './session.js';
 import { isTerminal, type SessionState } from './states.js';
+import { escapeText, hasUnsafeChar } from './text.js';
+import { BILLING_SOURCES, type Billing } from './vocab.js';
 
-/** Where a session's tokens are billed. A provider key joins when the keys and spend work is built: a spec that names it is refused when the host is made. */
-export const BILLING_SOURCES = Object.freeze(['engine-plan', 'local'] as const);
-export type Billing = (typeof BILLING_SOURCES)[number];
+export { BILLING_SOURCES };
+export type { Billing };
 
 /** The cap on sessions when none is given. */
 export const DEFAULT_SESSION_CAP = 4;
 /** How long a stop waits for the engine to go, in milliseconds, when none is given. */
 export const DEFAULT_STOP_TIMEOUT_MS = 5000;
+/** How long a session may stay `starting`, in milliseconds, when none is given. After it the session fails with `start_failed` and its program is killed. */
+export const DEFAULT_START_TIMEOUT_MS = 30_000;
+/** How long `killAll` waits for the programs to go after the kill signal, in milliseconds, when none is given. */
+export const DEFAULT_KILL_WAIT_MS = 5000;
 const MAX_CAP = 64;
 const MAX_STOP_TIMEOUT_MS = 600_000;
+const MAX_KILL_WAIT_MS = 60_000;
 const MAX_ENGINES = 16;
 
 /**
@@ -25,6 +31,7 @@ const MAX_ENGINES = 16;
  * `env` names the variables that the engine needs: they pass from the core to the program when they are set. `signalOf` reads one line of standard output and says which state
  * the engine claims, or `null` for a line that claims none. The machine decides whether the claim is a legal move.
  * `modelArgs` is the delivery path of a main-model choice: an engine that has none cannot take one, and a choice for it is refused.
+ * The only claims that a line may make are `running` and `waiting`. Any other claim is a fault, and a throw from `signalOf` is a fault too.
  */
 export interface EngineSpec {
   readonly id: string;
@@ -33,7 +40,7 @@ export interface EngineSpec {
   readonly args: readonly string[];
   readonly env: readonly string[];
   readonly billing: Billing;
-  readonly signalOf: (line: string) => SessionState | null;
+  readonly signalOf: (line: string) => string | null;
   readonly modelArgs?: (choice: ModelChoice) => readonly string[];
 }
 
@@ -48,9 +55,18 @@ export interface HostOptions {
   readonly environment?: () => Readonly<Record<string, string | undefined>>;
   /** Finds the real path of a program, or `undefined` when it is not on this computer. The default reads the path, and the folders of PATH for a bare name. */
   readonly locate?: (program: string) => string | undefined;
-  /** Gives the real path of a folder, or `undefined` when it is not a folder. The default is `realpath`, so two names for one folder are one folder. */
-  readonly canonical?: (folder: string) => string | undefined;
-  /** Receives each fault: an illegal move. Standard error by default. */
+  /**
+   * Gives the real path of a folder for display, and a key that names the folder itself, or `undefined` when it is not a folder. The pair rule and the shared folder rule compare keys, so two spellings of one folder
+   * are one folder. The default key is the device and the inode of the real directory, which no spelling, link, case, or normal form changes.
+   */
+  readonly canonical?: (folder: string) => { readonly path: string; readonly key: string } | undefined;
+  /** How long a session may stay `starting`, in milliseconds: a whole number from 1 to 600,000. 30,000 by default. */
+  readonly startTimeoutMs?: number;
+  /** Runs a callback after a delay and gives the function that cancels it. A timer by default. A test passes a clock that it moves by hand. It times the start only. */
+  readonly schedule?: (run: () => void, ms: number) => () => void;
+  /** How long `killAll` waits for the programs to go after the kill signal, in milliseconds: a whole number from 1 to 60,000. 5,000 by default. */
+  readonly killWaitMs?: number;
+  /** Receives each fault and each notable end of a session: an illegal move, an adapter that threw, a start that failed, a program that ended in error. Standard error by default. */
   readonly log?: (entry: FaultEntry) => void;
   /** Makes a session id. A random one by default. A bad or repeated id is a bug, and throws. */
   readonly newId?: () => string;
@@ -126,8 +142,11 @@ export interface EngineHost {
   list(engine?: string): readonly SessionInfo[];
   /** One session as a new frozen copy, or `undefined`. */
   get(sessionId: string): SessionInfo | undefined;
-  /** Kills every process that is still running and waits for it to go. This is the end of the app, and the clean-up of a test. It changes no state by itself: the exits move the sessions. */
-  killAll(): Promise<void>;
+  /**
+   * Kills every process that is still running and waits for it to go. This is the end of the app, and the clean-up of a test. It changes no state by itself: the exits move the sessions.
+   * It gives the number of programs that were still alive when the wait ended, so a caller can tell that a kill did not work.
+   */
+  killAll(): Promise<number>;
   /** The number of processes the host has asked the launcher to start since it was made. */
   readonly launched: number;
   /** How long a stop waits for the engine to go, in milliseconds. A stop plan tells the person. */
@@ -139,15 +158,16 @@ interface Tracked {
   readonly engine: EngineSpec;
   readonly folder: string;
   readonly model: ModelChoice | null;
+  /** The key of the folder, which the pair rule and the shared folder rule compare. `folder` is for display. */
+  readonly key: string;
   handle: Launched | undefined;
   exited: boolean;
+  /** Cancels the start timeout. Safe to call again. */
+  cancelStart: () => void;
   readonly endWaiters: (() => void)[];
 }
 
 const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-/** A control, format, line separator, or paragraph separator character. A text that holds one is never shown in a plan as it is. */
-const UNSAFE_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
-const LOADER_NAME = /^(?:LD_|DYLD_)|^NODE_OPTIONS$/;
 
 const sorted = (names: Iterable<string>): string[] => [...new Set(names)].sort();
 const refusal = (code: Exclude<HostRefusal['code'], 'ENGINE_REQUEST_INVALID'>): HostRefusal => ({ ok: false, code });
@@ -174,11 +194,12 @@ function locateProgram(program: string): string | undefined {
   return undefined;
 }
 
-/** The default `canonical`: the real path of a folder that exists. */
-function canonicalFolder(folder: string): string | undefined {
+/** The default `canonical`: the real path of a folder that exists, and its device and inode as the key. The key is read from the real directory, so no spelling of the path changes it. */
+function canonicalFolder(folder: string): { readonly path: string; readonly key: string } | undefined {
   try {
     const real = fs.realpathSync(folder);
-    return fs.statSync(real).isDirectory() ? real : undefined;
+    const stat = fs.statSync(real);
+    return stat.isDirectory() ? { path: real, key: `${stat.dev}:${stat.ino}` } : undefined;
   } catch {
     return undefined;
   }
@@ -187,10 +208,10 @@ function canonicalFolder(folder: string): string | undefined {
 function checkSpec(spec: EngineSpec): EngineSpec {
   const id = checkEngineId(spec.id);
   if (!id.ok) throw new RangeError('an engine id is lower-case words joined by single hyphens, at most 64 characters');
-  if (typeof spec.title !== 'string' || spec.title === '' || spec.title.length > MAX_NAME_LENGTH || UNSAFE_TEXT.test(spec.title)) throw new RangeError(`the engine ${id.value} needs a title of 1 to 64 plain characters`);
+  if (typeof spec.title !== 'string' || spec.title === '' || spec.title.length > MAX_NAME_LENGTH || hasUnsafeChar(spec.title)) throw new RangeError(`the engine ${id.value} needs a title of 1 to 64 plain characters`);
   if (typeof spec.program !== 'string' || spec.program === '') throw new RangeError(`the engine ${id.value} needs a program`);
   if (!Array.isArray(spec.args) || !spec.args.every(arg => typeof arg === 'string')) throw new RangeError(`the arguments of the engine ${id.value} are a list of text`);
-  if (!Array.isArray(spec.env) || !spec.env.every(name => typeof name === 'string' && VARIABLE_NAME.test(name) && !LOADER_NAME.test(name))) throw new RangeError(`the variables of the engine ${id.value} are a list of plain names`);
+  if (!Array.isArray(spec.env) || !spec.env.every(name => typeof name === 'string' && VARIABLE_NAME.test(name) && !isLoaderVariable(name)) || spec.env.length > MAX_VARIABLES) throw new RangeError(`the variables of the engine ${id.value} are a list of plain names`);
   if (!(BILLING_SOURCES as readonly string[]).includes(spec.billing)) throw new RangeError(`the billing source of the engine ${id.value} is engine-plan or local: a provider key waits for the keys and spend work`);
   if (typeof spec.signalOf !== 'function') throw new RangeError(`the engine ${id.value} needs a signalOf function`);
   if (spec.modelArgs !== undefined && typeof spec.modelArgs !== 'function') throw new RangeError(`the modelArgs of the engine ${id.value} is a function`);
@@ -206,6 +227,10 @@ export function createEngineHost(options: HostOptions): EngineHost {
   if (!Number.isSafeInteger(cap) || cap < 1 || cap > MAX_CAP) throw new RangeError(`the session cap is a whole number from 1 to ${MAX_CAP}`);
   const stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   if (!Number.isSafeInteger(stopTimeoutMs) || stopTimeoutMs < 1 || stopTimeoutMs > MAX_STOP_TIMEOUT_MS) throw new RangeError(`the stop timeout is a whole number of milliseconds from 1 to ${MAX_STOP_TIMEOUT_MS}`);
+  const startTimeoutMs = options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
+  if (!Number.isSafeInteger(startTimeoutMs) || startTimeoutMs < 1 || startTimeoutMs > MAX_STOP_TIMEOUT_MS) throw new RangeError(`the start timeout is a whole number of milliseconds from 1 to ${MAX_STOP_TIMEOUT_MS}`);
+  const killWaitMs = options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
+  if (!Number.isSafeInteger(killWaitMs) || killWaitMs < 1 || killWaitMs > MAX_KILL_WAIT_MS) throw new RangeError(`the kill wait is a whole number of milliseconds from 1 to ${MAX_KILL_WAIT_MS}`);
   if (!Array.isArray(options.engines) || options.engines.length > MAX_ENGINES) throw new RangeError(`the host holds at most ${MAX_ENGINES} engines`);
   const engines = new Map<string, EngineSpec>();
   for (const spec of options.engines) {
@@ -218,6 +243,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
   const locate = options.locate ?? locateProgram;
   const canonical = options.canonical ?? canonicalFolder;
   const log = options.log;
+  const schedule = options.schedule ?? ((run: () => void, ms: number): (() => void) => { const timer = setTimeout(run, ms); return () => clearTimeout(timer); });
   const newId = options.newId ?? ((): string => `s-${randomBytes(8).toString('hex')}`);
   /** Every session ever made, in the order they were made. A Map, so an id such as `__proto__` is only a key. */
   const records = new Map<string, Tracked>();
@@ -227,7 +253,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
     id: record.session.id, engine: record.engine.id, folder: record.folder, state: record.session.state, billing: record.engine.billing,
     model: record.model === null ? null : Object.freeze({ provider: record.model.provider, model: record.model.model }), failure: record.session.failure,
   });
-  const active = (): Tracked[] => [...records.values()].filter(record => !isTerminal(record.session.state));
+  /** The sessions that hold a place: those that have not ended, and those that have ended in state while their process still lives, because a process that lives is a process that runs. */
+  const active = (): Tracked[] => [...records.values()].filter(record => !isTerminal(record.session.state) || !record.exited);
 
   const endOf = (record: Tracked): void => {
     record.exited = true;
@@ -244,32 +271,67 @@ export function createEngineHost(options: HostOptions): EngineHost {
   /** A session marked failed while its program still runs gets the signal that cannot be ignored, so a failed session never has a live process. */
   const killIfRunning = (record: Tracked): void => { if (!record.exited) record.handle?.signal('kill'); };
 
+  const say = (record: Tracked, from: SessionState, message: string): void => {
+    report(log, { session: record.session.id, from, to: record.session.state, message: `engine session ${record.session.id}: ${message}` });
+  };
+
+  /** A fault of the adapter: the first throw fails the session, and the program is killed. The message of the throw is escaped before it is logged. */
+  function adapterFault(record: Tracked, error: unknown): void {
+    const from = record.session.state;
+    record.cancelStart();
+    record.session.fail('adapter_error');
+    say(record, from, `the adapter of ${escapeText(record.engine.id)} threw: ${escapeText(error instanceof Error ? error.message : String(error))}`);
+    killIfRunning(record);
+  }
+
+  /**
+   * A line of the engine may move a session only to `running` or `waiting`. Every other claim is a fault, whatever the table of moves says: the session fails with `illegal_move`, the fault is logged,
+   * and the process group is killed. A session ends only by the exit of its program, by the host's own stop, or by a fault, so no line of an engine can free a place while its process lives.
+   */
   function claim(record: Tracked, line: string): void {
     const state = record.session.state;
     // A stopping session ignores what the engine still says, and so does a session that has ended.
     if (state === 'stopping' || isTerminal(state)) return;
-    let claimed: SessionState | null | undefined;
+    let claimed: unknown;
     try {
       claimed = record.engine.signalOf(line);
     } catch (error) {
-      process.stderr.write(`engine session ${record.session.id}: the adapter of ${record.engine.id} threw on a line: ${error instanceof Error ? error.message : String(error)}\n`);
+      adapterFault(record, error);
       return;
     }
     if (claimed === null || claimed === undefined || claimed === state) return;
-    if (!record.session.move(claimed).ok) killIfRunning(record);
+    if (claimed === 'running' || claimed === 'waiting') {
+      record.session.move(claimed);
+      record.cancelStart();
+      return;
+    }
+    record.cancelStart();
+    record.session.fault(claimed);
+    killIfRunning(record);
   }
 
-  function onExited(record: Tracked, code: number | null, signal: string | null): void {
-    const state = record.session.state;
-    if (state === 'starting') record.session.fail('start_failed');
-    else if (state === 'running' || state === 'waiting') {
+  function describeEnd(code: number | null, signal: string | null): string {
+    return `the program ended with ${code === null ? 'no code' : `code ${code}`} and ${signal === null ? 'no signal' : `the signal ${escapeText(signal)}`}`;
+  }
+
+  function onExited(record: Tracked, code: number | null, signal: string | null, stderrTail: string): void {
+    const before = record.session.state;
+    record.cancelStart();
+    const tail = stderrTail === '' ? '' : `; the end of its standard error: "${escapeText(stderrTail)}"`;
+    if (before === 'starting') record.session.fail('start_failed');
+    else if (before === 'running' || before === 'waiting') {
       if (code === 0 && signal === null) record.session.move('stopped');
       else record.session.fail('crashed');
-    } else if (state === 'stopping') record.session.move('stopped');
+    } else if (before === 'stopping') {
+      record.session.move('stopped');
+      // A stop ends the program with the signal it sent, or with a clean exit. Any other end is logged, and the session is stopped all the same.
+      if (!(code === 0 && signal === null) && signal !== 'SIGTERM' && signal !== 'SIGKILL') say(record, before, `${describeEnd(code, signal)} while it was stopping${tail}`);
+    }
+    if (record.session.state === 'failed' && (before === 'starting' || before === 'running' || before === 'waiting')) say(record, before, `${describeEnd(code, signal)}${tail}`);
     endOf(record);
   }
 
-  function planStart(request: unknown): { readonly ok: true; readonly plan: StartPlanContent } | HostRefusal {
+  function planWithKey(request: unknown): { readonly ok: true; readonly plan: StartPlanContent; readonly key: string } | HostRefusal {
     if (typeof request !== 'object' || request === null || Array.isArray(request)) return invalid('engine');
     const id = checkEngineId(field(request, 'engine'));
     if (!id.ok) return invalid(id.reason);
@@ -277,28 +339,40 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (!folder.ok) return invalid(folder.reason);
     const model = checkModel(field(request, 'model'));
     if (!model.ok) return invalid(model.reason);
-    const allowed = checkVariables(field(request, 'variables'));
+    const allowed = checkVariables(field(request, 'variables'), { denylist: false });
     if (!allowed.ok) return invalid(allowed.reason);
     const spec = engines.get(id.value);
     if (!spec) return refusal('ENGINE_NOT_FOUND');
+    // The denylist is for the names that a caller asks for. A name that the engine declares itself passes, since the plan lists it and a plan that is planned again must be accepted.
+    if (allowed.value.some(name => isRefusedVariable(name) && !spec.env.includes(name))) return invalid('variables');
     const program = locate(spec.program);
     // A program whose path holds a control or separator character is not offered to the person: the plan shows the real path as it is.
-    if (program === undefined || UNSAFE_TEXT.test(program)) return refusal('ENGINE_NOT_FOUND');
+    if (program === undefined || hasUnsafeChar(program)) return refusal('ENGINE_NOT_FOUND');
     const real = canonical(folder.value);
-    if (real === undefined || !checkFolder(real).ok) return invalid('folder');
+    if (real === undefined || !checkFolder(real.path).ok) return invalid('folder');
+    if (typeof real.key !== 'string' || real.key === '') throw new Error('engine host: canonical gave a folder with no key');
     // The core never picks another model on its own: a choice for an engine that cannot take one is refused, and is never dropped.
     if (model.value !== null && spec.modelArgs === undefined) return refusal('MODEL_NOT_FOR_ENGINE');
     const live = active();
-    if (live.some(record => record.engine.id === spec.id && record.folder === real)) return refusal('ENGINE_PAIR_BUSY');
+    // The variables of the plan, those of the engine and those allowed together, are at most 32, so no approved plan fails to start for a count.
+    const variables = sorted([...spec.env, ...allowed.value]);
+    if (variables.length > MAX_VARIABLES) return invalid('variables');
+    if (live.some(record => record.engine.id === spec.id && record.key === real.key)) return refusal('ENGINE_PAIR_BUSY');
     if (live.length >= cap) return refusal('ENGINE_LIMIT');
     return {
       ok: true,
+      key: real.key,
       plan: Object.freeze({
-        engine: spec.id, title: spec.title, program, folder: real, model: model.value, billing: spec.billing,
-        variables: Object.freeze(sorted([...spec.env, ...allowed.value])),
-        sharedWith: Object.freeze(sorted(live.filter(record => record.folder === real).map(record => record.engine.id))),
+        engine: spec.id, title: spec.title, program, folder: real.path, model: model.value, billing: spec.billing,
+        variables: Object.freeze(variables),
+        sharedWith: Object.freeze(sorted(live.filter(record => record.key === real.key).map(record => record.engine.id))),
       }),
     };
+  }
+
+  function planStart(request: unknown): { readonly ok: true; readonly plan: StartPlanContent } | HostRefusal {
+    const planned = planWithKey(request);
+    return planned.ok ? { ok: true, plan: planned.plan } : planned;
   }
 
   /** The environment of the program: the variables the plan lists, when they are set, and nothing else. Built so a name such as `__proto__` is an ordinary variable. */
@@ -313,37 +387,49 @@ export function createEngineHost(options: HostOptions): EngineHost {
   }
 
   function beginStart(plan: StartPlanContent, approvals: { readonly sharedApproved: boolean }): BegunStart | HostRefusal {
-    const fresh = planStart({ engine: plan.engine, folder: plan.folder, model: plan.model, variables: plan.variables });
+    const fresh = planWithKey({ engine: plan.engine, folder: plan.folder, model: plan.model, variables: plan.variables });
     if (!fresh.ok) return fresh;
     // The core plans again from live state, in the same tick, before it calls this. A plan that differs here is a bug in the caller, so it throws.
     if (JSON.stringify(fresh.plan) !== JSON.stringify(plan)) throw new Error('engine host: the plan does not match the state now, so the core must plan again before it begins a start');
-    if (plan.sharedWith.length > 0 && !approvals.sharedApproved) return refusal('ENGINE_FOLDER_SHARED');
+    // Only the value true is the second approval: a truthy value of another kind is not.
+    if (plan.sharedWith.length > 0 && approvals.sharedApproved !== true) return refusal('ENGINE_FOLDER_SHARED');
     const spec = engines.get(plan.engine);
     if (!spec) throw new Error('engine host: an engine that was planned is gone');
     const id = newId();
     if (!checkSessionId(id).ok || records.has(id)) throw new Error('engine host: newId gave a session id that is malformed or already used');
-    const record: Tracked = { session: createSession(id, log), engine: spec, folder: plan.folder, model: plan.model, handle: undefined, exited: false, endWaiters: [] };
+    const record: Tracked = { session: createSession(id, log), engine: spec, folder: plan.folder, key: fresh.key, model: plan.model, handle: undefined, exited: false, cancelStart: () => undefined, endWaiters: [] };
     records.set(id, record);
     // The program was found when the start was planned, and the session is checked ready, so the session walks detected, ready, starting before the program runs.
     record.session.move('ready');
     record.session.move('starting');
     const settled = new Promise<{ readonly ok: true; readonly info: SessionInfo } | HostRefusal>(resolve => {
-      const failed = (): void => {
+      /** The program could not be started. The cause goes to the log with the session id, and the person sees only the bare code. A handle that was made before a throw is killed. */
+      const failed = (error: unknown): void => {
+        const code = typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string' ? `${escapeText((error as { code: string }).code)} ` : '';
+        record.cancelStart();
         record.session.fail('start_failed');
+        say(record, 'starting', `the program could not be started: ${code}${escapeText(error instanceof Error ? error.message : String(error))}`);
+        killIfRunning(record);
         endOf(record);
         resolve(refusal('ENGINE_START_FAILED'));
       };
       try {
-        launched += 1;
         const args = [...spec.args, ...(plan.model !== null && spec.modelArgs !== undefined ? spec.modelArgs(plan.model) : [])];
+        launched += 1;
         const handle = launcher.launch({ program: plan.program, args, cwd: plan.folder, env: environmentOf(plan.variables) });
         record.handle = handle;
+        record.cancelStart = schedule(() => {
+          if (record.session.state !== 'starting') return;
+          record.session.fail('start_failed');
+          say(record, 'starting', `the program did not say it runs within ${startTimeoutMs} ms`);
+          killIfRunning(record);
+        }, startTimeoutMs);
         handle.onSpawn(() => resolve({ ok: true, info: info(record) }));
         handle.onError(failed);
         handle.onLine(line => claim(record, line));
-        handle.onExit((code, signal) => onExited(record, code, signal));
-      } catch {
-        failed();
+        handle.onExit((code, signal, stderrTail) => onExited(record, code, signal, stderrTail));
+      } catch (error) {
+        failed(error);
       }
     });
     return { ok: true, session: id, settled };
@@ -367,6 +453,7 @@ export function createEngineHost(options: HostOptions): EngineHost {
     if (state === 'stopping') {
       record.handle?.signal('kill');
     } else if (state === 'starting' || state === 'running' || state === 'waiting') {
+      record.cancelStart();
       record.session.move('stopping');
       record.handle?.signal('term');
     } else {
@@ -391,7 +478,8 @@ export function createEngineHost(options: HostOptions): EngineHost {
     async killAll() {
       const running = [...records.values()].filter(record => !record.exited);
       for (const record of running) record.handle?.signal('kill');
-      await Promise.all(running.map(record => waitForEnd(record, 5000)));
+      const gone = await Promise.all(running.map(record => waitForEnd(record, killWaitMs)));
+      return gone.filter(went => !went).length;
     },
     get launched() { return launched; },
     get stopTimeoutMs() { return stopTimeoutMs; },

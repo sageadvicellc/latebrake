@@ -14,7 +14,11 @@ type Step =
   | { readonly printCwd: true }
   | { readonly readStdin: true }
   | { readonly hold: true }
-  | { readonly crash: 'SIGSEGV' | 'SIGABRT' };
+  | { readonly crash: 'SIGSEGV' | 'SIGABRT' }
+  | { readonly spawnEscaped: true }
+  | { readonly spawnEscapedHolding: true }
+  | { readonly stderr: string }
+  | { readonly stderrBytes: number };
 
 const argv = process.argv.slice(2);
 const flag = (name: string): string | undefined => { const at = argv.indexOf(name); return at === -1 ? undefined : argv[at + 1]; };
@@ -36,6 +40,17 @@ async function run(): Promise<void> {
       // A helper in the same process group, as a real engine starts for a tool. It lives until a signal ends it. Its argument list holds the tag, so a test can find it.
       const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', '--', `--tag=${tag}`], { stdio: 'ignore' });
       await out(`child:${child.pid ?? 0}`);
+    } else if ('spawnEscaped' in step || 'spawnEscapedHolding' in step) {
+      // A helper that leaves the group of the engine, as a daemon does. A signal to the group of the engine never reaches it. The holding kind also keeps the output pipe of the engine open.
+      const holding = 'spawnEscapedHolding' in step;
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', '--', `--tag=${tag}`], { stdio: holding ? ['ignore', 'inherit', 'inherit'] : 'ignore', detached: true });
+      child.unref();
+      await out(`escaped:${child.pid ?? 0}`);
+    } else if ('stderr' in step) {
+      await new Promise<void>(resolve => { process.stderr.write(step.stderr, () => resolve()); });
+    } else if ('stderrBytes' in step) {
+      const chunk = 'e'.repeat(65_536);
+      for (let sent = 0; sent < step.stderrBytes; sent += chunk.length) await new Promise<void>(resolve => { process.stderr.write(chunk.slice(0, Math.min(chunk.length, step.stderrBytes - sent)), () => resolve()); });
     } else if ('printEnv' in step) {
       // macOS adds `__CF_USER_TEXT_ENCODING` to every process it starts, so the program leaves it out: it is not a variable that the host passed.
       const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== '__CF_USER_TEXT_ENCODING').sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));

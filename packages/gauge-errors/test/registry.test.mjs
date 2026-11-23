@@ -134,7 +134,7 @@ test('the engine codes name what they refuse, in one line each', () => {
   assert.equal(GAUGE_MEANINGS.ENGINE_PAIR_BUSY, 'This engine already has a session in this folder.');
   assert.equal(GAUGE_MEANINGS.ENGINE_FOLDER_SHARED, 'Another engine runs in this folder, so the start needs a second approval from the person.');
   assert.equal(GAUGE_MEANINGS.ENGINE_START_FAILED, 'The program of the engine could not be started, so the session failed.');
-  assert.equal(GAUGE_MEANINGS.ENGINE_SESSION_UNKNOWN, 'No session has that id.');
+  assert.equal(GAUGE_MEANINGS.ENGINE_SESSION_UNKNOWN, 'No session has that id, or none that this Gauge may use.');
   assert.equal(GAUGE_MEANINGS.ENGINE_SESSION_ENDED, 'The session has stopped or failed already, so there is nothing to stop.');
   assert.equal(GAUGE_MEANINGS.ENGINE_STOP_TIMEOUT, 'The engine did not stop in time, so the session stays stopping.');
 });

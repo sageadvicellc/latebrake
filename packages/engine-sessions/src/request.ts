@@ -1,3 +1,5 @@
+import { hasUnsafeChar } from './text.js';
+
 /**
  * The checks on what a start or stop request holds. A value is checked here before a plan is built from it, and before any text of a plan prints it.
  * Every check reads own data properties only, once, and gives back a new frozen value. A refusal is a word of the closed set `REQUEST_REASONS`.
@@ -27,10 +29,22 @@ export interface ModelChoice {
 const NAME = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const SESSION_ID = /^[a-z0-9][a-z0-9-]*$/;
 const VARIABLE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-/** A control, format, line separator, or paragraph separator character. */
-const UNSAFE_CHAR = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
-/** The loader names that make a program run code of the caller's choice: refused as variables to pass. */
-const LOADER_NAME = /^(?:LD_|DYLD_)|^NODE_OPTIONS$/;
+/** The plain charset of a provider and a model: letters, digits, and `. _ : / @ + -`. Nothing that a shell, a flag, or a path means. */
+const CHOICE_CHARS = /^[A-Za-z0-9._:/@+-]+$/;
+/** The names that make a program load code of the caller's choice, or run a start-up script, or trust another set of certificates, or find its tools elsewhere. */
+const LOADER_PREFIX = /^(?:LD_|DYLD_)/;
+const LOADER_NAMES: ReadonlySet<string> = new Set(['NODE_OPTIONS']);
+const REFUSED_NAMES: ReadonlySet<string> = new Set([
+  'NODE_OPTIONS', 'BASH_ENV', 'ENV', 'PYTHONSTARTUP', 'PYTHONPATH', 'PERL5OPT', 'PERL5LIB', 'RUBYOPT', 'RUBYLIB', 'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'NODE_PATH', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'PATH',
+]);
+
+/**
+ * True when a variable may not be passed on the request of a caller. This is a denylist: it names the loader prefixes (`LD_`, `DYLD_`) and the names above, in any case. It cannot name every variable that
+ * changes how a program starts, so it is a floor and not a guarantee. The person sees every name in the plan before it applies.
+ */
+export const isRefusedVariable = (name: string): boolean => LOADER_PREFIX.test(name.toUpperCase()) || REFUSED_NAMES.has(name.toUpperCase());
+/** True for the names that no engine may declare either: the loader prefixes and `NODE_OPTIONS`. An engine may declare `PATH` and `HOME`, since an adapter is trusted code of the app. */
+export const isLoaderVariable = (name: string): boolean => LOADER_PREFIX.test(name.toUpperCase()) || LOADER_NAMES.has(name.toUpperCase());
 
 export const MAX_NAME_LENGTH = 64;
 export const MAX_FOLDER_LENGTH = 1024;
@@ -53,7 +67,7 @@ export function checkSessionId(value: unknown): Checked<string> {
  * It is at most 1,024 characters. The check is on the text only. Whether the folder exists, and which folder a link leads to, is the host's job.
  */
 export function checkFolder(value: unknown): Checked<string> {
-  if (typeof value !== 'string' || value.length > MAX_FOLDER_LENGTH || !value.startsWith('/') || value === '/' || UNSAFE_CHAR.test(value)) return refused('folder');
+  if (typeof value !== 'string' || value.length > MAX_FOLDER_LENGTH || !value.startsWith('/') || value === '/' || hasUnsafeChar(value)) return refused('folder');
   const segments = value.slice(1).split('/');
   if (segments.some(segment => segment === '' || segment === '.' || segment === '..' || segment !== segment.trim())) return refused('folder');
   return good(value);
@@ -65,8 +79,9 @@ function ownData(record: object, key: string): unknown {
   return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
 }
 
+/** A provider or a model: 1 to 128 characters of the plain charset, never starting with a dash (a flag) or an equals sign. */
 const choiceText = (value: unknown): value is string =>
-  typeof value === 'string' && value.length >= 1 && value.length <= MAX_CHOICE_LENGTH && !UNSAFE_CHAR.test(value) && value === value.trim();
+  typeof value === 'string' && value.length >= 1 && value.length <= MAX_CHOICE_LENGTH && CHOICE_CHARS.test(value) && !value.startsWith('-') && !value.startsWith('=');
 
 /** A model choice: `null` (the engine's own default), or exactly a provider and a model, each a short plain text. `undefined` reads as `null`. */
 export function checkModel(value: unknown): Checked<ModelChoice | null> {
@@ -83,17 +98,40 @@ export function checkModel(value: unknown): Checked<ModelChoice | null> {
   }
 }
 
-/** The variables a person allows: none, or a list of at most 32 plain names with no repeat and no loader name. The core sorts them. */
-export function checkVariables(value: unknown): Checked<readonly string[]> {
-  if (value === undefined) return good(Object.freeze([]));
+/** The longest list that `readList` reads when no cap is given. */
+export const MAX_LIST_LENGTH = 4096;
+
+/**
+ * Reads a list once, by index, from own data properties, and gives a new list, or `undefined`. It never uses the iterator of the list, so an iterator that lies is not followed. A subclass of Array, a hole,
+ * an accessor index, a length over `max`, and a list whose reading throws are all refused. The length is checked before any item is read.
+ */
+export function readList(value: unknown, max: number = MAX_LIST_LENGTH): unknown[] | undefined {
   try {
-    if (!Array.isArray(value) || value.length > MAX_VARIABLES) return refused('variables');
-    // A hole in a list is not a name: Array.from reads it as undefined, where `every` would skip it.
-    const names = Array.from(value as unknown[]);
-    const plain = (name: unknown): name is string => typeof name === 'string' && name.length <= MAX_VARIABLE_LENGTH && VARIABLE.test(name) && !LOADER_NAME.test(name);
-    if (!names.every(plain) || new Set(names).size !== names.length) return refused('variables');
-    return good(Object.freeze(names.sort()));
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return undefined;
+    const length: unknown = Object.getOwnPropertyDescriptor(value, 'length')?.value;
+    if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || length > max) return undefined;
+    const items: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (descriptor === undefined || !('value' in descriptor)) return undefined;
+      items.push(descriptor.value);
+    }
+    return items;
   } catch {
-    return refused('variables');
+    return undefined;
   }
+}
+
+/**
+ * The variables a person allows: none, or a list of at most 32 plain names with no repeat and no refused name. The core sorts them. With `denylist: false` the refused names pass, for the host, which lets an engine
+ * keep the names that it declares itself (a plan lists them, and a plan that is planned again must be accepted) and refuses the others.
+ */
+export function checkVariables(value: unknown, options: { readonly denylist?: boolean } = {}): Checked<readonly string[]> {
+  if (value === undefined) return good(Object.freeze([]));
+  const names = readList(value, MAX_VARIABLES);
+  if (names === undefined) return refused('variables');
+  const denylist = options.denylist !== false;
+  const plain = (name: unknown): name is string => typeof name === 'string' && name.length <= MAX_VARIABLE_LENGTH && VARIABLE.test(name) && !(denylist && isRefusedVariable(name));
+  if (!names.every(plain) || new Set(names).size !== names.length) return refused('variables');
+  return good(Object.freeze(names.sort()));
 }

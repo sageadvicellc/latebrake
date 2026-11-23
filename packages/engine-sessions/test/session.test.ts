@@ -19,7 +19,7 @@ const PATH: Readonly<Record<SessionState, readonly SessionState[]>> = {
 };
 const at = (state: SessionState, log: (entry: FaultEntry) => void) => {
   const session = createSession('s-1', log);
-  for (const step of PATH[state]) assert.equal(session.move(step).ok, true, `${state} via ${step}`);
+  for (const step of PATH[state]) assert.equal(step === 'failed' ? session.fail('crashed').ok : session.move(step).ok, true, `${state} via ${step}`);
   assert.equal(session.state, state);
   return session;
 };
@@ -31,13 +31,67 @@ test('a new session is detected, has no failure, and keeps its id', () => {
   assert.equal(session.failure, null);
 });
 
-test('every legal move changes the state, gives ok, and writes no log', () => {
-  for (const [from, to] of LEGAL) {
+test('every legal move changes the state, gives ok, and writes no log: a move to failed goes through fail with a cause', () => {
+  for (const [from, to] of LEGAL.filter(([, target]) => target !== 'failed')) {
     const entries: FaultEntry[] = [];
     const session = at(from, entry => entries.push(entry));
     assert.deepEqual(session.move(to), { ok: true, state: to }, `${from} -> ${to}`);
     assert.equal(session.state, to);
     assert.deepEqual(entries, [], `${from} -> ${to}`);
+  }
+});
+
+test('a bare move to failed is a bug, and it throws with no change: the cause is named by fail', () => {
+  for (const from of ALL) {
+    const entries: FaultEntry[] = [];
+    const session = at(from, entry => entries.push(entry));
+    assert.throws(() => session.move('failed'), /fail\(cause\)/, from);
+    assert.equal(session.state, from);
+    assert.equal(session.failure, from === 'failed' ? session.failure : null);
+    assert.deepEqual(entries, []);
+  }
+});
+
+test('every legal move to failed goes through fail, and gives the cause', () => {
+  for (const [from] of LEGAL.filter(([, target]) => target === 'failed')) {
+    for (const cause of ['start_failed', 'crashed', 'illegal_move', 'adapter_error'] as const) {
+      const session = at(from, () => undefined);
+      assert.deepEqual(session.fail(cause), { ok: true, state: 'failed' }, `${from} ${cause}`);
+      assert.equal(session.failure, cause);
+    }
+  }
+});
+
+test('fault marks a session that has not ended failed with illegal_move, and logs the id and both states, for any claim, a legal move to another state included', () => {
+  for (const from of ['starting', 'running', 'waiting', 'stopping'] as const) {
+    for (const to of ['stopped', 'failed', 'stopping', 'detected', 'ready', 'starting']) {
+      const entries: FaultEntry[] = [];
+      const session = at(from, entry => entries.push(entry));
+      assert.deepEqual(session.fault(to), { ok: false, state: 'failed' }, `${from} ${to}`);
+      assert.equal(session.state, 'failed');
+      assert.equal(session.failure, 'illegal_move');
+      assert.deepEqual(entries, [{ session: 's-1', from, to, message: `engine session s-1: illegal move ${from} -> ${to}` }]);
+    }
+  }
+  for (const from of ['stopped', 'failed'] as const) {
+    const entries: FaultEntry[] = [];
+    const session = at(from, entry => entries.push(entry));
+    assert.deepEqual(session.fault('running'), { ok: false, state: from });
+    assert.equal(session.state, from);
+    assert.equal(entries.length, 1);
+  }
+});
+
+test('the log escapes what the engine sent: a control, bidi, format, or separator character, and a look-alike space, shows as an escape in both the entry and the line', () => {
+  const hostile = 'x\n\u2028\u202e\u200b\u00a0';
+  const escaped = 'x\\u{a}\\u{2028}\\u{202e}\\u{200b}\\u{a0}';
+  for (const act of [(s: ReturnType<typeof at>) => s.move(hostile as never), (s: ReturnType<typeof at>) => s.fault(hostile)]) {
+    const entries: FaultEntry[] = [];
+    const session = at('running', entry => entries.push(entry));
+    act(session);
+    assert.equal(entries[0]?.to, escaped);
+    assert.equal(entries[0]?.message, `engine session s-1: illegal move running -> ${escaped}`);
+    assert.equal(/[\n\u2028\u202e\u200b\u00a0]/.test(entries[0]?.message ?? ''), false);
   }
 });
 
@@ -63,6 +117,7 @@ test('an illegal move on a session that has ended is logged, and the state stays
   for (const from of ['stopped', 'failed'] as const) {
     for (const to of ALL) {
       const entries: FaultEntry[] = [];
+      if (to === 'failed') continue;
       const session = at(from, entry => entries.push(entry));
       const failure = session.failure;
       assert.deepEqual(session.move(to), { ok: false, state: from }, `${from} -> ${to}`);

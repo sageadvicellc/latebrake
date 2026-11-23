@@ -7,7 +7,7 @@ import path from 'node:path';
 import { createEngineHost, type EngineHost, type HostOptions } from '../src/host.js';
 import { fakeEngine, type FakeStep } from '../src/fixtures.js';
 import { createProcessLauncher } from '../src/process-launcher.js';
-import { assertNoLeaks, liveWithTag } from './leaks.js';
+import { assertNoDescendants, assertNoLeaks, killWithTag, liveWithTag } from './leaks.js';
 import { newTag, recording, waitFor } from './support.js';
 
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'engine-sessions-')));
@@ -21,9 +21,14 @@ async function withHost(engines: readonly (readonly [string, readonly FakeStep[]
   const host = createEngineHost({ engines: engines.map(([id, steps, extra]) => fakeEngine({ id, tag, steps, ...(extra ?? {}) })), launcher, ...options });
   try {
     await body(host, tag, launcher);
+    // Before anything is killed: a process that lives behind a session that has ended is a leak of the host, and it must fail the test, not be hidden by the clean-up below.
+    const live = host.list().filter(item => item.state !== 'stopped' && item.state !== 'failed').length;
+    if (live === 0) await assertNoLeaks(tag, 1000);
   } finally {
-    await host.killAll();
+    const survivors = await host.killAll();
     await assertNoLeaks(tag);
+    await assertNoDescendants();
+    assert.equal(survivors, 0, 'a program survived the kill signal');
   }
 }
 async function begin(host: EngineHost, engine: string, dir: string, extra: Record<string, unknown> = {}, sharedApproved = false): Promise<string> {
@@ -70,10 +75,10 @@ test('with no environment given, variables pass from the environment of this pro
 test('a model choice reaches the engine as an argument, and the engine is started with an argument list', async () => {
   const dir = folder('model');
   await withHost([['alpha', [{ printArgs: true }, { say: 'state:running' }, { hold: true }], { takesModel: true }]], {}, async (host, tag, launcher) => {
-    const id = await begin(host, 'alpha', dir, { model: { provider: 'local-llama', model: 'qwen; rm -rf /' } });
+    const id = await begin(host, 'alpha', dir, { model: { provider: 'local-llama', model: 'qwen3-7b' } });
     await waitFor(() => state(host, id) === 'running', 'running');
     const printed = JSON.parse((launcher.lines[0]?.[0] ?? '').slice('args:'.length)) as string[];
-    assert.deepEqual(printed, ['--tag', tag, '--script', JSON.stringify([{ printArgs: true }, { say: 'state:running' }, { hold: true }]), '--model', 'local-llama/qwen; rm -rf /']);
+    assert.deepEqual(printed, ['--tag', tag, '--script', JSON.stringify([{ printArgs: true }, { say: 'state:running' }, { hold: true }]), '--model', 'local-llama/qwen3-7b']);
   });
 });
 
@@ -228,5 +233,108 @@ test('four real sessions run side by side, a fifth is refused, and killAll ends 
     await host.killAll();
     await waitFor(() => ids.every(id => ['stopped', 'failed'].includes(state(host, id) ?? '')), 'all ended');
     await assertNoLeaks(tag);
+  });
+});
+
+test('a real engine that claims it has stopped, while its process lives, is failed with illegal_move and killed, and nothing lives behind it', async () => {
+  for (const claim of ['stopped', 'failed', 'stopping']) {
+    const faults: string[] = [];
+    await withHost([['alpha', [{ say: 'state:running' }, { say: `state:${claim}` }, { hold: true }]]], { log: entry => faults.push(entry.message) }, async (host, tag) => {
+      const id = await begin(host, 'alpha', folder(`claim-${claim}`));
+      await waitFor(() => state(host, id) === 'failed', 'failed');
+      assert.equal(host.get(id)?.failure, 'illegal_move');
+      assert.deepEqual(faults, [`engine session ${id}: illegal move running -> ${claim}`]);
+      await assertNoLeaks(tag);
+    });
+  }
+});
+
+test('a pair stays busy while the process of a failed session lives, and is free once it has gone', async () => {
+  const dir = folder('pair-claim');
+  await withHost([['alpha', [{ say: 'state:running' }, { ignoreTerm: true }, { say: 'state:stopped' }, { hold: true }]]], { cap: 1 }, async (host, tag) => {
+    const id = await begin(host, 'alpha', dir);
+    await waitFor(() => state(host, id) === 'failed', 'failed');
+    await assertNoLeaks(tag);
+    await waitFor(() => host.planStart({ engine: 'alpha', folder: dir }).ok, 'the slot to free once the exit is seen');
+  });
+});
+
+test('a session that never says it runs fails after the start timeout, and its process is killed', async () => {
+  const faults: string[] = [];
+  await withHost([['alpha', [{ hold: true }]]], { startTimeoutMs: 250, log: entry => faults.push(entry.message) }, async (host, tag) => {
+    const id = await begin(host, 'alpha', folder('never-runs'));
+    assert.equal(state(host, id), 'starting');
+    await waitFor(() => state(host, id) === 'failed', 'the start timeout');
+    assert.equal(host.get(id)?.failure, 'start_failed');
+    assert.deepEqual(faults, [`engine session ${id}: the program did not say it runs within 250 ms`]);
+    await assertNoLeaks(tag);
+  });
+});
+
+test('a helper that leaves the group of the engine survives a stop: this is a known limit, and the detector finds it', async () => {
+  await withHost([['alpha', [{ spawnEscaped: true }, { say: 'state:running' }, { hold: true }]]], {}, async (host, tag) => {
+    try {
+      const id = await begin(host, 'alpha', folder('escaped'));
+      await waitFor(() => state(host, id) === 'running', 'running');
+      assert.equal(liveWithTag(tag).length, 2);
+      assert.ok((await host.stop(id)).ok);
+      await waitFor(() => liveWithTag(tag).length === 1, 'the engine to go, and the helper to stay');
+      assert.equal(liveWithTag(tag).length, 1, 'the escaped helper is out of reach of the group kill');
+    } finally {
+      killWithTag(tag);
+    }
+  });
+});
+
+/** Starts alpha in `first`, and checks that another spelling of the folder is the same folder for the pair rule and the shared folder rule. */
+async function sameFolder(first: string, other: string): Promise<void> {
+  await withHost([['alpha', [{ say: 'state:running' }, { hold: true }]], ['beta', [{ say: 'state:running' }, { hold: true }]]], {}, async (host) => {
+    await begin(host, 'alpha', first);
+    assert.deepEqual(host.planStart({ engine: 'alpha', folder: other }), { ok: false, code: 'ENGINE_PAIR_BUSY' }, 'the pair rule');
+    const shared = host.planStart({ engine: 'beta', folder: other });
+    assert.ok(shared.ok);
+    assert.deepEqual(shared.plan.sharedWith, ['alpha'], 'the shared folder rule');
+  });
+}
+
+test('two spellings that differ only in case are one folder on a volume that ignores case', async t => {
+  const dir = folder('casedir');
+  const upper = path.join(root, 'CASEDIR');
+  if (!fs.existsSync(upper) || fs.realpathSync.native(upper) !== fs.realpathSync.native(dir)) { t.skip('this volume tells the two spellings apart'); return; }
+  await sameFolder(dir, upper);
+});
+
+test('two spellings that differ only in the normal form of a letter are one folder on a volume that ignores it', async t => {
+  const composed = path.join(root, 'café-nfc');
+  const decomposed = path.join(root, 'cafe\u0301-nfc'.normalize('NFD'));
+  fs.mkdirSync(composed, { recursive: true });
+  if (composed === decomposed || !fs.existsSync(decomposed)) { t.skip('this volume tells the two spellings apart'); return; }
+  await sameFolder(composed, decomposed);
+});
+
+test('a path through a firmlink and the same path without it are one folder', async t => {
+  const dir = folder('firm');
+  const through = `/System/Volumes/Data${dir}`;
+  if (process.platform !== 'darwin' || !fs.existsSync(through)) { t.skip('this computer has no firmlink to this folder'); return; }
+  await sameFolder(dir, through);
+});
+
+test('a link and its target are one folder, and a second link to the same target is too', async () => {
+  const real = folder('link-target');
+  const one = path.join(root, 'link-one'), two = path.join(root, 'link-two');
+  fs.symlinkSync(real, one);
+  fs.symlinkSync(real, two);
+  await sameFolder(one, two);
+});
+
+test('two folders that only share a prefix, or a name in different places, are two folders', async () => {
+  await withHost([['alpha', [{ say: 'state:running' }, { hold: true }]]], {}, async (host) => {
+    await begin(host, 'alpha', folder('prefix'));
+    const other = host.planStart({ engine: 'alpha', folder: folder('prefix-longer') });
+    assert.ok(other.ok);
+    assert.deepEqual(other.plan.sharedWith, []);
+    const nested = host.planStart({ engine: 'alpha', folder: folder('prefix/inner') });
+    assert.ok(nested.ok, 'a folder inside another is not the same folder');
+    assert.deepEqual(nested.plan.sharedWith, []);
   });
 });

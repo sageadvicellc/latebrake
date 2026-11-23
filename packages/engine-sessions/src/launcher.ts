@@ -20,10 +20,13 @@ export interface Launched {
   onSpawn(listener: () => void): void;
   /** Called once, when the program could not be started. Then no spawn and no exit follow. */
   onError(listener: (error: Error) => void): void;
-  /** Called for each line the program writes to its standard output, cut at 4,096 characters. Standard error is read and dropped. */
+  /** Called for each line the program writes to its standard output, cut at 4,096 characters. Standard error is read, and its end comes with the exit. */
   onLine(listener: (line: string) => void): void;
-  /** Called once, when the program and everything it started are gone. `code` is the exit code, or `null` when a signal ended it. */
-  onExit(listener: (code: number | null, signal: string | null) => void): void;
+  /**
+   * Called once, when the program and everything it started in its group are gone. `code` is the exit code, or `null` when a signal ended it. `stderrTail` is the last 2,048 characters of its standard error,
+   * for the log of a session that failed. It is text that the program wrote, so a reader escapes it.
+   */
+  onExit(listener: (code: number | null, signal: string | null, stderrTail: string) => void): void;
   /** Sends a signal to the program and everything it started. It never throws, and does nothing once they are gone. */
   signal(kind: StopSignal): void;
 }

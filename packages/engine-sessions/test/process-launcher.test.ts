@@ -2,21 +2,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { MAX_LINE_CHARS, createProcessLauncher, lineSplitter } from '../src/process-launcher.js';
+import { CLOSE_GRACE_MS, MAX_LINE_CHARS, STDERR_TAIL_CHARS, createProcessLauncher, killLiveGroups, lineSplitter } from '../src/process-launcher.js';
 import { FAKE_ENGINE_PROGRAM, type FakeStep } from '../src/fixtures.js';
 import type { Launched } from '../src/launcher.js';
-import { assertNoLeaks, killWithTag, leavesBehind, liveWithTag } from './leaks.js';
+import { assertNoDescendants, assertNoLeaks, killWithTag, leavesBehind, liveDescendants, liveWithTag } from './leaks.js';
 import { newTag, waitFor } from './support.js';
 
 /** Runs a fake engine to its end through the process launcher, and gives what it wrote and how it ended. */
 async function run(steps: readonly FakeStep[], tag: string, extra: readonly string[] = [], env: Record<string, string> = {}) {
   const lines: string[] = [];
   let ended: { code: number | null; signal: string | null } | undefined;
+  let tail: string | undefined;
   const handle = createProcessLauncher().launch({ program: process.execPath, args: [FAKE_ENGINE_PROGRAM, '--tag', tag, '--script', JSON.stringify(steps), ...extra], cwd: process.cwd(), env });
   handle.onLine(line => lines.push(line));
-  handle.onExit((code, signal) => { ended = { code, signal }; });
+  handle.onExit((code, signal, stderrTail) => { ended = { code, signal }; tail = stderrTail; });
   await waitFor(() => ended !== undefined, 'the program to end');
-  return { lines, ended, handle };
+  return { lines, ended, handle, tail };
 }
 
 function splitting(chunks: readonly string[]): string[] {
@@ -189,4 +190,99 @@ test('the orphan detector finds a process that was deliberately left running, an
     await exited;
   }
   assert.deepEqual(await leavesBehind(tag), [], 'after the kill the detector finds nothing');
+});
+
+test('the last 2,048 characters of standard error come with the exit, and a short standard error comes whole', async () => {
+  assert.equal(STDERR_TAIL_CHARS, 2048);
+  const tag = newTag();
+  try {
+    const small = await run([{ stderr: 'one\ntwo\n' }], tag);
+    assert.equal(small.tail, 'one\ntwo\n');
+    const big = await run([{ stderr: `${'x'.repeat(5000)}END` }], tag);
+    assert.equal(big.tail?.length, 2048);
+    assert.equal(big.tail?.endsWith('xxxEND'), true);
+    assert.equal(big.tail?.startsWith('x'), true);
+    const none = await run([{ say: 'quiet' }], tag);
+    assert.equal(none.tail, '');
+  } finally {
+    await assertNoLeaks(tag);
+  }
+});
+
+test('standard error is drained: a program that writes two megabytes to it still ends', async () => {
+  const tag = newTag();
+  try {
+    const { ended, tail } = await run([{ stderrBytes: 2_000_000 }, { say: 'done' }], tag);
+    assert.deepEqual(ended, { code: 0, signal: null });
+    assert.equal(tail?.length, 2048);
+  } finally {
+    await assertNoLeaks(tag);
+  }
+});
+
+test('a helper that left the group and holds the output pipe cannot hold the exit: it is reported after the grace, and the helper is out of reach', async () => {
+  assert.equal(CLOSE_GRACE_MS, 500);
+  const tag = newTag();
+  try {
+    const began = Date.now();
+    const { ended, lines } = await run([{ spawnEscapedHolding: true }, { say: 'last' }, { exit: 0 }], tag);
+    const took = Date.now() - began;
+    assert.deepEqual(ended, { code: 0, signal: null });
+    assert.equal(lines.includes('last'), true, 'the output that came before the exit is not lost');
+    assert.ok(took >= CLOSE_GRACE_MS - 50, `the exit waited for the output to close: ${took} ms`);
+    assert.ok(took < 4000, `and did not wait for ever: ${took} ms`);
+    assert.equal(liveWithTag(tag).length, 1, 'the helper left the group, so no signal to the group reached it: this is a known limit');
+  } finally {
+    killWithTag(tag);
+    await assertNoLeaks(tag);
+  }
+});
+
+test('a helper that left the group without holding the pipe also survives the program, and the detector finds it', async () => {
+  const tag = newTag();
+  try {
+    await run([{ spawnEscaped: true }, { say: 'x' }, { exit: 0 }], tag);
+    await waitFor(() => liveWithTag(tag).length === 1, 'the escaped helper to show');
+    assert.equal(liveWithTag(tag).length, 1);
+  } finally {
+    killWithTag(tag);
+    await assertNoLeaks(tag);
+  }
+});
+
+test('killLiveGroups kills every program that is still running, at once, and reports each as a signal exit', async () => {
+  const tag = newTag();
+  try {
+    const exits: (string | null)[] = [];
+    const launcher = createProcessLauncher();
+    for (let index = 0; index < 2; index += 1) {
+      const handle = launcher.launch({ program: process.execPath, args: [FAKE_ENGINE_PROGRAM, '--tag', tag, '--script', JSON.stringify([{ spawnChild: true }, { hold: true }])], cwd: process.cwd(), env: {} });
+      handle.onExit((_code, signal) => { exits.push(signal); });
+    }
+    await waitFor(() => liveWithTag(tag).length === 4, 'two programs and two helpers');
+    killLiveGroups();
+    await waitFor(() => exits.length === 2, 'both exits');
+    assert.deepEqual(exits, ['SIGKILL', 'SIGKILL']);
+    assert.deepEqual(await leavesBehind(tag), []);
+    assert.doesNotThrow(() => killLiveGroups(), 'nothing is left, so it does nothing');
+  } finally {
+    await assertNoLeaks(tag);
+  }
+});
+
+test('the orphan detector finds a leaked process by its parent links alone, with no tag in its arguments', async () => {
+  const { spawn: start } = await import('node:child_process');
+  const parent = start(process.execPath, ['-e', "require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); setInterval(() => {}, 1000)"], { stdio: 'ignore' });
+  try {
+    await waitFor(() => liveDescendants(process.pid).length === 2, 'the untagged parent and its child to show');
+    const found = liveDescendants(process.pid);
+    assert.equal(found.some(item => item.pid === parent.pid), true, 'the child of this process');
+    assert.equal(found.some(item => item.pid !== parent.pid), true, 'and its own child, one level down');
+    assert.equal(found.some(item => /^ps\s/.test(item.args)), false, 'the ps that lists them is not one of them');
+    await assert.rejects(assertNoDescendants(100), /a child process was left behind: \d+ /);
+  } finally {
+    parent.kill('SIGKILL');
+    for (const { pid } of liveDescendants(process.pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+  }
+  await assertNoDescendants(2000);
 });

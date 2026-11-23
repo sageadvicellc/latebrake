@@ -46,7 +46,7 @@ const ENTRIES = [
   { code: 'ENGINE_PAIR_BUSY', meaning: 'This engine already has a session in this folder.' },
   { code: 'ENGINE_FOLDER_SHARED', meaning: 'Another engine runs in this folder, so the start needs a second approval from the person.' },
   { code: 'ENGINE_START_FAILED', meaning: 'The program of the engine could not be started, so the session failed.' },
-  { code: 'ENGINE_SESSION_UNKNOWN', meaning: 'No session has that id.' },
+  { code: 'ENGINE_SESSION_UNKNOWN', meaning: 'No session has that id, or none that this Gauge may use.' },
   { code: 'ENGINE_SESSION_ENDED', meaning: 'The session has stopped or failed already, so there is nothing to stop.' },
   { code: 'ENGINE_STOP_TIMEOUT', meaning: 'The engine did not stop in time, so the session stays stopping.' },
 ] as const;

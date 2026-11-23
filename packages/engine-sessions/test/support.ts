@@ -47,32 +47,32 @@ export interface ManualProgram {
   /** The signals the host sent, in order. */
   readonly signals: StopSignal[];
   spawn(): void;
-  fail(message: string): void;
+  fail(message: string, code?: string): void;
   line(text: string): void;
-  exit(code: number | null, signal?: string | null): void;
+  exit(code: number | null, signal?: string | null, stderrTail?: string): void;
 }
 
 /** A launcher that starts no process. It gives a `ManualProgram` for each launch, for tests of the state changes. */
-export function manualLauncher(options: { readonly throwOnLaunch?: boolean } = {}): Launcher & { readonly programs: readonly ManualProgram[] } {
+export function manualLauncher(options: { readonly throwOnLaunch?: boolean; readonly throwOnListen?: boolean } = {}): Launcher & { readonly programs: readonly ManualProgram[] } {
   const programs: ManualProgram[] = [];
   return {
     programs,
     launch(spec): Launched {
       if (options.throwOnLaunch === true) throw new Error('the launcher broke');
-      const listeners = { spawn: [] as (() => void)[], error: [] as ((error: Error) => void)[], line: [] as ((line: string) => void)[], exit: [] as ((code: number | null, signal: string | null) => void)[] };
+      const listeners = { spawn: [] as (() => void)[], error: [] as ((error: Error) => void)[], line: [] as ((line: string) => void)[], exit: [] as ((code: number | null, signal: string | null, stderrTail: string) => void)[] };
       const signals: StopSignal[] = [];
       programs.push({
         spec,
         signals,
         spawn: () => listeners.spawn.forEach(listener => listener()),
-        fail: message => listeners.error.forEach(listener => listener(new Error(message))),
+        fail: (message, code) => listeners.error.forEach(listener => listener(code === undefined ? new Error(message) : Object.assign(new Error(message), { code }))),
         line: text => listeners.line.forEach(listener => listener(text)),
-        exit: (code, signal = null) => listeners.exit.forEach(listener => listener(code, signal)),
+        exit: (code, signal = null, stderrTail = '') => listeners.exit.forEach(listener => listener(code, signal, stderrTail)),
       });
       return {
         onSpawn: listener => { listeners.spawn.push(listener); },
         onError: listener => { listeners.error.push(listener); },
-        onLine: listener => { listeners.line.push(listener); },
+        onLine: listener => { if (options.throwOnListen === true) throw new Error('the listener broke'); listeners.line.push(listener); },
         onExit: listener => { listeners.exit.push(listener); },
         signal: kind => { signals.push(kind); },
       };
