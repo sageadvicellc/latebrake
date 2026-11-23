@@ -53,6 +53,20 @@ test('a real engine starts in its folder, the session reads running from its own
   }
 });
 
+test('with no environment given, variables pass from the environment of this process', async () => {
+  const dir = folder('default-env');
+  process.env['ENGINE_SESSIONS_DEFAULT_ENV'] = 'from-this-process';
+  try {
+    await withHost([['alpha', [{ printEnv: true }, { say: 'state:running' }, { hold: true }], { env: ['ENGINE_SESSIONS_DEFAULT_ENV', 'ENGINE_SESSIONS_NOT_SET'] }]], {}, async (host, _tag, launcher) => {
+      const id = await begin(host, 'alpha', dir);
+      await waitFor(() => state(host, id) === 'running', 'running');
+      assert.deepEqual(launcher.lines[0]?.[0], `env:${JSON.stringify({ ENGINE_SESSIONS_DEFAULT_ENV: 'from-this-process' })}`);
+    });
+  } finally {
+    delete process.env['ENGINE_SESSIONS_DEFAULT_ENV'];
+  }
+});
+
 test('a model choice reaches the engine as an argument, and the engine is started with an argument list', async () => {
   const dir = folder('model');
   await withHost([['alpha', [{ printArgs: true }, { say: 'state:running' }, { hold: true }], { takesModel: true }]], {}, async (host, tag, launcher) => {

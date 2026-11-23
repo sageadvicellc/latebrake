@@ -271,14 +271,20 @@ test('a line that repeats the state the session is in is no move and no fault', 
   const id = await startOne(r, 'alpha', '/work/one');
   programOf(r, 0).line('state:running');
   programOf(r, 0).line('state:running');
+  assert.equal(stateOf(r, id), 'running');
+  programOf(r, 0).line('state:waiting');
+  programOf(r, 0).line('state:waiting');
+  assert.equal(stateOf(r, id), 'waiting');
+  assert.deepEqual(r.faults, []);
+});
+
+test('a claim of an earlier state is an illegal move, and not a repeat', async () => {
+  const r = rig();
+  const id = await startOne(r, 'alpha', '/work/one');
+  programOf(r, 0).line('state:running');
   programOf(r, 0).line('state:starting');
-  assert.equal(stateOf(r, id) === 'failed', true, 'a claim of an earlier state is an illegal move');
-  const again = rig();
-  const second = await startOne(again, 'alpha', '/work/one');
-  programOf(again, 0).line('state:running');
-  programOf(again, 0).line('state:running');
-  assert.equal(stateOf(again, second), 'running');
-  assert.deepEqual(again.faults, []);
+  assert.equal(stateOf(r, id), 'failed');
+  assert.deepEqual(r.faults.map(entry => [entry.from, entry.to]), [['running', 'starting']]);
 });
 
 test('a claim that is not a legal move marks the session failed with illegal_move, logs the id and both states, and kills the program', async () => {
@@ -485,6 +491,12 @@ test('a read gives a new frozen copy with no output of the engine, oldest first,
   assert.deepEqual(r.host.list('alpha').map(item => item.id), [one, three]);
   assert.deepEqual(r.host.list('nothing'), []);
   assert.deepEqual(Object.keys(all[0] ?? {}).sort(), ['billing', 'engine', 'failure', 'folder', 'id', 'model', 'state']);
+  const picky = rig({}, [spec('picky', { modelArgs: choice => [choice.model] })]);
+  const chosen = await startOne(picky, 'picky', '/work/one', { model: { provider: 'p', model: 'm' } });
+  const first = picky.host.get(chosen)?.model, second = picky.host.get(chosen)?.model;
+  assert.deepEqual(first, { provider: 'p', model: 'm' });
+  assert.notEqual(first, second, 'the model of a read is a new object each time');
+  assert.equal(Object.isFrozen(first), true);
   assert.equal(Object.isFrozen(all), true);
   assert.equal(Object.isFrozen(all[0]), true);
   assert.notEqual(r.host.get(one), r.host.get(one));

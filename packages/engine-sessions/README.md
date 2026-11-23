@@ -113,7 +113,7 @@ All codes are in `packages/gauge-errors`.
 
 ## Not built
 
-Real engine adapters, detection and the list of engines on the computer, the preview switch, `ENGINE_VERSION_UNKNOWN`, `ENGINE_PREVIEW_OFF`, `ENGINE_HARNESS_BLOCKED`, the iCloud Drive refusal, the model catalog and its checks, keys, `MODEL_SPEND_NOT_APPROVED`, the live message stream, attach and send, the terminal pane, "Stop all" on quit, a start-signal timeout, Windows and Linux process handling, and a check of the engine version.
+Real engine adapters, detection and the list of engines on the computer, the preview switch, `ENGINE_VERSION_UNKNOWN`, `ENGINE_PREVIEW_OFF`, `ENGINE_HARNESS_BLOCKED`, the iCloud Drive refusal, the model catalog and its checks, keys, `MODEL_SPEND_NOT_APPROVED`, the live message stream, attach and send, the terminal pane, "Stop all" on quit, a start-signal timeout, removal of ended sessions from the host (it keeps every session it made), Windows and Linux process handling, and a check of the engine version.
 
 ## The fake engine
 
