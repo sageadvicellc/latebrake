@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PERMISSIONS, PERMISSION_NAMES, isPermission, isTracesPermission, permissionOf, GRANT_REASONS, isGrantReason, validateManifest } from '../src/index.js';
+import { AUDIT_REASONS, PERMISSIONS, PERMISSION_NAMES, isAuditReason, isPermission, isTracesPermission, permissionOf, GRANT_REASONS, isGrantReason, validateManifest, type PermissionName } from '../src/index.js';
 import { validManifest } from '../src/fixtures.js';
 
 // The list, written out here so a change to it fails a test on purpose: a permission name is a promise to Gauge authors.
@@ -81,9 +81,27 @@ test('isTracesPermission is true for the two traces permissions only', () => {
 });
 
 test('the grant reasons are a closed set of lower-case words, once each', () => {
-  assert.deepEqual([...GRANT_REASONS], ['unknown_permission', 'not_declared', 'engine_not_listed', 'gauge_disabled', 'not_held', 'invalid_request']);
+  assert.deepEqual([...GRANT_REASONS], ['unknown_permission', 'not_declared', 'engine_not_listed', 'gauge_disabled', 'invalid_request', 'facts_required']);
   for (const reason of GRANT_REASONS) assert.equal(isGrantReason(reason), true, reason);
-  for (const value of ['syntax', 'toString', '', undefined, null, 5]) assert.equal(isGrantReason(value), false, String(value));
+  for (const value of ['syntax', 'not_held', 'toString', '', undefined, null, 5]) assert.equal(isGrantReason(value), false, String(value));
+});
+
+test('the audit reasons are a closed set of two words', () => {
+  assert.deepEqual([...AUDIT_REASONS], ['clock_unusable', 'write_failed']);
+  for (const reason of AUDIT_REASONS) assert.equal(isAuditReason(reason), true, reason);
+  for (const value of ['syntax', 'invalid_request', 'toString', '', undefined, null, 5]) assert.equal(isAuditReason(value), false, String(value));
+});
+
+test('a permission name has a literal type, so a typed name needs a listed one', () => {
+  const name: PermissionName = 'traces.text';
+  assert.equal(isPermission(name), true);
+  const unknown: unknown = 'engines.read';
+  if (isPermission(unknown)) {
+    const narrowed: PermissionName = unknown;
+    assert.equal(permissionOf(narrowed)?.name, 'engines.read');
+  } else {
+    assert.fail('engines.read is a permission');
+  }
 });
 
 const withPermissions = (permissions: unknown) => JSON.stringify({ ...JSON.parse(validManifest('tile-only')), permissions });

@@ -16,8 +16,16 @@
 export const PERMISSION_KINDS = Object.freeze(['read', 'write', 'act'] as const);
 export type PermissionKind = (typeof PERMISSION_KINDS)[number];
 
+const NAMES = [
+  'engines.read', 'usage.read', 'models.read', 'sessions.read', 'sessions.stream', 'sessions.start', 'sessions.stop', 'sessions.attach', 'sessions.send',
+  'layout.propose', 'jobs.read', 'jobs.write', 'jobs.run', 'traces.facts', 'traces.text',
+] as const;
+
+/** A name in the permission list, as a literal type. */
+export type PermissionName = (typeof NAMES)[number];
+
 export interface PermissionEntry {
-  readonly name: string;
+  readonly name: PermissionName;
   readonly kind: PermissionKind;
   readonly scope: 'engine' | 'none';
   readonly traces: boolean;
@@ -25,31 +33,34 @@ export interface PermissionEntry {
   readonly meaning: string;
 }
 
-const entry = (name: string, kind: PermissionKind, scope: 'engine' | 'none', meaning: string, traces = false): PermissionEntry =>
-  Object.freeze({ name, kind, scope, traces, meaning });
+type Definition = Omit<PermissionEntry, 'name'>;
+const define = (kind: PermissionKind, scope: 'engine' | 'none', meaning: string, traces = false): Definition => ({ kind, scope, traces, meaning });
 const NEVER_SKIPS = ' The Gauge never skips the plan.';
 
+/** The definition of each name. The type is a record over every name, so a name without a definition does not compile. */
+const DEFINITIONS: Readonly<Record<PermissionName, Definition>> = {
+  'engines.read': define('read', 'engine', 'Read the state of the engines the Gauge lists.'),
+  'usage.read': define('read', 'engine', 'Read the usage figures of the engines the Gauge lists.'),
+  'models.read': define('read', 'engine', 'Read the models of the engines the Gauge lists.'),
+  'sessions.read': define('read', 'engine', 'Read the sessions of the engines the Gauge lists.'),
+  'sessions.stream': define('read', 'engine', 'Read the live message stream of a session on an engine the Gauge lists.'),
+  'sessions.start': define('act', 'engine', `Ask for a plan to start a session on an engine the Gauge lists.${NEVER_SKIPS}`),
+  'sessions.stop': define('act', 'engine', `Ask for a plan to stop a session on an engine the Gauge lists.${NEVER_SKIPS}`),
+  'sessions.attach': define('act', 'engine', `Ask for a plan to attach to a running session on an engine the Gauge lists.${NEVER_SKIPS}`),
+  'sessions.send': define('act', 'engine', `Ask for a plan to send text to a session on an engine the Gauge lists.${NEVER_SKIPS}`),
+  'layout.propose': define('write', 'none', `Ask for a plan to add the Gauge to the layout.${NEVER_SKIPS}`),
+  'jobs.read': define('read', 'none', 'Read the saved jobs and their runs.'),
+  'jobs.write': define('write', 'none', `Ask for a plan to create or change a job.${NEVER_SKIPS}`),
+  'jobs.run': define('act', 'none', `Ask for a plan to run a job.${NEVER_SKIPS}`),
+  'traces.facts': define('read', 'engine', 'Read the recorded facts of traces from the engines the Gauge lists. Denied until the person grants it.', true),
+  'traces.text': define('read', 'engine', 'Read the prompt and reply text of traces, together with traces.facts. Denied until the person grants it.', true),
+};
+
 /** Every permission, with its one-line meaning, in a fixed order. Frozen. */
-export const PERMISSIONS: readonly PermissionEntry[] = Object.freeze([
-  entry('engines.read', 'read', 'engine', 'Read the state of the engines the Gauge lists.'),
-  entry('usage.read', 'read', 'engine', 'Read the usage figures of the engines the Gauge lists.'),
-  entry('models.read', 'read', 'engine', 'Read the models of the engines the Gauge lists.'),
-  entry('sessions.read', 'read', 'engine', 'Read the sessions of the engines the Gauge lists.'),
-  entry('sessions.stream', 'read', 'engine', 'Read the live message stream of a session on an engine the Gauge lists.'),
-  entry('sessions.start', 'act', 'engine', `Ask for a plan to start a session on an engine the Gauge lists.${NEVER_SKIPS}`),
-  entry('sessions.stop', 'act', 'engine', `Ask for a plan to stop a session on an engine the Gauge lists.${NEVER_SKIPS}`),
-  entry('sessions.attach', 'act', 'engine', `Ask for a plan to attach to a running session on an engine the Gauge lists.${NEVER_SKIPS}`),
-  entry('sessions.send', 'act', 'engine', `Ask for a plan to send text to a session on an engine the Gauge lists.${NEVER_SKIPS}`),
-  entry('layout.propose', 'write', 'none', `Ask for a plan to add the Gauge to the layout.${NEVER_SKIPS}`),
-  entry('jobs.read', 'read', 'none', 'Read the saved jobs and their runs.'),
-  entry('jobs.write', 'write', 'none', `Ask for a plan to create or change a job.${NEVER_SKIPS}`),
-  entry('jobs.run', 'act', 'none', `Ask for a plan to run a job.${NEVER_SKIPS}`),
-  entry('traces.facts', 'read', 'engine', 'Read the recorded facts of traces from the engines the Gauge lists. Denied until the person grants it.', true),
-  entry('traces.text', 'read', 'engine', 'Read the prompt and reply text of traces, together with traces.facts. Denied until the person grants it.', true),
-]);
+export const PERMISSIONS: readonly PermissionEntry[] = Object.freeze(NAMES.map((name): PermissionEntry => Object.freeze({ name, ...DEFINITIONS[name] })));
 
 /** Every permission name, in the order of the list. Frozen. */
-export const PERMISSION_NAMES: readonly string[] = Object.freeze(PERMISSIONS.map(permission => permission.name));
+export const PERMISSION_NAMES: readonly PermissionName[] = Object.freeze(PERMISSIONS.map(permission => permission.name));
 
 const BY_NAME: ReadonlyMap<string, PermissionEntry> = new Map(PERMISSIONS.map(permission => [permission.name, permission]));
 
@@ -59,7 +70,7 @@ export function permissionOf(value: unknown): PermissionEntry | undefined {
 }
 
 /** True when the value is a name in the list. */
-export function isPermission(value: unknown): value is string {
+export function isPermission(value: unknown): value is PermissionName {
   return permissionOf(value) !== undefined;
 }
 
@@ -76,10 +87,11 @@ export function isTracesPermission(value: unknown): boolean {
  * - `not_declared`: a listed name that the Gauge's manifest does not declare.
  * - `engine_not_listed`: an engine that the Gauge's manifest does not list, or no engine for a permission that needs one.
  * - `gauge_disabled`: the Gauge is disabled, so it holds no active grant.
- * - `not_held`: a revoke of a permission that the Gauge does not hold.
- * - `invalid_request`: a request of the wrong shape: not a list of names, an empty list, a repeat, or a value that is not text.
+ * - `invalid_request`: a request of the wrong shape: not a list of names, an empty list, a repeat, a value that is not text, a revoke that names both or neither of a list and a group,
+ *   a group that is not `traces`, or an engine given for a permission that touches no engine.
+ * - `facts_required`: `traces.text` is held, but `traces.facts` is not, and the text is readable only together with the facts.
  */
-export const GRANT_REASONS = Object.freeze(['unknown_permission', 'not_declared', 'engine_not_listed', 'gauge_disabled', 'not_held', 'invalid_request'] as const);
+export const GRANT_REASONS = Object.freeze(['unknown_permission', 'not_declared', 'engine_not_listed', 'gauge_disabled', 'invalid_request', 'facts_required'] as const);
 export type GrantReason = (typeof GRANT_REASONS)[number];
 
 const GRANT_REASON_SET: ReadonlySet<string> = new Set(GRANT_REASONS);
@@ -87,4 +99,18 @@ const GRANT_REASON_SET: ReadonlySet<string> = new Set(GRANT_REASONS);
 /** True when the value is one of the grant reasons. */
 export function isGrantReason(value: unknown): value is GrantReason {
   return typeof value === 'string' && GRANT_REASON_SET.has(value);
+}
+
+/**
+ * Why a grant was refused with the code `GAUGE_AUDIT_FAILED`, as a closed set. A grant is recorded in the audit file before it takes effect, so a grant whose record cannot
+ * be written is refused. `clock_unusable`: the wall clock gave no usable time. `write_failed`: the audit file could not be written.
+ */
+export const AUDIT_REASONS = Object.freeze(['clock_unusable', 'write_failed'] as const);
+export type AuditReason = (typeof AUDIT_REASONS)[number];
+
+const AUDIT_REASON_SET: ReadonlySet<string> = new Set(AUDIT_REASONS);
+
+/** True when the value is one of the audit reasons. */
+export function isAuditReason(value: unknown): value is AuditReason {
+  return typeof value === 'string' && AUDIT_REASON_SET.has(value);
 }

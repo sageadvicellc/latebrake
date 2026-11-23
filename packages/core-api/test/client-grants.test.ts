@@ -13,7 +13,8 @@ const A = 'a'.repeat(64), B = 'b'.repeat(64), C = 'c'.repeat(64), D = 'd'.repeat
 const PLAN: GrantPlan = { action: 'grant', id: 'fixture-solo', version: '1.0.0', permissions: ['engines.read', 'usage.read'], steps: ['one', 'two'], digest: A, manifestHash: B, folderHash: C, nonce: D };
 const REQUEST = ['usage.read', 'engines.read'];
 const planning = (result: unknown, request: readonly string[] = REQUEST) => createCoreClient(ok(result)).planGrant('fixture-solo', request);
-const ENTRY = { permission: 'engines.read', manifestHash: B, folderHash: C, current: true };
+const ENTRY = { permission: 'engines.read', manifestHash: B, folderHash: C };
+const READ = (entries: unknown[], extra: Record<string, unknown> = {}) => ({ entries, firstSeq: (entries[0] as { seq?: number } | undefined)?.seq ?? null, droppedCount: Math.max(0, ((entries[0] as { seq?: number } | undefined)?.seq ?? 1) - 1), auditFailed: false, ...extra });
 const AUDIT = { seq: 1, at: '2026-01-02T03:04:05.006Z', action: 'grant', via: 'plan', id: 'fixture-solo', version: '1.0.0', permission: 'engines.read', manifestHash: B, folderHash: C };
 
 test('each grants call sends its params under a bowerloom wire name', async () => {
@@ -83,6 +84,26 @@ test('a grant plan of the wrong shape, or for another request, is a protocol err
   }
 });
 
+test('a sparse steps list in a grant plan is a protocol error, because a hole is not a line of text', async () => {
+  const sparse: unknown[] = ['one'];
+  sparse[2] = 'three';
+  assert.equal(sparse.length, 3);
+  await assert.rejects(planning({ ...PLAN, steps: sparse }), CoreProtocolError);
+  await assert.rejects(planning({ ...PLAN, steps: new Array<string>(2) }), CoreProtocolError);
+  const sparseNames: unknown[] = ['engines.read'];
+  sparseNames[2] = 'usage.read';
+  await assert.rejects(planning({ ...PLAN, permissions: sparseNames }), CoreProtocolError);
+});
+
+test('a sparse list of permissions in a revoke, an applied grant, or a list reply is a protocol error', async () => {
+  await assert.rejects(revoking({ id: 'fixture-solo', revoked: new Array<string>(2) }), CoreProtocolError);
+  await assert.rejects(createCoreClient(ok({ id: 'fixture-solo', revoked: new Array<string>(1) })).revokeTraces('fixture-solo'), CoreProtocolError);
+  const sparse: unknown[] = [];
+  sparse[1] = 'usage.read';
+  await assert.rejects(revoking({ id: 'fixture-solo', revoked: sparse }), CoreProtocolError);
+  await assert.rejects(createCoreClient(ok({ id: 'fixture-solo', permissions: new Array<string>(1) })).applyGrant({ ...PLAN, permissions: [] as never }, 'approval'), CoreProtocolError);
+});
+
 test('a grant plan reply that asks for more permissions than were requested is refused, even when the list is valid', async () => {
   await assert.rejects(planning({ ...PLAN, permissions: ['engines.read', 'traces.facts', 'usage.read'] }), CoreProtocolError);
   await assert.rejects(planning({ ...PLAN, permissions: ['traces.facts'] }, ['traces.facts', 'traces.text']), CoreProtocolError);
@@ -129,19 +150,25 @@ test('an applied grant that does not match the plan is a protocol error', async 
 const revoking = (result: unknown, permissions: readonly string[] = ['usage.read', 'engines.read']) => createCoreClient(ok(result)).revoke('fixture-solo', permissions);
 const REVOKED = { id: 'fixture-solo', revoked: ['engines.read', 'usage.read'] };
 
-test('a revoke reply must name exactly the permissions that were asked, sorted', async () => {
+test('a revoke reply names the permissions that were held and are now revoked: sorted, once each, and only among those asked', async () => {
   assert.deepEqual(await revoking({ ...REVOKED, extra: 1 }), { ok: true, value: REVOKED });
-  for (const result of [null, {}, { ...REVOKED, id: 'other' }, { ...REVOKED, revoked: ['engines.read'] }, { ...REVOKED, revoked: ['engines.read', 'usage.read', 'jobs.run'] },
-    { ...REVOKED, revoked: ['usage.read', 'engines.read'] }, { ...REVOKED, revoked: 'x' }, { ...REVOKED, revoked: [5, 6] }, { id: 'fixture-solo' }]) {
+  assert.deepEqual(await revoking({ id: 'fixture-solo', revoked: ['usage.read'] }), { ok: true, value: { id: 'fixture-solo', revoked: ['usage.read'] } });
+  assert.deepEqual(await revoking({ id: 'fixture-solo', revoked: [] }), { ok: true, value: { id: 'fixture-solo', revoked: [] } });
+  const frozen = await revoking(REVOKED);
+  assert.ok(frozen.ok);
+  assert.equal(Object.isFrozen(frozen.value.revoked), true);
+  for (const result of [null, {}, { ...REVOKED, id: 'other' }, { ...REVOKED, revoked: ['engines.read', 'usage.read', 'jobs.run'] }, { ...REVOKED, revoked: ['jobs.run'] },
+    { ...REVOKED, revoked: ['usage.read', 'engines.read'] }, { ...REVOKED, revoked: ['usage.read', 'usage.read'] }, { ...REVOKED, revoked: 'x' }, { ...REVOKED, revoked: [5, 6] }, { id: 'fixture-solo' }]) {
     await assert.rejects(revoking(result), error => error instanceof CoreProtocolError && error.method === 'bowerloom.grants.revoke', JSON.stringify(result));
   }
 });
 
-test('a reply to revoking the traces group holds only traces permissions, once, sorted, and at least one', async () => {
+test('a reply to revoking the traces group holds only traces permissions, once, and sorted, and may be empty', async () => {
   const group = (result: unknown) => createCoreClient(ok(result)).revokeTraces('fixture-solo');
   assert.deepEqual(await group({ id: 'fixture-solo', revoked: ['traces.facts', 'traces.text'] }), { ok: true, value: { id: 'fixture-solo', revoked: ['traces.facts', 'traces.text'] } });
   assert.deepEqual(await group({ id: 'fixture-solo', revoked: ['traces.text'] }), { ok: true, value: { id: 'fixture-solo', revoked: ['traces.text'] } });
-  for (const result of [null, {}, { id: 'other', revoked: ['traces.facts'] }, { id: 'fixture-solo', revoked: [] }, { id: 'fixture-solo', revoked: ['engines.read'] }, { id: 'fixture-solo', revoked: ['traces.facts', 'engines.read'] },
+  assert.deepEqual(await group({ id: 'fixture-solo', revoked: [] }), { ok: true, value: { id: 'fixture-solo', revoked: [] } });
+  for (const result of [null, {}, { id: 'other', revoked: ['traces.facts'] }, { id: 'fixture-solo', revoked: ['engines.read'] }, { id: 'fixture-solo', revoked: ['traces.facts', 'engines.read'] },
     { id: 'fixture-solo', revoked: ['traces.text', 'traces.facts'] }, { id: 'fixture-solo', revoked: ['traces.facts', 'traces.facts'] }, { id: 'fixture-solo', revoked: 'traces.facts' }]) {
     await assert.rejects(group(result), error => error instanceof CoreProtocolError && error.method === 'bowerloom.grants.revoke', JSON.stringify(result));
   }
@@ -150,7 +177,7 @@ test('a reply to revoking the traces group holds only traces permissions, once, 
 const listing = (result: unknown) => createCoreClient(ok(result)).listGrants('fixture-solo');
 
 test('a list of grants comes back as frozen copies, sorted by name, and drops other fields', async () => {
-  const second = { ...ENTRY, permission: 'usage.read', current: false };
+  const second = { ...ENTRY, permission: 'usage.read' };
   const result = await listing([{ ...ENTRY, extra: 1 }, second]);
   assert.deepEqual(result, { ok: true, value: [ENTRY, second] });
   assert.ok(result.ok);
@@ -162,8 +189,7 @@ test('a list of grants comes back as frozen copies, sorted by name, and drops ot
 
 test('a list of grants of the wrong shape is a protocol error', async () => {
   const second = { ...ENTRY, permission: 'usage.read' };
-  for (const result of [null, {}, 'x', [null], [{}], [{ ...ENTRY, permission: 'nothing.here' }], [{ ...ENTRY, permission: 5 }], [{ ...ENTRY, current: 'yes' }], [{ ...ENTRY, current: undefined }],
-    [{ ...ENTRY, manifestHash: 5 }], [{ ...ENTRY, manifestHash: 'z'.repeat(64) }], [{ ...ENTRY, folderHash: undefined }], [{ ...ENTRY, folderHash: 'c'.repeat(63) }],
+  for (const result of [null, {}, 'x', [null], [{}], [{ ...ENTRY, permission: 'nothing.here' }], [{ ...ENTRY, permission: 5 }], [{ ...ENTRY, manifestHash: 5 }], [{ ...ENTRY, manifestHash: 'z'.repeat(64) }], [{ ...ENTRY, folderHash: undefined }], [{ ...ENTRY, folderHash: 'c'.repeat(63) }],
     [second, ENTRY], [ENTRY, ENTRY], Object.create([ENTRY])]) {
     await assert.rejects(listing(result), error => error instanceof CoreProtocolError && error.method === 'bowerloom.grants.list', JSON.stringify(result));
   }
@@ -188,41 +214,57 @@ test('a permission check reply names the Gauge, the permission, and the engine t
 
 const reading = (result: unknown) => createCoreClient(ok(result)).readAudit();
 
-test('an audit read gives frozen copies in the order of the file, and drops other fields', async () => {
+test('an audit read gives frozen copies in the order of the file, with the first number, the dropped count, and the failed marker', async () => {
   const second = { ...AUDIT, seq: 2, action: 'revoke', via: 'revoke' };
-  const result = await reading([{ ...AUDIT, extra: 1 }, second]);
-  assert.deepEqual(result, { ok: true, value: [AUDIT, second] });
+  const result = await reading({ ...READ([{ ...AUDIT, extra: 1 }, second]), extra: 1 });
+  assert.deepEqual(result, { ok: true, value: { entries: [AUDIT, second], firstSeq: 1, droppedCount: 0, auditFailed: false } });
   assert.ok(result.ok);
   assert.equal(Object.isFrozen(result.value), true);
-  assert.equal(Object.isFrozen(result.value[0]), true);
-  assert.deepEqual(Object.keys(result.value[0] ?? {}), ['seq', 'at', 'action', 'via', 'id', 'version', 'permission', 'manifestHash', 'folderHash']);
-  assert.deepEqual(await reading([]), { ok: true, value: [] });
-  assert.deepEqual(await reading([{ ...AUDIT, seq: 41 }, { ...AUDIT, seq: 42, action: 'revoke', via: 'remove' }]), { ok: true, value: [{ ...AUDIT, seq: 41 }, { ...AUDIT, seq: 42, action: 'revoke', via: 'remove' }] });
+  assert.equal(Object.isFrozen(result.value.entries), true);
+  assert.equal(Object.isFrozen(result.value.entries[0]), true);
+  assert.deepEqual(Object.keys(result.value.entries[0] ?? {}), ['seq', 'at', 'action', 'via', 'id', 'version', 'permission', 'manifestHash', 'folderHash']);
+  assert.deepEqual(await reading(READ([])), { ok: true, value: { entries: [], firstSeq: null, droppedCount: 0, auditFailed: false } });
+  const later = [{ ...AUDIT, seq: 41 }, { ...AUDIT, seq: 42, action: 'revoke', via: 'remove' }];
+  assert.deepEqual(await reading(READ(later, { auditFailed: true })), { ok: true, value: { entries: later, firstSeq: 41, droppedCount: 40, auditFailed: true } });
+});
+
+test('each way a revoke can come about is accepted: revoke, remove, disable, and update', async () => {
+  for (const via of ['revoke', 'remove', 'disable', 'update']) {
+    const entries = [{ ...AUDIT, action: 'revoke', via }];
+    assert.deepEqual(await reading(READ(entries)), { ok: true, value: { entries, firstSeq: 1, droppedCount: 0, auditFailed: false } }, via);
+  }
 });
 
 test('an audit read of the wrong shape is a protocol error', async () => {
   const revoke = { ...AUDIT, action: 'revoke', via: 'revoke' };
   const bad: unknown[] = [
-    null, {}, 'x', [null], [{}],
-    [{ ...AUDIT, seq: 0 }], [{ ...AUDIT, seq: -1 }], [{ ...AUDIT, seq: 1.5 }], [{ ...AUDIT, seq: '1' }], [{ ...AUDIT, seq: Number.MAX_SAFE_INTEGER + 1 }],
-    [AUDIT, AUDIT], [{ ...AUDIT, seq: 2 }, AUDIT],
-    [{ ...AUDIT, at: 'yesterday' }], [{ ...AUDIT, at: '2026-01-02T03:04:05Z' }], [{ ...AUDIT, at: 5 }], [{ ...AUDIT, at: '2026-13-02T03:04:05.006Z' }],
-    [{ ...AUDIT, action: 'allow' }], [{ ...AUDIT, via: 'magic' }], [{ ...AUDIT, via: 'revoke' }], [{ ...AUDIT, via: 'remove' }], [{ ...revoke, via: 'plan' }],
-    [{ ...AUDIT, id: 5 }], [{ ...AUDIT, id: '' }], [{ ...AUDIT, version: 1 }], [{ ...AUDIT, version: undefined }], [{ ...AUDIT, permission: 'nothing.here' }], [{ ...AUDIT, permission: 5 }],
-    [{ ...AUDIT, manifestHash: 5 }], [{ ...AUDIT, manifestHash: 'z'.repeat(64) }], [{ ...AUDIT, folderHash: undefined }],
+    null, {}, 'x', [], [AUDIT], { entries: [AUDIT] }, { ...READ([AUDIT]), entries: 'x' }, { ...READ([AUDIT]), entries: [null] }, { ...READ([AUDIT]), entries: [{}] },
+    { ...READ([AUDIT]), firstSeq: 2 }, { ...READ([AUDIT]), firstSeq: null }, { ...READ([]), firstSeq: 1 }, { ...READ([AUDIT]), firstSeq: '1' },
+    { ...READ([AUDIT]), droppedCount: 1 }, { ...READ([]), droppedCount: 1 }, { ...READ([AUDIT]), droppedCount: -1 }, { ...READ([AUDIT]), droppedCount: 0.5 }, { ...READ([AUDIT]), droppedCount: '0' },
+    { ...READ([AUDIT]), auditFailed: 'no' }, { ...READ([AUDIT]), auditFailed: undefined },
+    READ([{ ...AUDIT, seq: 0 }]), READ([{ ...AUDIT, seq: -1 }]), READ([{ ...AUDIT, seq: 1.5 }]), READ([{ ...AUDIT, seq: '1' }]), READ([{ ...AUDIT, seq: Number.MAX_SAFE_INTEGER + 1 }]),
+    READ([AUDIT, AUDIT]), READ([{ ...AUDIT, seq: 2 }, AUDIT]), READ([AUDIT, { ...AUDIT, seq: 3 }]),
+    READ([{ ...AUDIT, at: 'yesterday' }]), READ([{ ...AUDIT, at: '2026-01-02T03:04:05Z' }]), READ([{ ...AUDIT, at: 5 }]), READ([{ ...AUDIT, at: '2026-13-02T03:04:05.006Z' }]),
+    READ([{ ...AUDIT, action: 'allow' }]), READ([{ ...AUDIT, via: 'magic' }]), READ([{ ...AUDIT, via: 'revoke' }]), READ([{ ...AUDIT, via: 'remove' }]), READ([{ ...AUDIT, via: 'disable' }]), READ([{ ...revoke, via: 'plan' }]),
+    READ([{ ...AUDIT, id: 5 }]), READ([{ ...AUDIT, id: '' }]), READ([{ ...AUDIT, version: 1 }]), READ([{ ...AUDIT, version: undefined }]), READ([{ ...AUDIT, permission: 'nothing.here' }]), READ([{ ...AUDIT, permission: 5 }]),
+    READ([{ ...AUDIT, manifestHash: 5 }]), READ([{ ...AUDIT, manifestHash: 'z'.repeat(64) }]), READ([{ ...AUDIT, folderHash: undefined }]),
   ];
   for (const result of bad) await assert.rejects(reading(result), error => error instanceof CoreProtocolError && error.method === 'bowerloom.audit.read', JSON.stringify(result));
+  const sparse: unknown[] = [AUDIT];
+  sparse[2] = { ...AUDIT, seq: 3 };
+  await assert.rejects(reading({ ...READ([AUDIT]), entries: sparse }), CoreProtocolError);
 });
 
 test('a refusal of a grants call may carry a reason of the grant set, and only with GAUGE_GRANT_MISSING', async () => {
   const refused = (code: string, reason?: unknown) => createCoreClient(scripted(reason === undefined ? { ok: false, code } : { ok: false, code, reason })).checkPermission('fixture-solo', 'engines.read');
-  for (const reason of ['unknown_permission', 'not_declared', 'engine_not_listed', 'gauge_disabled', 'not_held', 'invalid_request']) {
+  for (const reason of ['unknown_permission', 'not_declared', 'engine_not_listed', 'gauge_disabled', 'invalid_request', 'facts_required']) {
     assert.deepEqual(await refused('GAUGE_GRANT_MISSING', reason), { ok: false, code: 'GAUGE_GRANT_MISSING', reason });
   }
   assert.deepEqual(await refused('GAUGE_GRANT_MISSING'), { ok: false, code: 'GAUGE_GRANT_MISSING' });
   assert.deepEqual(await refused('GAUGE_GRANT_STALE'), { ok: false, code: 'GAUGE_GRANT_STALE' });
+  for (const reason of ['clock_unusable', 'write_failed']) assert.deepEqual(await refused('GAUGE_AUDIT_FAILED', reason), { ok: false, code: 'GAUGE_AUDIT_FAILED', reason });
   assert.deepEqual(await refused('GAUGE_TRACES_OWN_STEP'), { ok: false, code: 'GAUGE_TRACES_OWN_STEP' });
-  for (const [code, reason] of [['GAUGE_GRANT_STALE', 'not_held'], ['UNKNOWN_GAUGE', 'gauge_disabled'], ['GAUGE_TRACES_OWN_STEP', 'invalid_request'], ['GAUGE_GRANT_MISSING', 'made_up'], ['GAUGE_GRANT_MISSING', ''], ['GAUGE_GRANT_MISSING', 5], ['GAUGE_GRANT_MISSING', null], ['GAUGE_GRANT_MISSING', 'toString']] as const) {
+  for (const [code, reason] of [['GAUGE_GRANT_STALE', 'invalid_request'], ['GAUGE_GRANT_MISSING', 'not_held'], ['GAUGE_GRANT_MISSING', 'clock_unusable'], ['GAUGE_AUDIT_FAILED', 'invalid_request'], ['GAUGE_AUDIT_FAILED', 'duplicate_key'], ['GAUGE_AUDIT_FAILED', undefined], ['UNKNOWN_GAUGE', 'gauge_disabled'], ['GAUGE_TRACES_OWN_STEP', 'invalid_request'], ['GAUGE_GRANT_MISSING', 'made_up'], ['GAUGE_GRANT_MISSING', ''], ['GAUGE_GRANT_MISSING', 5], ['GAUGE_GRANT_MISSING', null], ['GAUGE_GRANT_MISSING', 'toString']] as const) {
     await assert.rejects(refused(code, reason), CoreProtocolError, `${code} ${String(reason)}`);
   }
 });

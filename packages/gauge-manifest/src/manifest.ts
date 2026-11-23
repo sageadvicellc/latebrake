@@ -69,12 +69,18 @@ export function isManifestReason(value: unknown): value is ManifestReason {
 const jsonProblemsAreReasons: JsonProblem extends ManifestReason ? true : never = true;
 void jsonProblemsAreReasons;
 
+/** The codes a manifest check can give. */
+export type ManifestCode = 'GAUGE_MANIFEST_INVALID' | 'GAUGE_MANIFEST_TOO_LARGE' | 'GAUGE_PATH_UNSAFE' | 'GAUGE_SECRET_FOUND' | 'GAUGE_API_UNSUPPORTED';
+// A compile-time check: a manifest code is a code of the registry.
+const manifestCodesAreCodes: ManifestCode extends GaugeCode ? true : never = true;
+void manifestCodesAreCodes;
+
 export type ManifestResult =
   | { readonly ok: true; readonly manifest: GaugeManifest }
-  | { readonly ok: false; readonly code: GaugeCode; readonly reason: ManifestReason };
+  | { readonly ok: false; readonly code: ManifestCode; readonly reason: ManifestReason };
 
 class Refused extends Error {
-  constructor(readonly code: GaugeCode, readonly reason: ManifestReason) { super(reason); }
+  constructor(readonly code: ManifestCode, readonly reason: ManifestReason) { super(reason); }
 }
 function invalid(reason: ManifestReason = 'invalid_field'): never {
   throw new Refused('GAUGE_MANIFEST_INVALID', reason);

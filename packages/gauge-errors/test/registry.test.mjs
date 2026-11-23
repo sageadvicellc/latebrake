@@ -15,7 +15,7 @@ const digest = text => createHash('sha256').update(text).digest('hex');
 const STABLE = [
   'GAUGE_MANIFEST_INVALID', 'GAUGE_MANIFEST_TOO_LARGE', 'GAUGE_PATH_UNSAFE', 'GAUGE_SECRET_FOUND', 'GAUGE_API_UNSUPPORTED',
   'UNKNOWN_GAUGE', 'GAUGE_EXISTS', 'GAUGE_PROTECTED', 'GAUGE_REMOVE_INCOMPLETE', 'GAUGE_NAME_RESERVED', 'GAUGE_VERSION_NOT_NEWER',
-  'GAUGE_GRANT_MISSING', 'GAUGE_GRANT_STALE', 'GAUGE_TRACES_OWN_STEP',
+  'GAUGE_GRANT_MISSING', 'GAUGE_GRANT_STALE', 'GAUGE_TRACES_OWN_STEP', 'GAUGE_AUDIT_FAILED',
   'GAUGE_LAYOUT_INVALID',
   'GAUGE_PLAN_NOT_APPROVED', 'GAUGE_PLAN_CHANGED',
 ];
@@ -135,4 +135,8 @@ test('isGaugeCode accepts a registry code and refuses everything else', () => {
 
 test('the code for a mixed traces grant says that traces permissions have their own step', () => {
   assert.equal(GAUGE_MEANINGS.GAUGE_TRACES_OWN_STEP, 'Traces permissions are granted in their own step, apart from every other permission.');
+});
+
+test('the code for a grant that could not be recorded says that the audit file could not be written', () => {
+  assert.equal(GAUGE_MEANINGS.GAUGE_AUDIT_FAILED, 'The audit file could not be written, so the grant was refused.');
 });

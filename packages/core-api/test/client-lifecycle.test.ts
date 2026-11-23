@@ -184,3 +184,17 @@ test('the plan actions are one list, used by the client and the fake core', asyn
   assert.deepEqual([...PLAN_ACTIONS], ['install', 'enable', 'disable', 'update', 'remove']);
   assert.equal(Object.isFrozen(PLAN_ACTIONS), true);
 });
+
+test('a sparse steps list in a lifecycle plan is a protocol error, because a hole is not a line of text', async () => {
+  const sparse: unknown[] = ['one'];
+  sparse[2] = 'three';
+  await assert.rejects(planning({ ...PLAN, steps: sparse }), CoreProtocolError);
+  await assert.rejects(planning({ ...PLAN, steps: new Array<string>(2) }), CoreProtocolError);
+});
+
+test('a sparse list of routes is a protocol error, because a hole is not a route', async () => {
+  const sparse: unknown[] = ['/gauges/a'];
+  sparse[2] = '/gauges/b';
+  await assert.rejects(createCoreClient(scripted({ ok: true, result: sparse })).listRoutes(), CoreProtocolError);
+  await assert.rejects(createCoreClient(scripted({ ok: true, result: new Array<string>(1) })).listRoutes(), CoreProtocolError);
+});

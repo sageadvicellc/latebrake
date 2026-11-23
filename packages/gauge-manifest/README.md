@@ -45,12 +45,12 @@ Each entry has a `name`, a `kind` (`read`, `write`, or `act`), a `scope`, a `tra
 
 - `read` permissions read state. `write` and `act` permissions let a Gauge ask for a plan, and never let it skip the plan: the meaning of each says so in the same words, and the person approves every plan.
 - `scope` is `engine` for a permission that works only for an engine in the manifest's `engines` list, so a Gauge that lists one engine reads that engine only. It is `none` for a permission that touches no engine.
-- `traces` is true for `traces.facts` and `traces.text`. Traces permissions are denied by default, granted in their own step, and revoked in one action. A Gauge that reads the text of a trace needs the facts permission too: the meaning says so, and the Traces API enforces it, not this list.
+- `traces` is true for `traces.facts` and `traces.text`. Traces permissions are denied by default, granted in their own step, and revoked in one action. A Gauge that reads the text of a trace needs the facts permission too: the meaning says so, and the core's one enforcement point refuses the text while the facts are not held.
 - There is no permission to react. A reaction is recorded only from the person's click on the core's reaction menu.
 
 The names are `engines.read`, `usage.read`, `models.read`, `sessions.read`, `sessions.stream`, `sessions.start`, `sessions.stop`, `sessions.attach`, `sessions.send`, `layout.propose`, `jobs.read`, `jobs.write`, `jobs.run`, `traces.facts`, and `traces.text`. A test pins this list, so a change to it fails on purpose.
 
-`GRANT_REASONS` is a second closed set of reasons, for a refusal of a call about grants. The core pairs it with the code `GAUGE_GRANT_MISSING` only. See `packages/core-api/README.md`.
+`GRANT_REASONS` is a second closed set of reasons, for a refusal of a call about grants. The core pairs it with the code `GAUGE_GRANT_MISSING` only. `AUDIT_REASONS` is a third, for `GAUGE_AUDIT_FAILED`. See `packages/core-api/README.md`. `PermissionName` is the literal type of a name, and `isPermission` narrows to it. `ManifestCode` is the type of the codes a manifest check gives.
 
 ## Origin
 

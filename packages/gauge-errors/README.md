@@ -14,7 +14,7 @@ To add a code, write its test in `test/registry.test.mjs` first, then add one li
 
 ## Scope of the starter set
 
-The set covers manifest, lifecycle, grant, layout, and plan refusals. `GAUGE_TRACES_OWN_STEP` is the one code of the grants ticket: the other grant refusals reuse `GAUGE_GRANT_MISSING` and `GAUGE_GRANT_STALE` with a reason. A refusal to hide, remove, or replace a protected Gauge, such as the Gauge manager, reuses `GAUGE_PROTECTED`. In v0.9.1 Gauges have layout slots and no routes, so there are no route codes. Later tickets own any further codes.
+The set covers manifest, lifecycle, grant, layout, and plan refusals. `GAUGE_TRACES_OWN_STEP` and `GAUGE_AUDIT_FAILED` are the codes of the grants ticket: the other grant refusals reuse `GAUGE_GRANT_MISSING` with a reason. `GAUGE_GRANT_STALE` stays in the registry, but the fake core no longer produces it: an update drops the grants of the old version, so none can be stale. A refusal to hide, remove, or replace a protected Gauge, such as the Gauge manager, reuses `GAUGE_PROTECTED`. In v0.9.1 Gauges have layout slots and no routes, so there are no route codes. Later tickets own any further codes.
 
 ## The old-literal fixture
 

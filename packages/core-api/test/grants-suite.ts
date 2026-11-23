@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createCoreClient, type CoreClient } from '../src/client.js';
-import type { Core, GaugePlan, GrantPlan } from '../src/types.js';
+import type { AuditRead, Core, GaugePlan } from '../src/types.js';
 import type { GaugeFolder } from '../src/fake-core.js';
 import { validManifest } from '../../gauge-manifest/src/fixtures.js';
 import { APPROVAL_TTL_MS } from './lifecycle-suite.js';
@@ -22,12 +22,20 @@ export interface GrantsHarnessOptions {
   readonly auditMaxBytes?: number;
 }
 
-/** The smallest size cap of the audit file that a core must accept. */
-export const MIN_AUDIT_MAX_BYTES = 4096;
+/**
+ * The smallest size cap of the audit file that a core must accept: 15 records of the longest line (398 bytes), because the largest single step grants or ends all 15 permissions at once.
+ * Written out here as a number, and not read from the core, so a wrong cap fails the suite.
+ */
+export const MIN_AUDIT_MAX_BYTES = 5970;
 
 const FILE = 'export default 1;';
 const base = JSON.parse(validManifest('tile-only')) as Record<string, unknown>;
 const manifestOf = (fields: Record<string, unknown>): string => JSON.stringify({ ...base, ...fields });
+/** Every permission of the list, written out here. */
+const ALL_PERMISSIONS = [
+  'engines.read', 'usage.read', 'models.read', 'sessions.read', 'sessions.stream', 'sessions.start', 'sessions.stop', 'sessions.attach', 'sessions.send',
+  'layout.propose', 'jobs.read', 'jobs.write', 'jobs.run', 'traces.facts', 'traces.text',
+];
 const TRACED_PERMISSIONS = ['engines.read', 'sessions.start', 'layout.propose', 'traces.facts', 'traces.text'];
 const traced = (version: string, title: string, permissions: readonly string[] = TRACED_PERMISSIONS): string =>
   manifestOf({ id: 'fixture-traced', title, version, engines: ['fixture-engine', 'fixture-other'], permissions });
@@ -38,6 +46,7 @@ export const GRANT_FOLDERS: readonly GaugeFolder[] = [
   { name: 'traced-update', location: 'user', manifest: traced('1.1.0', 'Fixture Traced Two'), files: { 'ui/tile.js': FILE } },
   { name: 'traced-narrow', location: 'user', manifest: traced('1.2.0', 'Fixture Traced Two', ['engines.read']), files: { 'ui/tile.js': FILE } },
   { name: 'solo-folder', location: 'user', manifest: manifestOf({ id: 'fixture-solo', title: 'Fixture Solo', engines: ['fixture-engine'], permissions: ['engines.read', 'usage.read'] }) },
+  { name: 'all-folder', location: 'user', manifest: manifestOf({ id: 'fixture-all', title: 'Fixture All', engines: ['fixture-engine'], permissions: ALL_PERMISSIONS }) },
   { name: 'bare-folder', location: 'user', manifest: manifestOf({ id: 'fixture-bare', title: 'Fixture Bare', engines: [], permissions: ['engines.read', 'layout.propose'] }) },
 ];
 
@@ -76,7 +85,8 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     return must(await s.client.applyGrant(plan, await s.harness.approve(plan)));
   };
   const outcome = (result: { ok: boolean; code?: string; reason?: string }) => (result.ok ? { ok: true } : result.reason === undefined ? { ok: false, code: result.code } : { ok: false, code: result.code, reason: result.reason });
-  const audit = async (client: CoreClient) => must(await client.readAudit());
+  const auditRead = async (client: CoreClient): Promise<AuditRead> => must(await client.readAudit());
+  const audit = async (client: CoreClient) => (await auditRead(client)).entries;
   const withoutTime = (entries: readonly { at: string }[]) => entries.map(({ at, ...rest }) => { assert.match(at, TIME); return rest; });
 
   test(`${name}: makeHarness gives a distinct core on each call`, async () => {
@@ -106,6 +116,50 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     for (const line of plan.steps) assert.equal(/[\n\r\u2028\u2029]/.test(line), false, line);
     assert.deepEqual(must(await s.client.listGrants('fixture-traced')), []);
     assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'engines.read', 'fixture-engine')), MISSING);
+  });
+
+  test(`${name}: a plain grant plan reads exactly like this`, async () => {
+    const s = await start();
+    await bring(s, 'solo-folder', 'fixture-solo');
+    const plan = must(await s.client.planGrant('fixture-solo', ['usage.read', 'engines.read']));
+    assert.deepEqual(plan.steps, [
+      'grant 2 permissions to fixture-solo 1.0.0',
+      'permission engines.read (read): Read the state of the engines the Gauge lists.',
+      'permission usage.read (read): Read the usage figures of the engines the Gauge lists.',
+      'engines: fixture-engine',
+      'bind the grant to manifest 98be40e5c42f11b50a63f270324e3a32d32bb700ba84cd2cab5c5a838c205a86 and folder f81312d87c751ef78e7c64be4b9018f6de33a1b8f1bf1482cdf33d8e44aa34ea',
+    ]);
+    assert.equal(plan.manifestHash, '98be40e5c42f11b50a63f270324e3a32d32bb700ba84cd2cab5c5a838c205a86');
+    assert.equal(plan.folderHash, 'f81312d87c751ef78e7c64be4b9018f6de33a1b8f1bf1482cdf33d8e44aa34ea');
+  });
+
+  test(`${name}: a traces grant plan reads exactly like this, with the notice line`, async () => {
+    const s = await start();
+    await bring(s, 'traced-folder', 'fixture-traced');
+    const plan = must(await s.client.planGrant('fixture-traced', ['traces.text', 'traces.facts']));
+    assert.deepEqual(plan.steps, [
+      'grant 2 permissions to fixture-traced 1.0.0',
+      'permission traces.facts (read): Read the recorded facts of traces from the engines the Gauge lists. Denied until the person grants it.',
+      'permission traces.text (read): Read the prompt and reply text of traces, together with traces.facts. Denied until the person grants it.',
+      'engines: fixture-engine, fixture-other',
+      'traces permissions start denied, are granted only here, and one revoke removes them all',
+      'bind the grant to manifest 312b3c224780cca21d60bf603beee2478551e77a3e55e9ef19bc11f403f4d46a and folder 3040cfd9adb64ede2150a4e4d91210dc85eed94d1bb7c97c4d107eeedd15cc6a',
+    ]);
+  });
+
+  test(`${name}: a manifest with a hostile id, title, or engine never reaches a plan, because the manifest rules refuse it at install`, async () => {
+    const hostile = ['a\nb', 'a\u2028b', 'a\u0085b', `a${'x'.repeat(100)}`];
+    const folders: GaugeFolder[] = hostile.flatMap((text, index): GaugeFolder[] => [
+      { name: `hostile-id-${index}`, location: 'user', manifest: manifestOf({ id: text, title: 'Fixture Hostile' }) },
+      { name: `hostile-title-${index}`, location: 'user', manifest: manifestOf({ id: 'fixture-hostile', title: text }) },
+      { name: `hostile-engine-${index}`, location: 'user', manifest: manifestOf({ id: 'fixture-hostile', title: 'Fixture Hostile', engines: [text], permissions: ['engines.read'] }) },
+    ]);
+    const harness = await makeHarness(folders, {});
+    const client = createCoreClient(harness.core);
+    for (const folder of folders) {
+      const planned = await client.planInstall(folder.name);
+      assert.equal(planned.ok, false, folder.name);
+    }
   });
 
   test(`${name}: a grant plan for a Gauge that lists no engine says so`, async () => {
@@ -243,8 +297,8 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     const applied = await grant(s, 'fixture-traced', ['sessions.start', 'engines.read']);
     assert.deepEqual(applied, { id: 'fixture-traced', permissions: ['engines.read', 'sessions.start'] });
     assert.deepEqual(must(await s.client.listGrants('fixture-traced')), [
-      { permission: 'engines.read', manifestHash: install.manifestHash, folderHash: install.folderHash, current: true },
-      { permission: 'sessions.start', manifestHash: install.manifestHash, folderHash: install.folderHash, current: true },
+      { permission: 'engines.read', manifestHash: install.manifestHash, folderHash: install.folderHash },
+      { permission: 'sessions.start', manifestHash: install.manifestHash, folderHash: install.folderHash },
     ]);
     assert.deepEqual(must(await s.client.checkPermission('fixture-traced', 'engines.read', 'fixture-engine')), { gauge: 'fixture-traced', permission: 'engines.read', engine: 'fixture-engine' });
     assert.deepEqual(must(await s.client.checkPermission('fixture-traced', 'sessions.start', 'fixture-other')), { gauge: 'fixture-traced', permission: 'sessions.start', engine: 'fixture-other' });
@@ -313,24 +367,67 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     assert.deepEqual(outcome(await s.client.checkPermission('fixture-solo', 'engines.read', 'fixture-engine')), { ok: true });
   });
 
-  test(`${name}: a changed manifest asks again: after an update the old grant is stale, and a new grant makes it current`, async () => {
+  test(`${name}: a changed manifest asks again: an update drops every grant of the old version, and a new grant binds to the new hashes`, async () => {
     const s = await start();
     const first = await bring(s, 'traced-folder', 'fixture-traced');
     await grant(s, 'fixture-traced', ['engines.read', 'layout.propose']);
     const update = await step(s, s.client.planUpdate('traced-update'));
     assert.notEqual(update.manifestHash, first.manifestHash);
-    assert.deepEqual(await s.client.checkPermission('fixture-traced', 'engines.read', 'fixture-engine'), { ok: false, code: 'GAUGE_GRANT_STALE' });
-    assert.deepEqual(await s.client.checkPermission('fixture-traced', 'layout.propose'), { ok: false, code: 'GAUGE_GRANT_STALE' });
-    assert.deepEqual(must(await s.client.listGrants('fixture-traced')), [
-      { permission: 'engines.read', manifestHash: first.manifestHash, folderHash: first.folderHash, current: false },
-      { permission: 'layout.propose', manifestHash: first.manifestHash, folderHash: first.folderHash, current: false },
-    ]);
+    assert.deepEqual(await s.client.checkPermission('fixture-traced', 'engines.read', 'fixture-engine'), MISSING);
+    assert.deepEqual(await s.client.checkPermission('fixture-traced', 'layout.propose'), MISSING);
+    assert.deepEqual(must(await s.client.listGrants('fixture-traced')), []);
     const plan = must(await s.client.planGrant('fixture-traced', ['engines.read']));
     assert.equal(plan.version, '1.1.0');
     assert.equal(plan.manifestHash, update.manifestHash);
     must(await s.client.applyGrant(plan, await s.harness.approve(plan)));
     assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'engines.read', 'fixture-engine')), { ok: true });
-    assert.deepEqual(await s.client.checkPermission('fixture-traced', 'layout.propose'), { ok: false, code: 'GAUGE_GRANT_STALE' });
+    assert.deepEqual(await s.client.checkPermission('fixture-traced', 'layout.propose'), MISSING);
+    assert.deepEqual(must(await s.client.listGrants('fixture-traced')), [{ permission: 'engines.read', manifestHash: update.manifestHash, folderHash: update.folderHash }]);
+  });
+
+  test(`${name}: an update ends each grant with a record: the old version, the old hashes, and the way update`, async () => {
+    const s = await start();
+    const first = await bring(s, 'traced-folder', 'fixture-traced');
+    await grant(s, 'fixture-traced', ['engines.read', 'layout.propose']);
+    await step(s, s.client.planUpdate('traced-update'));
+    const hashes = { manifestHash: first.manifestHash, folderHash: first.folderHash };
+    const common = { id: 'fixture-traced', version: '1.0.0', ...hashes };
+    assert.deepEqual(withoutTime(await audit(s.client)), [
+      { seq: 1, action: 'grant', via: 'plan', permission: 'engines.read', ...common },
+      { seq: 2, action: 'grant', via: 'plan', permission: 'layout.propose', ...common },
+      { seq: 3, action: 'revoke', via: 'update', permission: 'engines.read', ...common },
+      { seq: 4, action: 'revoke', via: 'update', permission: 'layout.propose', ...common },
+    ]);
+  });
+
+  test(`${name}: a disabled Gauge clears its traces grants and keeps the others, and the traces grants must be made again in their own step`, async () => {
+    const s = await start();
+    const install = await bring(s, 'traced-folder', 'fixture-traced');
+    await grant(s, 'fixture-traced', ['traces.facts', 'traces.text']);
+    await grant(s, 'fixture-traced', ['engines.read', 'layout.propose']);
+    await step(s, s.client.planDisable('fixture-traced'));
+    assert.deepEqual(must(await s.client.listGrants('fixture-traced')).map(entry => entry.permission), ['engines.read', 'layout.propose']);
+    const hashes = { manifestHash: install.manifestHash, folderHash: install.folderHash };
+    const records = (await audit(s.client)).slice(4);
+    assert.deepEqual(withoutTime(records), [
+      { seq: 5, action: 'revoke', via: 'disable', permission: 'traces.facts', id: 'fixture-traced', version: '1.0.0', ...hashes },
+      { seq: 6, action: 'revoke', via: 'disable', permission: 'traces.text', id: 'fixture-traced', version: '1.0.0', ...hashes },
+    ]);
+    await step(s, s.client.planEnable('fixture-traced'));
+    assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'engines.read', 'fixture-engine')), { ok: true });
+    assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'layout.propose')), { ok: true });
+    for (const permission of ['traces.facts', 'traces.text']) assert.deepEqual(await s.client.checkPermission('fixture-traced', permission, 'fixture-engine'), MISSING, permission);
+    assert.deepEqual(await s.client.planGrant('fixture-traced', ['traces.facts', 'engines.read']), { ok: false, code: 'GAUGE_TRACES_OWN_STEP' });
+    await grant(s, 'fixture-traced', ['traces.facts']);
+    assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'traces.facts', 'fixture-engine')), { ok: true });
+  });
+
+  test(`${name}: disabling a Gauge that holds no traces grant writes no record`, async () => {
+    const s = await start();
+    await bring(s, 'solo-folder', 'fixture-solo');
+    await grant(s, 'fixture-solo', ['engines.read']);
+    await step(s, s.client.planDisable('fixture-solo'));
+    assert.equal((await audit(s.client)).length, 1);
   });
 
   test(`${name}: an update that drops a permission leaves a Gauge that cannot use it, and the old grant for it is not usable`, async () => {
@@ -428,6 +525,19 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     assert.deepEqual(await s.client.checkPermission('fixture-traced', 'traces.text', 'fixture-engine'), MISSING);
   });
 
+  test(`${name}: the text of traces is allowed only while the facts are also held`, async () => {
+    const s = await start();
+    await bring(s, 'traced-folder', 'fixture-traced');
+    await grant(s, 'fixture-traced', ['traces.text']);
+    assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'traces.text', 'fixture-engine')), missing('facts_required'));
+    await grant(s, 'fixture-traced', ['traces.facts']);
+    assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'traces.text', 'fixture-engine')), { ok: true });
+    must(await s.client.revoke('fixture-traced', ['traces.facts']));
+    assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'traces.text', 'fixture-engine')), missing('facts_required'));
+    assert.deepEqual(await s.client.checkPermission('fixture-traced', 'traces.facts', 'fixture-engine'), MISSING);
+    assert.deepEqual(must(await s.client.listGrants('fixture-traced')).map(entry => entry.permission), ['traces.text']);
+  });
+
   test(`${name}: one action revokes every traces permission at once, and no other`, async () => {
     const s = await start();
     await bring(s, 'traced-folder', 'fixture-traced');
@@ -437,7 +547,7 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     for (const permission of ['traces.facts', 'traces.text']) assert.deepEqual(await s.client.checkPermission('fixture-traced', permission, 'fixture-engine'), MISSING, permission);
     assert.deepEqual(must(await s.client.listGrants('fixture-traced')).map(entry => entry.permission), ['engines.read']);
     assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'engines.read', 'fixture-engine')), { ok: true });
-    assert.deepEqual(outcome(await s.client.revokeTraces('fixture-traced')), missing('not_held'));
+    assert.deepEqual(must(await s.client.revokeTraces('fixture-traced')), { id: 'fixture-traced', revoked: [] });
   });
 
   test(`${name}: a revoked traces permission is denied again, and granting it again needs a new approval`, async () => {
@@ -470,12 +580,23 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     assert.deepEqual(must(await s.client.revoke('fixture-solo', ['usage.read', 'engines.read'])), { id: 'fixture-solo', revoked: ['engines.read', 'usage.read'] });
   });
 
-  test(`${name}: a revoke that holds a permission the Gauge lacks changes nothing`, async () => {
+  test(`${name}: a revoke of a permission the Gauge does not hold is a no-op, and a repeated revoke is too`, async () => {
+    const s = await start();
+    await bring(s, 'solo-folder', 'fixture-solo');
+    await grant(s, 'fixture-solo', ['engines.read']);
+    assert.deepEqual(must(await s.client.revoke('fixture-solo', ['engines.read', 'usage.read'])), { id: 'fixture-solo', revoked: ['engines.read'] });
+    assert.equal((await audit(s.client)).length, 2);
+    for (let again = 0; again < 3; again += 1) assert.deepEqual(must(await s.client.revoke('fixture-solo', ['engines.read', 'usage.read'])), { id: 'fixture-solo', revoked: [] });
+    assert.deepEqual(must(await s.client.revoke('fixture-solo', ['usage.read'])), { id: 'fixture-solo', revoked: [] });
+    assert.deepEqual(must(await s.client.revokeTraces('fixture-solo')), { id: 'fixture-solo', revoked: [] });
+    assert.equal((await audit(s.client)).length, 2);
+  });
+
+  test(`${name}: a revoke refuses an unknown Gauge, an unknown name, and a request of the wrong shape, and then changes nothing`, async () => {
     const s = await start();
     await bring(s, 'solo-folder', 'fixture-solo');
     await grant(s, 'fixture-solo', ['engines.read']);
     const before = await audit(s.client);
-    assert.deepEqual(outcome(await s.client.revoke('fixture-solo', ['engines.read', 'usage.read'])), missing('not_held'));
     assert.deepEqual(outcome(await s.client.revoke('fixture-solo', ['nothing.here'])), missing('unknown_permission'));
     assert.deepEqual(outcome(await s.client.revoke('fixture-solo', ['engines.read', '__proto__'])), missing('unknown_permission'));
     assert.deepEqual(outcome(await s.client.revoke('fixture-solo', [])), missing('invalid_request'));
@@ -483,6 +604,32 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     assert.equal(must(await s.client.listGrants('fixture-solo')).length, 1);
     assert.deepEqual(outcome(await s.client.checkPermission('fixture-solo', 'engines.read', 'fixture-engine')), { ok: true });
     assert.deepEqual(await audit(s.client), before);
+  });
+
+  test(`${name}: a revoke retires the pending grant plans and approvals of that Gauge, so an approved regrant cannot apply later`, async () => {
+    const s = await start();
+    await bring(s, 'traced-folder', 'fixture-traced');
+    await bring(s, 'solo-folder', 'fixture-solo');
+    await grant(s, 'fixture-traced', ['traces.facts']);
+    const regrant = must(await s.client.planGrant('fixture-traced', ['traces.text']));
+    const approval = await s.harness.approve(regrant);
+    const other = must(await s.client.planGrant('fixture-solo', ['engines.read']));
+    const otherApproval = await s.harness.approve(other);
+    must(await s.client.revoke('fixture-traced', ['traces.facts']));
+    assert.deepEqual(await s.client.applyGrant(regrant, approval), { ok: false, code: 'GAUGE_PLAN_NOT_APPROVED' });
+    assert.deepEqual(must(await s.client.listGrants('fixture-traced')), []);
+    assert.deepEqual(await s.client.checkPermission('fixture-traced', 'traces.text', 'fixture-engine'), MISSING);
+    // The plan of another Gauge is not touched by that revoke.
+    must(await s.client.applyGrant(other, otherApproval));
+  });
+
+  test(`${name}: a revoke that holds nothing does not retire any plan`, async () => {
+    const s = await start();
+    await bring(s, 'solo-folder', 'fixture-solo');
+    const plan = must(await s.client.planGrant('fixture-solo', ['engines.read']));
+    const approval = await s.harness.approve(plan);
+    must(await s.client.revoke('fixture-solo', ['usage.read']));
+    must(await s.client.applyGrant(plan, approval));
   });
 
   test(`${name}: a revoke call must name permissions or the traces group, and not both`, async () => {
@@ -494,15 +641,13 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     assert.deepEqual(outcome(await s.client.checkPermission('fixture-traced', 'traces.facts', 'fixture-engine')), { ok: true });
   });
 
-  test(`${name}: a revoke works on a stale grant, and on a Gauge that is disabled`, async () => {
+  test(`${name}: a revoke works on a Gauge that is disabled`, async () => {
     const s = await start();
-    await bring(s, 'traced-folder', 'fixture-traced');
-    await grant(s, 'fixture-traced', ['engines.read', 'layout.propose']);
-    await step(s, s.client.planUpdate('traced-update'));
-    must(await s.client.revoke('fixture-traced', ['engines.read']));
-    await step(s, s.client.planDisable('fixture-traced'));
-    must(await s.client.revoke('fixture-traced', ['layout.propose']));
-    assert.deepEqual(must(await s.client.listGrants('fixture-traced')), []);
+    await bring(s, 'solo-folder', 'fixture-solo');
+    await grant(s, 'fixture-solo', ['engines.read', 'usage.read']);
+    await step(s, s.client.planDisable('fixture-solo'));
+    assert.deepEqual(must(await s.client.revoke('fixture-solo', ['usage.read'])), { id: 'fixture-solo', revoked: ['usage.read'] });
+    assert.deepEqual(must(await s.client.listGrants('fixture-solo')).map(entry => entry.permission), ['engines.read']);
   });
 
   // The audit file
@@ -527,7 +672,7 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     ]);
   });
 
-  test(`${name}: a refused grant or revoke adds no record`, async () => {
+  test(`${name}: a refused grant, or a revoke of nothing, adds no record`, async () => {
     const s = await start();
     await bring(s, 'solo-folder', 'fixture-solo');
     const plan = must(await s.client.planGrant('fixture-solo', ['engines.read']));
@@ -538,19 +683,7 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
     assert.deepEqual(await audit(s.client), []);
   });
 
-  test(`${name}: an update that makes a grant stale adds no record, and a revoke of a stale grant adds one`, async () => {
-    const s = await start();
-    await bring(s, 'traced-folder', 'fixture-traced');
-    await grant(s, 'fixture-traced', ['engines.read']);
-    await step(s, s.client.planUpdate('traced-update'));
-    assert.equal((await audit(s.client)).length, 1);
-    must(await s.client.revoke('fixture-traced', ['engines.read']));
-    const entries = await audit(s.client);
-    assert.equal(entries.length, 2);
-    assert.deepEqual(entries.map(entry => [entry.action, entry.via, entry.version]), [['grant', 'plan', '1.0.0'], ['revoke', 'revoke', '1.1.0']]);
-  });
-
-  test(`${name}: the audit file has a size cap: it drops the oldest records, keeps the order and the numbers, and never refuses a revoke`, async () => {
+  test(`${name}: the audit file has a size cap: it drops the oldest records, keeps the order and the numbers, says what was lost, and never refuses a revoke`, async () => {
     const s = await start({ auditMaxBytes: MIN_AUDIT_MAX_BYTES });
     await bring(s, 'solo-folder', 'fixture-solo');
     for (let round = 0; round < 20; round += 1) {
@@ -558,19 +691,53 @@ export function runGrantsSuite(name: string, makeHarness: (folders: readonly Gau
       must(await s.client.revoke('fixture-solo', ['engines.read']));
     }
     await grant(s, 'fixture-solo', ['engines.read']);
-    const entries = await audit(s.client);
-    const bytes = entries.reduce((sum, entry) => sum + Buffer.byteLength(`${JSON.stringify(entry)}\n`), 0);
-    assert.ok(bytes <= MIN_AUDIT_MAX_BYTES, `${bytes} bytes`);
-    assert.ok(entries.length >= 5, `${entries.length} records kept`);
-    assert.ok(entries.length < 41, `${entries.length} records kept`);
-    assert.equal(entries[entries.length - 1]?.seq, 41);
-    assert.ok((entries[0]?.seq ?? 0) > 1);
-    entries.forEach((entry, index) => { if (index > 0) assert.equal(entry.seq, (entries[index - 1]?.seq ?? 0) + 1); });
+    const read = await auditRead(s.client);
+    // 41 records of 301 bytes and more were written. The cap of 5,970 bytes holds 19 of them.
+    assert.equal(read.entries.length, 19);
+    assert.equal(read.firstSeq, 23);
+    assert.equal(read.droppedCount, 22);
+    assert.equal(read.entries[18]?.seq, 41);
+    assert.equal(read.auditFailed, false);
+    assert.equal(read.entries.reduce((sum, entry) => sum + Buffer.byteLength(`${JSON.stringify(entry)}\n`), 0), 5746);
+    read.entries.forEach((entry, index) => assert.equal(entry.seq, 23 + index));
     assert.deepEqual(outcome(await s.client.checkPermission('fixture-solo', 'engines.read', 'fixture-engine')), { ok: true });
     must(await s.client.revoke('fixture-solo', ['engines.read']));
-    const after = await audit(s.client);
-    assert.equal(after[after.length - 1]?.seq, 42);
-    assert.equal(after[after.length - 1]?.action, 'revoke');
+    const after = await auditRead(s.client);
+    assert.equal(after.entries.length, 19);
+    assert.equal(after.firstSeq, 24);
+    assert.equal(after.droppedCount, 23);
+    assert.equal(after.entries[18]?.seq, 42);
+    assert.equal(after.entries[18]?.action, 'revoke');
+  });
+
+  test(`${name}: at the smallest cap, a step that touches all 15 permissions keeps every one of its own records`, async () => {
+    const s = await start({ auditMaxBytes: MIN_AUDIT_MAX_BYTES });
+    await bring(s, 'all-folder', 'fixture-all');
+    for (let round = 0; round < 10; round += 1) {
+      await grant(s, 'fixture-all', ALL_PERMISSIONS.filter(permission => !permission.startsWith('traces.')));
+      await grant(s, 'fixture-all', ['traces.facts', 'traces.text']);
+      must(await s.client.revoke('fixture-all', ALL_PERMISSIONS));
+    }
+    await grant(s, 'fixture-all', ALL_PERMISSIONS.filter(permission => !permission.startsWith('traces.')));
+    await grant(s, 'fixture-all', ['traces.facts', 'traces.text']);
+    assert.equal(must(await s.client.listGrants('fixture-all')).length, 15);
+    const grantStep = await audit(s.client);
+    assert.deepEqual(grantStep.slice(-2).map(entry => [entry.via, entry.permission]), [['plan', 'traces.facts'], ['plan', 'traces.text']]);
+    await step(s, s.client.planRemove('fixture-all'));
+    const read = await auditRead(s.client);
+    const removed = read.entries.filter(entry => entry.via === 'remove');
+    assert.equal(removed.length, 15);
+    assert.deepEqual(removed.map(entry => entry.permission), [...ALL_PERMISSIONS].sort());
+    assert.deepEqual(removed.map(entry => entry.seq), Array.from({ length: 15 }, (_, index) => (removed[0]?.seq ?? 0) + index));
+    // 10 rounds of 13 + 2 grants and 15 revokes, then 13 + 2 grants and the removal of 15: 330 records.
+    assert.equal(read.entries[read.entries.length - 1]?.seq, 330);
+    assert.equal(read.droppedCount, (read.firstSeq ?? 0) - 1);
+    assert.ok(read.droppedCount > 0);
+  });
+
+  test(`${name}: a core that has written nothing reports an empty file with no first number, nothing dropped, and no failure`, async () => {
+    const s = await start();
+    assert.deepEqual(await auditRead(s.client), { entries: [], firstSeq: null, droppedCount: 0, auditFailed: false });
   });
 
   test(`${name}: the audit file holds no secret, no text a Gauge sent, and only the fields of the contract`, async () => {

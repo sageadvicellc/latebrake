@@ -1,5 +1,5 @@
 import type { GaugeCode } from '../../gauge-errors/src/index.js';
-import type { GrantReason, ManifestReason } from '../../gauge-manifest/src/index.js';
+import type { AuditReason, GrantReason, ManifestReason, PermissionName } from '../../gauge-manifest/src/index.js';
 
 /** The wire names of the calls the core offers. Wire identifiers keep the `bowerloom` prefix until the rename. */
 export type CoreMethod =
@@ -68,7 +68,7 @@ export interface GrantPlan {
   readonly action: 'grant';
   readonly id: string;
   readonly version: string;
-  readonly permissions: readonly string[];
+  readonly permissions: readonly PermissionName[];
   readonly steps: readonly string[];
   readonly digest: string;
   readonly manifestHash: string | null;
@@ -79,21 +79,20 @@ export interface GrantPlan {
 /** What an applied grant gives back: the Gauge and the permissions that are now granted, sorted. */
 export interface GrantApplied {
   readonly id: string;
-  readonly permissions: readonly string[];
+  readonly permissions: readonly PermissionName[];
 }
 
-/** What a revoke gives back: the Gauge and the permissions that were revoked, sorted. */
+/** What a revoke gives back: the Gauge and the permissions that it held and that were revoked now, sorted. A permission it did not hold is not in the list. The list may be empty. */
 export interface GrantRevoked {
   readonly id: string;
-  readonly revoked: readonly string[];
+  readonly revoked: readonly PermissionName[];
 }
 
-/** One grant a Gauge holds. `current` is false when the grant belongs to an earlier manifest or folder, so the person must grant again. */
+/** One grant a Gauge holds, with the two hashes it is bound to. */
 export interface GrantEntry {
-  readonly permission: string;
+  readonly permission: PermissionName;
   readonly manifestHash: string | null;
   readonly folderHash: string | null;
-  readonly current: boolean;
 }
 
 /** What a permission check gives back when the call is allowed. `engine` is `null` for a permission that touches no engine. */
@@ -106,18 +105,33 @@ export interface PermissionCheck {
 /**
  * One record of the audit file: a grant or a revoke of one permission. `seq` starts at 1 and counts every record ever written, so it is never reused,
  * also after the oldest records were dropped to keep the file under its cap. `at` is an ISO 8601 time in UTC with milliseconds. `via` says how: `plan` is an
- * approved grant plan, `revoke` is a revoke call, and `remove` is the removal of the Gauge. The hashes are those the grant is bound to.
+ * approved grant plan. A revoke is `revoke` (a revoke call), `remove` (the removal of the Gauge), `disable` (the Gauge was disabled, which clears its traces grants), or `update`
+ * (the Gauge was updated, which drops every grant of the old version). `version` is the installed version at the time of the record: for an update, the version that was replaced.
+ * The hashes are those the grant is bound to.
  */
 export interface AuditEntry {
   readonly seq: number;
   readonly at: string;
   readonly action: 'grant' | 'revoke';
-  readonly via: 'plan' | 'revoke' | 'remove';
+  readonly via: 'plan' | 'revoke' | 'remove' | 'disable' | 'update';
   readonly id: string;
   readonly version: string | null;
-  readonly permission: string;
+  readonly permission: PermissionName;
   readonly manifestHash: string | null;
   readonly folderHash: string | null;
+}
+
+/**
+ * What a read of the audit file gives. The file is not a complete history: when it is full, the oldest records are dropped. `firstSeq` is the `seq` of the oldest record
+ * held, or `null` when the file is empty, and `droppedCount` is how many records were dropped, so a reader can tell that records were lost (`droppedCount` is `firstSeq - 1` when the file
+ * is not empty). `auditFailed` is true once a record could not be written at all, because the clock gave no usable time or the file could not be written.
+ * A revoke, a removal, a disable, and an update take effect first and are recorded after, on a best effort, so a failure here never leaves access in place.
+ */
+export interface AuditRead {
+  readonly entries: readonly AuditEntry[];
+  readonly firstSeq: number | null;
+  readonly droppedCount: number;
+  readonly auditFailed: boolean;
 }
 
 /** The raw answer of a core: a result, or a refusal with a code. The client checks the code against the registry. */
@@ -137,6 +151,10 @@ export interface Core {
  * which says which rule it broke when several rules share one code. The manifest reasons go with the manifest and path codes. The grant reasons go with
  * `GAUGE_GRANT_MISSING` only. A reason is never a value that a caller or a manifest sent.
  */
-export type CoreResult<T> =
-  | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly code: GaugeCode; readonly reason?: ManifestReason | GrantReason };
+export type CoreResult<T> = { readonly ok: true; readonly value: T } | CoreRefusal;
+
+/** A refusal, with its reason typed by its code. `GAUGE_GRANT_MISSING` has a grant reason or none. `GAUGE_AUDIT_FAILED` always has an audit reason. Every other code has a manifest reason or none. */
+export type CoreRefusal =
+  | { readonly ok: false; readonly code: 'GAUGE_GRANT_MISSING'; readonly reason?: GrantReason }
+  | { readonly ok: false; readonly code: 'GAUGE_AUDIT_FAILED'; readonly reason: AuditReason }
+  | { readonly ok: false; readonly code: Exclude<GaugeCode, 'GAUGE_GRANT_MISSING' | 'GAUGE_AUDIT_FAILED'>; readonly reason?: ManifestReason };
